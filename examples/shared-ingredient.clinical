@@ -1,0 +1,30 @@
+// Fictional software fixture: values follow the demo parser, not clinical dosing.
+patient DemoPatient {
+  age 30
+  condition DemoCondition
+}
+
+medication paracetamol {
+  1 mg
+  route PO
+  frequency PRN
+}
+
+medication acetaminophen {
+  1 mg
+  route PO
+  frequency PRN
+}
+
+plan FirstOrder {
+  for DemoPatient
+  prescribe paracetamol
+}
+
+plan SecondOrder {
+  for DemoPatient
+  prescribe acetaminophen
+}
+
+show FirstOrder
+show SecondOrder
