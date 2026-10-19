@@ -1,0 +1,5 @@
+// Syntax fixture only; not a prescribing recommendation. Press ? for context help.
+Patient DemoPatient: age 30, condition DemoCondition
+Medication aspirin: 15 mg, strength 325 mg, doseForm Oral Tablet, route PO, frequency PRN
+Plan DemoPlan: for DemoPatient, prescribe aspirin
+show DemoPlan
