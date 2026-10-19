@@ -1,0 +1,12 @@
+[debug] Running TaskDef(lab.CopyTextSpec, zio.test.sbt.ZioSpecFingerprint$@6a6f0d66, false, [SuiteSelector])
+[debug] Running TaskDef(lab.ProductAttributesSpec, zio.test.sbt.ZioSpecFingerprint$@6a6f0d66, false, [SuiteSelector])
+[debug] Running TaskDef(lab.RrfSpec, zio.test.sbt.ZioSpecFingerprint$@6a6f0d66, false, [SuiteSelector])
+[debug] Running TaskDef(lab.ResolverSpec, zio.test.sbt.ZioSpecFingerprint$@6a6f0d66, false, [SuiteSelector])
+[debug] Running TaskDef(lab.ProductSpec, zio.test.sbt.ZioSpecFingerprint$@6a6f0d66, false, [SuiteSelector])
+[info] Completed tests
+[debug] Passed tests:
+[debug] 	lab.CopyTextSpec
+[debug] 	lab.ProductAttributesSpec
+[debug] 	lab.RrfSpec
+[debug] 	lab.ResolverSpec
+[debug] 	lab.ProductSpec

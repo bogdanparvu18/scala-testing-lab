@@ -1,0 +1,55 @@
+[debug] Created transactional ClassFileManager with tempDir = C:\AuroraLab\repos\scala-testing-lab\target\scala-3.5.1\test-classes.bak
+[debug] About to delete class files:
+[debug] 	RrfSpec$.class
+[debug] 	ResolverSpec$.class
+[debug] 	CopyTextSpec.class
+[debug] 	RrfSpec.class
+[debug] 	ResolverSpec.class
+[debug] 	CopyTextSpec$.class
+[debug] 	RrfSpec$.tasty
+[debug] 	ResolverSpec$.tasty
+[debug] 	CopyTextSpec.tasty
+[debug] 	RrfSpec.tasty
+[debug] 	ResolverSpec.tasty
+[debug] 	CopyTextSpec$.tasty
+[debug] We backup class files:
+[debug] 	RrfSpec$.class
+[debug] 	ResolverSpec$.class
+[debug] 	CopyTextSpec.class
+[debug] 	RrfSpec.class
+[debug] 	ResolverSpec.class
+[debug] 	CopyTextSpec$.class
+[debug] 	RrfSpec$.tasty
+[debug] 	ResolverSpec$.tasty
+[debug] 	CopyTextSpec.tasty
+[debug] 	RrfSpec.tasty
+[debug] 	ResolverSpec.tasty
+[debug] 	CopyTextSpec$.tasty
+[debug] Registering generated classes:
+[debug] 	ProductSpec.class
+[debug] 	RrfSpec$.class
+[debug] 	ProductAttributesSpec.class
+[debug] 	ProductAttributesSpec$.class
+[debug] 	ResolverSpec$.class
+[debug] 	ProductIntegrationCheck$$anon$1.class
+[debug] 	CopyTextSpec.class
+[debug] 	ProductIntegrationCheck.class
+[debug] 	RrfSpec.class
+[debug] 	ProductSpec$.class
+[debug] 	ResolverSpec.class
+[debug] 	CopyTextSpec$.class
+[debug] 	ProductIntegrationCheck$.class
+[debug] 	ProductSpec.tasty
+[debug] 	RrfSpec$.tasty
+[debug] 	ProductAttributesSpec.tasty
+[debug] 	ProductAttributesSpec$.tasty
+[debug] 	ResolverSpec$.tasty
+[debug] 	ProductIntegrationCheck$$anon$1.tasty
+[debug] 	CopyTextSpec.tasty
+[debug] 	ProductIntegrationCheck.tasty
+[debug] 	RrfSpec.tasty
+[debug] 	ProductSpec$.tasty
+[debug] 	ResolverSpec.tasty
+[debug] 	CopyTextSpec$.tasty
+[debug] 	ProductIntegrationCheck$.tasty
+[debug] Removing the temporary directory used for backing up class files: C:\AuroraLab\repos\scala-testing-lab\target\scala-3.5.1\test-classes.bak

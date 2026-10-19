@@ -1,0 +1,42 @@
+[debug] [zinc] IncrementalCompile -----------
+[debug] IncrementalCompile.incrementalCompile
+[debug] previous = Stamps for: 6 products, 3 sources, 6 libraries
+[debug] current source = Set(${BASE}/src/test/scala/lab/ProductAttributesSpec.scala, ${BASE}/src/test/scala/lab/CopyTextSpec.scala, ${BASE}/src/test/scala/lab/ProductSpec.scala, ${BASE}/src/test/scala/lab/ProductIntegrationCheck.scala, ${BASE}/src/test/scala/lab/RrfSpec.scala, ${BASE}/src/test/scala/lab/ResolverSpec.scala)
+[debug] > initialChanges = InitialChanges(Changes(added = Set(${BASE}/src/test/scala/lab/ProductAttributesSpec.scala, ${BASE}/src/test/scala/lab/ProductIntegrationCheck.scala, ${BASE}/src/test/scala/lab/ProductSpec.scala), removed = Set(), changed = Set(${BASE}/src/test/scala/lab/ResolverSpec.scala), unmodified = ...),Set(),Set(),API Changes: Set(NamesChange(lab.Resolution,ModifiedNames(changes = UsedName(lab;Resolution;init;,[Default]), UsedName(copy,[Default]), UsedName(apply,[Default]), UsedName($lessinit$greater$default$10,[Default]), UsedName(_10,[Default]), UsedName(copy$default$10,[Default]), UsedName(productEvidence,[Default])))))
+[debug] The lab.Resolution has the following regular definitions changed:
+[debug] 	UsedName(lab;Resolution;init;,[Default]), UsedName(copy,[Default]), UsedName(apply,[Default]), UsedName($lessinit$greater$default$10,[Default]), UsedName(_10,[Default]), UsedName(copy$default$10,[Default]), UsedName(productEvidence,[Default]).
+[debug] All member reference dependencies will be considered within this context.
+[debug] Files invalidated by inheriting from (external) lab.Resolution: Set()
+[debug] Now invalidating by inheritance (internally).
+[debug] Getting direct dependencies of all classes transitively invalidated by inheritance.
+[debug] Getting classes that directly depend on (external) lab.Resolution.
+[debug] The following modified names cause invalidation of lab.ResolverSpec: [copy$default$10, apply, $lessinit$greater$default$10, copy]
+[debug] 
+[debug] Initial source changes:
+[debug] 	removed: Set()
+[debug] 	added: Set(${BASE}/src/test/scala/lab/ProductAttributesSpec.scala, ${BASE}/src/test/scala/lab/ProductIntegrationCheck.scala, ${BASE}/src/test/scala/lab/ProductSpec.scala)
+[debug] 	modified: Set(${BASE}/src/test/scala/lab/ResolverSpec.scala)
+[debug] Invalidated products: Set()
+[debug] External API changes: API Changes: Set(NamesChange(lab.Resolution,ModifiedNames(changes = UsedName(lab;Resolution;init;,[Default]), UsedName(copy,[Default]), UsedName(apply,[Default]), UsedName($lessinit$greater$default$10,[Default]), UsedName(_10,[Default]), UsedName(copy$default$10,[Default]), UsedName(productEvidence,[Default]))))
+[debug] Modified binary dependencies: Set()
+[debug] Initial directly invalidated classes: Set(lab.ResolverSpec)
+[debug] Sources indirectly invalidated by:
+[debug] 	product: Set()
+[debug] 	binary dep: Set()
+[debug] 	external source: Set(lab.ResolverSpec)
+[debug] All initially invalidated classes: Set(lab.ResolverSpec)
+[debug] All initially invalidated sources:Set(${BASE}/src/test/scala/lab/ProductAttributesSpec.scala, ${BASE}/src/test/scala/lab/ProductIntegrationCheck.scala, ${BASE}/src/test/scala/lab/ProductSpec.scala, ${BASE}/src/test/scala/lab/ResolverSpec.scala)
+[debug] Initial set of included nodes: lab.ResolverSpec
+[debug] Recompiling all sources: number of invalidated sources > 50.0 percent of all sources
+[debug] compilation cycle 1
+[info] compiling 6 Scala sources to C:\AuroraLab\repos\scala-testing-lab\target\scala-3.5.1\test-classes ...
+[debug] Returning already retrieved and compiled bridge: C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\org\scala-lang\scala3-sbt-bridge\3.5.1\scala3-sbt-bridge-3.5.1.jar.
+[debug] [zinc] Running cached compiler 76317be5 for Scala Compiler version 3.5.1
+[debug] [zinc] The Scala compiler is invoked with:
+[debug] 	-deprecation
+[debug] 	-feature
+[debug] 	-unchecked
+[debug] 	-classpath
+[debug] 	C:\AuroraLab\repos\scala-testing-lab\target\scala-3.5.1\test-classes;C:\AuroraLab\repos\scala-testing-lab\target\scala-3.5.1\classes;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\org\scala-lang\scala3-library_3\3.5.1\scala3-library_3-3.5.1.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\zio_3\2.1.9\zio_3-2.1.9.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\zio-json_3\0.7.3\zio-json_3-0.7.3.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\org\postgresql\postgresql\42.7.14\postgresql-42.7.14.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\zio-test_3\2.1.9\zio-test_3-2.1.9.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\zio-test-sbt_3\2.1.9\zio-test-sbt_3-2.1.9.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\org\scala-lang\scala-library\2.13.14\scala-library-2.13.14.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\zio-internal-macros_3\2.1.9\zio-internal-macros_3-2.1.9.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\zio-stacktracer_3\2.1.9\zio-stacktracer_3-2.1.9.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\izumi-reflect_3\2.3.9\izumi-reflect_3-2.3.9.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\zio-streams_3\2.1.9\zio-streams_3-2.1.9.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\org\scala-lang\modules\scala-collection-compat_3\2.12.0\scala-collection-compat_3-2.12.0.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\com\softwaremill\magnolia1_3\magnolia_3\1.3.7\magnolia_3-1.3.7.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\org\checkerframework\checker-qual\3.55.1\checker-qual-3.55.1.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\org\portable-scala\portable-scala-reflect_2.13\1.1.3\portable-scala-reflect_2.13-1.1.3.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\org\scala-sbt\test-interface\1.0\test-interface-1.0.jar;C:\Users\bogdan\AppData\Local\Coursier\Cache\v1\https\repo1.maven.org\maven2\dev\zio\izumi-reflect-thirdparty-boopickle-shaded_3\2.3.9\izumi-reflect-thirdparty-boopickle-shaded_3-2.3.9.jar
+[debug] Scala compilation took 5.7446234 s
+[info] done compiling

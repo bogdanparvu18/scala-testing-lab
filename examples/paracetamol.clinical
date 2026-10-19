@@ -1,0 +1,20 @@
+// Fictional parser/terminology fixture, NOT prescribing advice.
+// 1 mg is chosen only because the existing demo permits [1, 2.5, 10].
+// The amount is an administered dose; it does not identify a product strength.
+patient DemoPatient {
+  age 30
+  condition DemoCondition
+}
+
+medication paracetamol {
+  1 mg
+  route PO
+  frequency PRN
+}
+
+plan DemoPlan {
+  for DemoPatient
+  prescribe paracetamol
+}
+
+show DemoPlan

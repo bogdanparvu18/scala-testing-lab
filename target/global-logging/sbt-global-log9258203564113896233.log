@@ -1,0 +1,87 @@
+[debug] > Exec(early(addDefaultCommands), None, None)
+[debug] > Exec(addDefaultCommands, None, None)
+[debug] > Exec(early(initialize), None, None)
+[debug] > Exec(initialize, None, None)
+[debug] > Exec(boot, None, None)
+[debug] > Exec(writeSbtVersion, None, None)
+[debug] > Exec(reload, None, None)
+[debug] > Exec(sbtStashOnFailure, None, None)
+[debug] > Exec(onFailure loadFailed, None, None)
+[debug] > Exec(loadp, None, None)
+[info] welcome to sbt 1.10.2 (Azul Systems, Inc. Java 21.0.12.1)
+[debug] Load.defaultLoad until apply took 156.0845ms
+[debug]           Load.loadUnit: plugins took 260.598099ms
+[debug]           Load.loadUnit: defsScala took 0.9185ms
+[debug] [Loading] Scanning directory C:\AuroraLab\repos\scala-testing-lab\project
+[debug] [Loading] Found non-root projects 
+[debug] [Loading] Done in C:\AuroraLab\repos\scala-testing-lab\project, returning: ()
+[debug] deducing auto plugins based on known facts Set(Atom(sbt.plugins.CorePlugin)) and clauses Clauses(Clause(Atom(sbt.plugins.JvmPlugin),Set(Atom(sbt.plugins.IvyPlugin)))
+[debug] Clause(Atom(sbt.ScriptedPlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.SbtPlugin),Set(Atom(sbt.ScriptedPlugin)))
+[debug] Clause(Atom(sbt.plugins.SemanticdbPlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.JUnitXmlReportPlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.MiniDependencyTreePlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.CorePlugin),Set(Atom(sbt.plugins.IvyPlugin)))
+[debug] Clause(Atom(sbt.plugins.IvyPlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.JvmPlugin),Set(Atom(sbt.plugins.SemanticdbPlugin)))
+[debug] Clause(Atom(sbt.plugins.JvmPlugin),Set(Atom(sbt.plugins.JUnitXmlReportPlugin)))
+[debug] Clause(Atom(sbt.plugins.CorePlugin),Set(Atom(sbt.plugins.Giter8TemplatePlugin)))
+[debug] Clause(Atom(sbt.plugins.JvmPlugin),Set(Atom(sbt.plugins.MiniDependencyTreePlugin))))
+[debug]   :: deduced result: Matched(sbt.plugins.CorePlugin,sbt.plugins.Giter8TemplatePlugin,sbt.plugins.IvyPlugin,sbt.plugins.JvmPlugin,sbt.plugins.MiniDependencyTreePlugin,sbt.plugins.JUnitXmlReportPlugin,sbt.plugins.SemanticdbPlugin)
+[debug] Plugins.deducer#function took 43.7139 ms
+[debug]               Load.resolveProject(scala-testing-lab-build) took 74.578601ms
+[debug]             Load.loadTransitive: finalizeProject(Project(id scala-testing-lab-build, base: C:\AuroraLab\repos\scala-testing-lab\project, plugins: List(<none>))) took 140.3463ms
+[debug] [Loading] Done in C:\AuroraLab\repos\scala-testing-lab\project, returning: (scala-testing-lab-build)
+[debug]           Load.loadUnit: loadedProjectsRaw took 176.606601ms
+[debug]           Load.loadUnit: cleanEvalClasses took 0.209499ms
+[debug]         Load.loadUnit(file:/C:/AuroraLab/repos/scala-testing-lab/project/, ...) took 487.3002ms
+[debug]       Load.apply: load took 785.2563ms
+[debug]       Load.apply: resolveProjects took 5.5541ms
+[debug]       Load.apply: finalTransforms took 194.3757ms
+[debug]       Load.apply: config.delegates took 5.5605ms
+[debug]       Load.apply: Def.make(settings)... took 660.1546ms
+[debug]       Load.apply: structureIndex took 220.8168ms
+[debug]       Load.apply: mkStreams took 1.031ms
+[info] loading project definition from C:\AuroraLab\repos\scala-testing-lab\project
+[debug] Running task... Cancel: Signal, check cycles: false, forcegc: true
+[debug]     Load.loadUnit: plugins took 3053.9203ms
+[debug]     Load.loadUnit: defsScala took 0.003ms
+[debug] [Loading] Scanning directory C:\AuroraLab\repos\scala-testing-lab
+[debug]       Load.loadUnit: mkEval took 3.7487ms
+[debug] [Loading] Found root project root w/ remaining 
+[debug] deducing auto plugins based on known facts Set(Atom(sbt.plugins.CorePlugin)) and clauses Clauses(Clause(Atom(sbt.plugins.JvmPlugin),Set(Atom(sbt.plugins.IvyPlugin)))
+[debug] Clause(Atom(sbt.ScriptedPlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.SbtPlugin),Set(Atom(sbt.ScriptedPlugin)))
+[debug] Clause(Atom(sbt.plugins.SemanticdbPlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.JUnitXmlReportPlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.MiniDependencyTreePlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.CorePlugin),Set(Atom(sbt.plugins.IvyPlugin)))
+[debug] Clause(Atom(sbt.plugins.IvyPlugin),Set(Atom(sbt.plugins.JvmPlugin)))
+[debug] Clause(Atom(sbt.plugins.JvmPlugin),Set(Atom(sbt.plugins.SemanticdbPlugin)))
+[debug] Clause(Atom(sbt.plugins.JvmPlugin),Set(Atom(sbt.plugins.JUnitXmlReportPlugin)))
+[debug] Clause(Atom(sbt.plugins.CorePlugin),Set(Atom(sbt.plugins.Giter8TemplatePlugin)))
+[debug] Clause(Atom(sbt.plugins.JvmPlugin),Set(Atom(sbt.plugins.MiniDependencyTreePlugin))))
+[debug]   :: deduced result: Matched(sbt.plugins.CorePlugin,sbt.plugins.Giter8TemplatePlugin,sbt.plugins.IvyPlugin,sbt.plugins.JvmPlugin,sbt.plugins.MiniDependencyTreePlugin,sbt.plugins.JUnitXmlReportPlugin,sbt.plugins.SemanticdbPlugin)
+[debug] Plugins.deducer#function took 2.5325 ms
+[info] loading settings for project root from build.sbt ...
+[debug]         Load.resolveProject(root) took 2.039401ms
+[debug]       Load.loadTransitive: finalizeProject(Project(id root, base: C:\AuroraLab\repos\scala-testing-lab, plugins: List(<none>))) took 5.2853ms
+[debug] [Loading] Done in C:\AuroraLab\repos\scala-testing-lab, returning: (root)
+[debug]     Load.loadUnit: loadedProjectsRaw took 345.3539ms
+[debug]     Load.loadUnit: cleanEvalClasses took 7.686799ms
+[debug]   Load.loadUnit(file:/C:/AuroraLab/repos/scala-testing-lab/, ...) took 3408.6893ms
+[debug] Load.apply: load took 3424.446501ms
+[debug] Load.apply: resolveProjects took 0.126299ms
+[debug] Load.apply: finalTransforms took 14.5699ms
+[debug] Load.apply: config.delegates took 0.566799ms
+[debug] Load.apply: Def.make(settings)... took 93.462ms
+[debug] Load.apply: structureIndex took 29.9318ms
+[debug] Load.apply: mkStreams took 0.002501ms
+[info] set current project to scala-testing-lab (in build file:/C:/AuroraLab/repos/scala-testing-lab/)
+[debug] > Exec(sbtPopOnFailure, None, None)
+[debug] > Exec(resumeFromFailure, None, None)
+[debug] > Exec(notifyUsersAboutShell, None, None)
+[debug] > Exec(iflast shell, None, None)
+[debug] > Exec(run resolve "c:/Users/bogdan/AppData/Roaming/Code/User/globalStorage/undefined_publisher.vscode-clinical-dsl-demo/rxnorm-sQyp1r/ast.json" "c:/Users/bogdan/AppData/Roaming/Code/User/globalStorage/undefined_publisher.vscode-clinical-dsl-demo/rxnorm-sQyp1r/resolved.json", None, None)
+[debug] Evaluating tasks: Compile / run
+[debug] Running task... Cancel: Signal, check cycles: false, forcegc: true

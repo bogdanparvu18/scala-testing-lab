@@ -1,0 +1,1 @@
+[[{"${BASE}/src/main/resources/db/schema.sql":["${BASE}/target/scala-3.5.1/classes/db/schema.sql"]},{"${BASE}/target/scala-3.5.1/classes/db/schema.sql":["${BASE}/src/main/resources/db/schema.sql"]}],{"${BASE}/src/main/resources/db/schema.sql":{"file":"file:///C:/AuroraLab/repos/scala-testing-lab/src/main/resources/db/schema.sql","lastModified":1792447664014}}]

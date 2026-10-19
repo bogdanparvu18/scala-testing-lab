@@ -1,0 +1,46 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<testsuite hostname="Aurora-Testing-" name="lab.RrfSpec" tests="18" errors="0" failures="0" skipped="0" time="1.171" timestamp="2026-10-19T22:25:17">
+          <properties>
+      <property name="java.specification.version" value="21"/><property name="sun.cpu.isalist" value="amd64"/><property name="sun.jnu.encoding" value="Cp1252"/><property name="sun.arch.data.model" value="64"/><property name="sbt.supershell" value="false"/><property name="java.vendor.url" value="http://www.azul.com/"/><property name="sun.boot.library.path" value="C:\Program Files\Zulu\zulu-21\bin"/><property name="sun.java.command" value="C:\Users\bogdan\AuroraLab\tools\sbt-1.10.2\bin\sbt-launch.jar test"/><property name="jdk.debug" value="release"/><property name="java.specification.vendor" value="Oracle Corporation"/><property name="java.version.date" value="2026-08-18"/><property name="java.home" value="C:\Program Files\Zulu\zulu-21"/><property name="file.separator" value="\"/><property name="java.vm.compressedOopsMode" value="32-bit"/><property name="line.separator" value="
+"/><property name="java.vm.specification.vendor" value="Oracle Corporation"/><property name="java.specification.name" value="Java Platform API Specification"/><property name="user.script" value=""/><property name="sun.management.compiler" value="HotSpot 64-Bit Tiered Compilers"/><property name="java.runtime.version" value="21.0.12.1+1-LTS"/><property name="user.name" value="bogdan"/><property name="log4j.ignoreTCL" value="true"/><property name="file.encoding" value="UTF-8"/><property name="jnidispatch.path" value="C:\Users\bogdan\AppData\Local\Temp\2\jna--1383631977\jna706059500649678489.dll"/><property name="java.vendor.version" value="Zulu21.52+203-CA"/><property name="jna.loaded" value="true"/><property name="java.io.tmpdir" value="C:\Users\bogdan\AppData\Local\Temp\2\"/><property name="java.version" value="21.0.12.1"/><property name="java.vm.specification.name" value="Java Virtual Machine Specification"/><property name="sun.os.patch.level" value=""/><property name="native.encoding" value="Cp1252"/><property name="java.library.path" value="C:\Program Files\Zulu\zulu-21\bin;C:\Windows\Sun\Java\bin;C:\Windows\system32;C:\Windows;C:\Program Files\nodejs;C:\Program Files\nodejs;C:\Python315\Scripts\;C:\Python315\;C:\Program Files\Zulu\zulu-21\bin\;C:\Python314\Scripts\;C:\Python314\;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\Git\cmd;C:\ProgramData\chocolatey\bin;C:\Program Files\GitHub CLI\;C:\Program Files\nodejs\;C:\Users\bogdan\AppData\Local\Microsoft\WindowsApps;C:\Users\bogdan\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\bogdan\AppData\Roaming\npm;."/><property name="stderr.encoding" value="cp437"/><property name="java.vendor" value="Azul Systems, Inc."/><property name="sun.io.unicode.encoding" value="UnicodeLittle"/><property name="java.class.path" value="C:\Users\bogdan\AuroraLab\tools\sbt-1.10.2\bin\sbt-launch.jar"/><property name="java.vm.vendor" value="Azul Systems, Inc."/><property name="user.variant" value=""/><property name="jline.shutdownhook" value="false"/><property name="user.timezone" value="Etc/UTC"/><property name="java.vm.specification.version" value="21"/><property name="os.name" value="Windows Server 2025"/><property name="sun.java.launcher" value="SUN_STANDARD"/><property name="user.country" value="US"/><property name="sun.cpu.endian" value="little"/><property name="user.home" value="C:\Users\bogdan"/><property name="user.language" value="en"/><property name="sbt.ipcsocket.tmpdir" value="C:\Users\bogdan\AppData\Local\Temp\2\.sbtd23caecb\ipcsocket"/><property name="swoval.tmpdir" value="C:\Users\bogdan\AppData\Local\Temp\2\.sbtd23caecb\swoval"/><property name="jline.esc.timeout" value="0"/><property name="stdout.encoding" value="cp437"/><property name="path.separator" value=";"/><property name="os.version" value="10.0"/><property name="jna.nosys" value="true"/><property name="java.runtime.name" value="OpenJDK Runtime Environment"/><property name="sbt.log.noformat" value="true"/><property name="java.vm.name" value="OpenJDK 64-Bit Server VM"/><property name="java.vendor.url.bug" value="http://www.azul.com/support/"/><property name="user.dir" value="C:\AuroraLab\repos\scala-testing-lab"/><property name="os.arch" value="amd64"/><property name="java.vm.info" value="mixed mode, sharing"/><property name="java.vm.version" value="21.0.12.1+1-LTS"/><property name="java.class.version" value="65.0"/>
+    </properties>
+          <testcase classname="lab.RrfSpec" name="Rrf full offline index - imports every supported active normal form independently of the example drug" time="0.082">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - raw streams preserve every row, empty field, quote and backslash without CSV interpretation" time="0.033">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - raw streaming verifies each source hash after the last callback" time="0.044">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - uses only supplied terminology evidence and indexes synonyms for unrelated concepts" time="0.023">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - retains all active synonym atoms associated with a supported canonical concept" time="0.228">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - preserves multiple dose-form entry terms without treating them as conflicting canonical normal forms" time="0.167">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - preserves lexical ambiguity instead of choosing the first concept" time="0.02">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - imports paracetamol from source atoms joined to canonical IN161 without a manual mapping" time="0.252">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - omits suppressed names and foreign-source-only or inactive canonical concepts" time="0.02">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - rejects malformed RRF columns even for a row that would not be imported" time="0.028">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - orients raw concept relations correctly and never projects unknown endpoint nodes" time="0.031">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - rejects malformed relationship columns while streaming" time="0.029">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - rejects duplicate source atom IDs instead of allowing a later row to overwrite evidence" time="0.029">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - rejects a combination whose second component is missing instead of retaining a partial ingredient set" time="0.036">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - rejects invalid release labels and conflicting normal forms" time="0.029">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - normalizes lexical formatting while keeping strength and brand distinctions" time="0.042">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - rejects a release whose contents change after preparation" time="0.042">
+                      
+                    </testcase><testcase classname="lab.RrfSpec" name="Rrf full offline index - rejects malformed retained atom IDs" time="0.036">
+                      
+                    </testcase>
+          <system-out><![CDATA[]]></system-out>
+          <system-err><![CDATA[]]></system-err>
+        </testsuite>

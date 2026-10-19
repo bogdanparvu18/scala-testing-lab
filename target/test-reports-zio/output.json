@@ -1,0 +1,413 @@
+{
+  "results": [
+    {
+       "name" : "lab.CopyTextSpec/PostgreSQL COPY transport/preserves empty fields, literal escape-looking text, quotes and Unicode",
+       "status" : "Success",
+       "durationMillis" : "272",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.CopyTextSpec",
+       "labels" : ["PostgreSQL COPY transport", "preserves empty fields, literal escape-looking text, quotes and Unicode"]
+    },
+    {
+       "name" : "lab.CopyTextSpec/PostgreSQL COPY transport/escapes embedded tab and line separators into one COPY record",
+       "status" : "Success",
+       "durationMillis" : "298",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.CopyTextSpec",
+       "labels" : ["PostgreSQL COPY transport", "escapes embedded tab and line separators into one COPY record"]
+    },
+    {
+       "name" : "lab.CopyTextSpec/PostgreSQL COPY transport/rejects null and NUL fields instead of silently changing source data",
+       "status" : "Success",
+       "durationMillis" : "78",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.CopyTextSpec",
+       "labels" : ["PostgreSQL COPY transport", "rejects null and NUL fields instead of silently changing source data"]
+    },
+    {
+       "name" : "lab.ProductAttributesSpec/RXNSAT import plan/retains all 13 original fields and pins all three source hashes",
+       "status" : "Success",
+       "durationMillis" : "141",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductAttributesSpec",
+       "labels" : ["RXNSAT import plan", "retains all 13 original fields and pins all three source hashes"]
+    },
+    {
+       "name" : "lab.ProductAttributesSpec/RXNSAT import plan/rejects malformed rows while streaming",
+       "status" : "Success",
+       "durationMillis" : "154",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductAttributesSpec",
+       "labels" : ["RXNSAT import plan", "rejects malformed rows while streaming"]
+    },
+    {
+       "name" : "lab.ProductAttributesSpec/RXNSAT import plan/rejects a modified source after preparation",
+       "status" : "Success",
+       "durationMillis" : "120",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductAttributesSpec",
+       "labels" : ["RXNSAT import plan", "rejects a modified source after preparation"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/imports every supported active normal form independently of the example drug",
+       "status" : "Success",
+       "durationMillis" : "82",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "imports every supported active normal form independently of the example drug"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/raw streams preserve every row, empty field, quote and backslash without CSV interpretation",
+       "status" : "Success",
+       "durationMillis" : "33",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "raw streams preserve every row, empty field, quote and backslash without CSV interpretation"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/raw streaming verifies each source hash after the last callback",
+       "status" : "Success",
+       "durationMillis" : "44",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "raw streaming verifies each source hash after the last callback"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/uses only supplied terminology evidence and indexes synonyms for unrelated concepts",
+       "status" : "Success",
+       "durationMillis" : "23",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "uses only supplied terminology evidence and indexes synonyms for unrelated concepts"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/retains all active synonym atoms associated with a supported canonical concept",
+       "status" : "Success",
+       "durationMillis" : "228",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "retains all active synonym atoms associated with a supported canonical concept"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/preserves multiple dose-form entry terms without treating them as conflicting canonical normal forms",
+       "status" : "Success",
+       "durationMillis" : "167",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "preserves multiple dose-form entry terms without treating them as conflicting canonical normal forms"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/preserves lexical ambiguity instead of choosing the first concept",
+       "status" : "Success",
+       "durationMillis" : "20",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "preserves lexical ambiguity instead of choosing the first concept"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/omits suppressed names and foreign-source-only or inactive canonical concepts",
+       "status" : "Success",
+       "durationMillis" : "20",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "omits suppressed names and foreign-source-only or inactive canonical concepts"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/imports paracetamol from source atoms joined to canonical IN161 without a manual mapping",
+       "status" : "Success",
+       "durationMillis" : "252",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "imports paracetamol from source atoms joined to canonical IN161 without a manual mapping"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/rejects malformed RRF columns even for a row that would not be imported",
+       "status" : "Success",
+       "durationMillis" : "28",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "rejects malformed RRF columns even for a row that would not be imported"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/orients raw concept relations correctly and never projects unknown endpoint nodes",
+       "status" : "Success",
+       "durationMillis" : "31",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "orients raw concept relations correctly and never projects unknown endpoint nodes"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/rejects malformed relationship columns while streaming",
+       "status" : "Success",
+       "durationMillis" : "29",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "rejects malformed relationship columns while streaming"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/rejects duplicate source atom IDs instead of allowing a later row to overwrite evidence",
+       "status" : "Success",
+       "durationMillis" : "29",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "rejects duplicate source atom IDs instead of allowing a later row to overwrite evidence"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/rejects a combination whose second component is missing instead of retaining a partial ingredient set",
+       "status" : "Success",
+       "durationMillis" : "36",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "rejects a combination whose second component is missing instead of retaining a partial ingredient set"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/rejects invalid release labels and conflicting normal forms",
+       "status" : "Success",
+       "durationMillis" : "29",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "rejects invalid release labels and conflicting normal forms"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/normalizes lexical formatting while keeping strength and brand distinctions",
+       "status" : "Success",
+       "durationMillis" : "42",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "normalizes lexical formatting while keeping strength and brand distinctions"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/rejects a release whose contents change after preparation",
+       "status" : "Success",
+       "durationMillis" : "42",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "rejects a release whose contents change after preparation"]
+    },
+    {
+       "name" : "lab.RrfSpec/Rrf full offline index/rejects malformed retained atom IDs",
+       "status" : "Success",
+       "durationMillis" : "36",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.RrfSpec",
+       "labels" : ["Rrf full offline index", "rejects malformed retained atom IDs"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/unknown spelling remains unresolved",
+       "status" : "Success",
+       "durationMillis" : "144",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "unknown spelling remains unresolved"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/ambiguous exact names require selection",
+       "status" : "Success",
+       "durationMillis" : "133",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "ambiguous exact names require selection"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/ingredient binding never promotes administered dose into a product",
+       "status" : "Success",
+       "durationMillis" : "149",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "ingredient binding never promotes administered dose into a product"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/ingredient is not allowed in medicationProduct role",
+       "status" : "Success",
+       "durationMillis" : "46",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "ingredient is not allowed in medicationProduct role"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/brand stays brand and does not claim a complete ingredient set",
+       "status" : "Success",
+       "durationMillis" : "60",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "brand stays brand and does not claim a complete ingredient set"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/typed component paths preserve every combination ingredient and provenance",
+       "status" : "Success",
+       "durationMillis" : "55",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "typed component paths preserve every combination ingredient and provenance"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/partial product filters cannot be silently ignored",
+       "status" : "Success",
+       "durationMillis" : "28",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "partial product filters cannot be silently ignored"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/same input snapshot policy produces byte-identical result",
+       "status" : "Success",
+       "durationMillis" : "134",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "same input snapshot policy produces byte-identical result"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/decoder rejects unknown keys instead of ignoring semantic qualifiers",
+       "status" : "Success",
+       "durationMillis" : "130",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "decoder rejects unknown keys instead of ignoring semantic qualifiers"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/source synonym resolves without a local alias and retains its source evidence",
+       "status" : "Success",
+       "durationMillis" : "111",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "source synonym resolves without a local alias and retains its source evidence"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/canonical name alone does not invent missing synonyms",
+       "status" : "Success",
+       "durationMillis" : "32",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "canonical name alone does not invent missing synonyms"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/shared ingredient rule groups by patient and distinct order",
+       "status" : "Success",
+       "durationMillis" : "63",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "shared ingredient rule groups by patient and distinct order"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/index scope cannot be silently mixed with legacy seed subset",
+       "status" : "Success",
+       "durationMillis" : "11",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "index scope cannot be silently mixed with legacy seed subset"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/source evidence and release mismatches fail closed",
+       "status" : "Success",
+       "durationMillis" : "12",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "source evidence and release mismatches fail closed"]
+    },
+    {
+       "name" : "lab.ResolverSpec/Resolution policy/foreign-source-only type cannot become an ingredient by its spelling",
+       "status" : "Success",
+       "durationMillis" : "36",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ResolverSpec",
+       "labels" : ["Resolution policy", "foreign-source-only type cannot become an ingredient by its spelling"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/administered dose is not used as a product-strength filter",
+       "status" : "Success",
+       "durationMillis" : "43",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "administered dose is not used as a product-strength filter"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/accepts equivalent explicit strength representations",
+       "status" : "Success",
+       "durationMillis" : "28",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "accepts equivalent explicit strength representations"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/compares mass units and ratios exactly without binary floating point",
+       "status" : "Success",
+       "durationMillis" : "42",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "compares mass units and ratios exactly without binary floating point"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/a different or unknown dose form cannot match",
+       "status" : "Success",
+       "durationMillis" : "8",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "a different or unknown dose form cannot match"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/known ingredient with wrong strength is a product failure, not an unknown medication",
+       "status" : "Success",
+       "durationMillis" : "9",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "known ingredient with wrong strength is a product failure, not an unknown medication"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/combination products are not selected using a single strength",
+       "status" : "Success",
+       "durationMillis" : "15",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "combination products are not selected using a single strength"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/multiple matching products require clarification",
+       "status" : "Success",
+       "durationMillis" : "13",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "multiple matching products require clarification"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/selects a product from imported ingredient, component strength and dose form",
+       "status" : "Success",
+       "durationMillis" : "118",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "selects a product from imported ingredient, component strength and dose form"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/missing or conflicting component strength cannot be accepted",
+       "status" : "Success",
+       "durationMillis" : "41",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "missing or conflicting component strength cannot be accepted"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/brand selection retains the generic product path and the IN ingredient",
+       "status" : "Success",
+       "durationMillis" : "50",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "brand selection retains the generic product path and the IN ingredient"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/absence of RXNSAT metadata never counts as a verified product match",
+       "status" : "Success",
+       "durationMillis" : "48",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "absence of RXNSAT metadata never counts as a verified product match"]
+    },
+    {
+       "name" : "lab.ProductSpec/Explicit product matching/an activeIngredient semantic role cannot be promoted to a product",
+       "status" : "Success",
+       "durationMillis" : "45",
+       "annotations" : "",
+       "fullyQualifiedClassName" : "lab.ProductSpec",
+       "labels" : ["Explicit product matching", "an activeIngredient semantic role cannot be promoted to a product"]
+    }
+
+  ]
+}

@@ -1,0 +1,102 @@
+{
+  "schemaVersion" : "2",
+  "policyVersion" : "exact-v1",
+  "terminologyRelease" : "2026-10-05",
+  "snapshotFingerprint" : "349523798ef9b0b0c4808f1404692361523d61100ce44130bf7a214ed313f569",
+  "terminologyScope" : "all-active-rxnorm-pg-v4",
+  "inputSha256" : "124454bf72d0e0bb1e42807175a1e9aec926c802f02fa4f993b4b62744e1e458",
+  "resolutions" : [
+    {
+      "mention" : {
+        "id" : "DemoPlan:paracetamol",
+        "originalText" : "paracetamol",
+        "role" : "medication",
+        "source" : {
+          "uri" : "file:///c%3A/AuroraLab/repos/scala-testing-lab/examples/paracetamol.clinical",
+          "start" : {
+            "line" : 8,
+            "character" : 0,
+            "offset" : 276
+          },
+          "end" : {
+            "line" : 12,
+            "character" : 1,
+            "offset" : 336
+          },
+          "text" : "medication paracetamol {\n  1 mg\n  route PO\n  frequency PRN\n}"
+        },
+        "dose" : {
+          "amount" : 1,
+          "unit" : "mg"
+        },
+        "route" : "PO",
+        "frequency" : "PRN",
+        "patientRef" : "DemoPatient",
+        "orderId" : "DemoPlan"
+      },
+      "status" : "resolved",
+      "initialConcept" : {
+        "system" : "http://www.nlm.nih.gov/research/umls/rxnorm",
+        "rxcui" : "161",
+        "release" : "2026-10-05",
+        "display" : "acetaminophen",
+        "tty" : "IN"
+      },
+      "ingredients" : [
+        {
+          "concept" : {
+            "system" : "http://www.nlm.nih.gov/research/umls/rxnorm",
+            "rxcui" : "161",
+            "release" : "2026-10-05",
+            "display" : "acetaminophen",
+            "tty" : "IN"
+          },
+          "path" : []
+        }
+      ],
+      "candidates" : [
+        {
+          "concept" : {
+            "system" : "http://www.nlm.nih.gov/research/umls/rxnorm",
+            "rxcui" : "161",
+            "release" : "2026-10-05",
+            "display" : "acetaminophen",
+            "tty" : "IN"
+          },
+          "names" : [
+            {
+              "rxaui" : "2658580",
+              "text" : "Paracetamol",
+              "tty" : "BN",
+              "sab" : "MMSL"
+            },
+            {
+              "rxaui" : "5481616",
+              "text" : "paracetamol",
+              "tty" : "IN",
+              "sab" : "ATC"
+            },
+            {
+              "rxaui" : "8596084",
+              "text" : "Paracetamol",
+              "tty" : "SY",
+              "sab" : "DRUGBANK"
+            },
+            {
+              "rxaui" : "9252471",
+              "text" : "Paracetamol",
+              "tty" : "SY",
+              "sab" : "SNOMEDCT_US"
+            }
+          ]
+        }
+      ],
+      "matchMethod" : "exact_imported_name",
+      "diagnostics" : [
+        "PRODUCT_NOT_SELECTED: administered dose is not product strength"
+      ],
+      "clinicianConfirmed" : false
+    }
+  ],
+  "sharedIngredients" : []
+}

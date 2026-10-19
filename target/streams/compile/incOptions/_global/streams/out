@@ -1,0 +1,2 @@
+[debug] Created transactional ClassFileManager with tempDir = C:\AuroraLab\repos\scala-testing-lab\target\scala-3.5.1\classes.bak
+[debug] Removing the temporary directory used for backing up class files: C:\AuroraLab\repos\scala-testing-lab\target\scala-3.5.1\classes.bak

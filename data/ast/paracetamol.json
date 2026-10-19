@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "1",
+  "policyVersion": "exact-v1",
+  "terminologyRelease": "2026-10-05",
+  "document": {
+    "uri": "file:///c%3A/AuroraLab/repos/scala-testing-lab/examples/paracetamol.clinical",
+    "text": "// Fictional parser/terminology fixture, NOT prescribing advice.\n// 1 mg is chosen only because the existing demo permits [1, 2.5, 10].\n// The amount is an administered dose; it does not identify a product strength.\npatient DemoPatient {\n  age 30\n  condition DemoCondition\n}\n\nmedication paracetamol {\n  1 mg\n  route PO\n  frequency PRN\n}\n\nplan DemoPlan {\n  for DemoPatient\n  prescribe paracetamol\n}\n\nshow DemoPlan\n"
+  },
+  "mentions": [
+    {
+      "id": "DemoPlan:paracetamol",
+      "originalText": "paracetamol",
+      "role": "medication",
+      "source": {
+        "uri": "file:///c%3A/AuroraLab/repos/scala-testing-lab/examples/paracetamol.clinical",
+        "start": {
+          "line": 8,
+          "character": 0,
+          "offset": 276
+        },
+        "end": {
+          "line": 12,
+          "character": 1,
+          "offset": 336
+        },
+        "text": "medication paracetamol {\n  1 mg\n  route PO\n  frequency PRN\n}"
+      },
+      "dose": {
+        "amount": 1,
+        "unit": "mg"
+      },
+      "route": "PO",
+      "frequency": "PRN",
+      "patientRef": "DemoPatient",
+      "orderId": "DemoPlan"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+2026.10.19 22:47:48 INFO  Started: Metals version 1.6.9 in folders 'C:\AuroraLab\repos\scala-testing-lab' for client Visual Studio Code 1.138.0.
+2026.10.19 22:47:48 INFO  Memory monitor started
+2026.10.19 22:47:50 WARN  Using H2 2.5.250 which is newer than the version Flyway has been verified with. The latest verified version of H2 is 2.3.232.
+Oct 19, 2026 10:48:04 PM org.eclipse.lsp4j.jsonrpc.services.GenericEndpoint notify
+INFO: Unsupported notification method: $/setTrace
