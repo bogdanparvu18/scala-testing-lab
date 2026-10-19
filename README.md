@@ -6,7 +6,6 @@ The project connects a human-readable clinical language to explicit terminology 
 
 This is a personal integration laboratory for work that can later be adapted to Aurora's Scala/ZIO ecosystem. It keeps language tooling, terminology data access, and resolution policy separate.
 
-Examples are fictional parser and terminology fixtures. Terminology resolution does not establish the clinical safety of a prescription.
 
 ## Contents
 
