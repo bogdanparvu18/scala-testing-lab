@@ -124,7 +124,7 @@ Node's built-in modules also do significant work:
 
 ## 3. Scala execution flow: JSON to terminology report
 
-The `resolve <ast.json> <result.json>` command receives a **JSON file path**. It decodes structured fields, reads a release-specific PostgreSQL snapshot, applies pure Scala terminology rules, and writes a report. ZIO sequences these operations and manages failures/resources; it does not decide which medication matches.
+The `resolve <ast.json> <result.json>` command receives a **JSON file path**. It decodes structured fields, reads a release-specific PostgreSQL snapshot, applies pure Scala terminology rules, and writes a report. ZIO sequences these operations and manages failures/resources.
 
 ### Execution and failure boundaries
 
