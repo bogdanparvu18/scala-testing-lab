@@ -56,8 +56,9 @@ test('rejects syntax and unresolved references', async () => {
   await assert.rejects(project(fixture.replace('prescribe paracetamol', 'prescribe MissingDrug')), /reference|resolve/);
 });
 
-test('runs original Langium demo amount validator', async () => {
-  await assert.rejects(project(fixture.replace('1 mg', '500 mg')), /Amount not in the prototype list/);
+test('accepts positive doses and rejects zero', async () => {
+  assert.equal((await project(fixture.replace('1 mg', '15 mg'))).mentions[0].dose.amount, 15);
+  await assert.rejects(project(fixture.replace('1 mg', '0 mg')), /greater than zero/);
 });
 
 test('rejects duplicate declarations before dereferencing', async () => {
@@ -93,4 +94,23 @@ test('validates the pair of product qualifiers and positive supported strength r
   for (const strength of ['0 mg', '12 mg/0 ml', '500 percent', '-1 mg']) {
     await assert.rejects(project(fixture.replace('1 mg route', `1 mg strength "${strength}" doseForm "Oral Tablet" route`)), /strength|positive/);
   }
+});
+
+const colonFixture = `// UTF-16 🧪
+Patient DemoPatient: age 30, condition DemoCondition
+Medication paracetamol: 15 mg, strength 160 mg/5 ml, doseForm Oral Solution, route PO, frequency PRN
+Plan DemoPlan: for DemoPatient, prescribe paracetamol
+show DemoPlan
+`;
+test('colon syntax exports the same contract and exact source positions', async () => {
+  const request = await project(colonFixture);
+  const m = request.mentions[0];
+  assert.deepEqual(m.dose, { amount: 15, unit: 'mg' });
+  assert.equal(m.productStrength, '160 mg/5 ml');
+  assert.equal(m.doseForm, 'Oral Solution');
+  assert.equal(m.originalText, 'paracetamol');
+  assert.equal(m.patientRef, 'DemoPatient');
+  assert.equal(colonFixture.slice(m.source.start.offset, m.source.end.offset), m.source.text);
+  assert.equal(m.source.text, colonFixture.split('\n')[2]);
+  assert.equal(request.schemaVersion, '1');
 });
