@@ -608,7 +608,7 @@ plan DemoPlan {
 show DemoPlan
 ~~~
 
-The existing demo validator accepts administered amounts `[1, 2.5, 10]`. The example's `1 mg` is a parser fixture, not a dosing recommendation or product strength.
+The current Langium validator accepts positive finite administered amounts, including decimals. `[1, 2.5, 10]` are completion suggestions, not an enforced list. The example's `1 mg` is a parser fixture, not a dosing recommendation or product strength.
 
 Langium links `DemoPlan` to `DemoPatient` and `paracetamol`. The exporter follows these linked objects rather than extracting names from source text with regular expressions.
 
@@ -742,7 +742,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Product resolution failed.' }
 | `doseForm` | Pharmaceutical form, resolved to a terminology `DF` concept. |
 | Dosage | Administration instructions/regimen; this is not the name chosen for the product-strength field. |
 
-The grammar uses `'strength' productStrength=STRING`. Therefore the user writes `strength` in the DSL, while AST/JSON/Scala use `productStrength`.
+The grammar maps the `strength` keyword to `productStrength`: legacy brace syntax uses `productStrength=STRING`, while colon syntax uses `productStrength=UnquotedStrength`. The user writes `strength` in the DSL; AST/JSON/Scala retain `productStrength`. The custom Langium value converter preserves spaces in unquoted strength and multiword dose-form values.
 
 The administered dose remains separate. The strength pair is optional for ingredient resolution, but `productStrength` and `doseForm` must be supplied together when requesting product verification.
 
@@ -791,6 +791,46 @@ Try a fictional name absent from the dataset to test `unresolved`. Change only t
 Missing or conflicting strength evidence produces `PRODUCT_EVIDENCE_INCOMPLETE` and requires clarification. Multiple supported matches produce `PRODUCT_AMBIGUOUS`. A database failure is an unavailable check, not an unknown medication.
 
 ## 10. VS Code extension workflow
+
+### Colon syntax and contextual help
+
+Use `:` after the declaration name and commas between fields. Names remain identifiers; product strength and multiword dose forms do not need quotes in colon syntax.
+
+```text
+Patient DemoPatient: age 30, condition DemoCondition
+Medication aspirin: 15 mg, strength 325 mg, doseForm Oral Tablet, route PO, frequency PRN
+Plan DemoPlan: for DemoPatient, prescribe aspirin
+show DemoPlan
+```
+
+This is a syntax example, not a treatment recommendation. `15 mg` is the administered amount; `325 mg` is the product strength. `route` and `frequency` are required. Supply both `strength` and `doseForm`, or omit both.
+
+In a writable `.clinical` editor:
+
+1. Press **Ctrl+Space** for completion suggestions.
+2. Press **?** for help based on the text before the cursor: declaration name, amount, strength, dose form, route, frequency, patient, plan, or `show`.
+3. Choose **Show suggestions** in the help message to open completion at that position.
+
+The command is **Clinical DSL: Context Help (?)** in the Command Palette. Its default keybinding is **Shift+/**; on other keyboard layouts, rebind that command in Keyboard Shortcuts. The shortcut consumes the key without inserting `?`: it is editor help, not part of the grammar, saved document, or JSON sent to Scala. A question mark pasted into the source is not automatically removed and can cause a syntax error.
+
+Lowercase `patient`, `medication`, and `plan` remain accepted, as do legacy brace declarations. `show` stays lowercase. Completion provides local language suggestions; it does not query RxNorm on every keystroke.
+
+The AST/JSON contract is unchanged. The bridge still exports the plans selected by `show`, preserving source positions. No PostgreSQL reimport is needed for the syntax/help update.
+
+The grammar and editor command live in the companion Langium repository; Scala continues to consume the same exported JSON. For legacy brace syntax, product qualifiers remain quoted. See the [Langium grammar guide](https://github.com/bogdanparvu18/langium_dsl_lab/blob/main/clinical-dsl-demo/README.md) and this repository's [colon example](examples/colon-help.clinical).
+
+After updating the Langium checkout, rebuild it and reload Extension Development Host:
+
+~~~powershell
+Set-Location $langiumRoot
+npm ci
+npm run langium:generate
+npm run build
+npm test
+~~~
+
+Open the workspace folder containing `package.json` and `.vscode`, launch **Run Extension** with F5, and open an example from that same checkout. The syntax/help update itself requires no Scala schema migration or new RxNorm import.
+
 
 ### Tool layout
 
@@ -1075,7 +1115,9 @@ The bridge does not resolve RxNorm itself. It passes user input and context to S
 In the companion repository:
 
 - `registerValidationChecks` registers validators for AST node types.
-- `checkMedicationAmountFromList` applies the existing demo amount list.
+- `checkMedicationAmount` validates positive finite amounts; completion suggestions do not restrict the accepted amounts.
+- `ClinicalDslValueConverter` preserves whitespace in unquoted strength and dose-form values.
+- `registerContextHelp` provides contextual editor help without inserting `?` into the document.
 - `checkProductQualifiers` checks the explicit strength/form pair and supported positive strength syntax.
 - `projectPlan` projects linked plan objects for Preview JSON.
 - `activate` starts the LanguageClient and registers editor functionality.
@@ -1133,16 +1175,16 @@ $env:LANGIUM_ROOT = $langiumRoot
 node.exe --test bridge/export-ast.test.mjs
 ~~~
 
-There are **9 tests**, including real parser/linker/validator execution, source positions, selected plans, and product qualifiers.
+There are **10 tests**, including real parser/linker/validator execution, source positions, selected plans, product qualifiers, and colon syntax with unquoted values.
 
 ### Extension tests
 
 ~~~powershell
 Set-Location $langiumRoot
-node.exe --test packages/extension/test/rxnorm.test.mjs
+node.exe --test packages/extension/test/context-help.test.mjs packages/extension/test/rxnorm.test.mjs
 ~~~
 
-There are **22 tests** covering process orchestration, unknown medications, product feedback, preview state, and invalidation of obsolete results.
+The two suites contain **25 tests**: 3 contextual-help tests and 22 RxNorm tests covering process orchestration, unknown medications, product feedback, preview state, and invalidation of obsolete results.
 
 Simulated-process UI tests are separate from a complete import of a real NLM release and a visual check on Windows. Run the database check and the saved-document editor examples on the target VM.
 
