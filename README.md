@@ -11,7 +11,7 @@ This is a personal integration laboratory for work that can later be adapted to 
 
 1. [Purpose and architecture](#1-purpose-and-architecture)
 2. [Libraries and tools](#2-libraries-and-tools)
-3. [What ZIO does in this project](#3-what-zio-does-in-this-project)
+3. [Scala execution flow: JSON to terminology report](#3-scala-execution-flow-json-to-terminology-report)
 4. [RxNorm and the PostgreSQL data model](#4-rxnorm-and-the-postgresql-data-model)
 5. [Windows installation and project setup](#5-windows-installation-and-project-setup)
 6. [Configure local PostgreSQL](#6-configure-local-postgresql)
@@ -122,60 +122,144 @@ Node's built-in modules also do significant work:
 - `node:child_process.spawn` starts Node and Java without a command shell.
 - `JSON.parse` / `JSON.stringify` handle plain JSON at the TypeScript/JavaScript boundary.
 
-## 3. What ZIO does in this project
+## 3. Scala execution flow: JSON to terminology report
 
-ZIO is a Scala library for describing and executing effects: database operations, file access, console output, failures, and resource management.
+The `resolve <ast.json> <result.json>` command receives a **JSON file path**. It decodes structured fields, reads a release-specific PostgreSQL snapshot, applies pure Scala terminology rules, and writes a report. ZIO sequences these operations and manages failures/resources; it does not decide which medication matches.
 
-A value of type `ZIO[R, E, A]` describes a computation that:
+### Execution and failure boundaries
 
-- Requires an environment `R`.
-- Can fail with an error `E`.
-- Produces a result `A` when successful.
-
-`Task[A]` is an alias for `ZIO[Any, Throwable, A]`: no special environment is required, failures are represented by exceptions, and success produces `A`.
-
-The resolver itself is ordinary pure Scala. ZIO surrounds it where the application interacts with the operating system.
-
-### The effect APIs actually used
-
-| API | Role in this implementation |
-| --- | --- |
-| `ZIOAppDefault` | Provides the application's executable entry point and runtime. |
-| `getArgs` | Reads CLI arguments such as `lookup`, `resolve`, or `import-rxnorm`. |
-| `ZIO.attempt` | Captures potentially throwing computations as effects. |
-| `ZIO.attemptBlocking` | Runs blocking JDBC or filesystem work on ZIO's blocking executor. |
-| `ZIO.scoped` | Establishes a lifetime for acquired resources. |
-| `ZIO.acquireRelease` | Pairs acquiring a connection/resource with its finalizer. |
-| `flatMap` / a `for` comprehension | Sequences dependent operations and passes their results forward. |
-| `Console.printLine` | Writes summaries and lookup reports. |
-| `ZIO.fail` | Represents an explicit failed computation, including invalid CLI usage. |
-
-For example, the `resolve` branch in [Main.scala](src/main/scala/lab/Main.scala) performs this sequence:
-
-~~~scala
-for
-  ast <- readInput(input)
-  store <- PostgresStore.open
-  snapshot <- store.snapshotForResolution(ast)
-  report <- ZIO.attempt(Resolver.resolve(ast, snapshot))
-  // Calculate runId, save the binding, and write the report.
-yield ()
+~~~mermaid
+flowchart TD
+    A["Main.run: resolve input output"] --> B["readInput: Files.readString and fromJson AstRequest"]
+    B --> C["InputValidation.validate: contract and source integrity"]
+    C --> D["PostgresStore.open: configuration and ensureSchema"]
+    D --> E["snapshotForResolution: names, forms and product-data flag"]
+    E --> F["readSnapshot: scoped JDBC connection and REPEATABLE READ"]
+    F --> G["Ready release, exact name queries, bounded relationships and attributes"]
+    G --> H["RxSnapshot in memory; JDBC connection closed"]
+    H --> I["Resolver.resolve: revalidate input, release and scope"]
+    I --> J["Resolve each mention: name, role, product and ingredients"]
+    J --> K["ResolutionReport: findings, evidence and hashes"]
+    K --> L["Main.run: calculate deterministic runId"]
+    L --> M["saveBinding: commit request and report in PostgreSQL"]
+    M --> N["writeJson: temporary file then replace output"]
+    N --> O["Console summary and successful completion"]
+    B -.-> X["Decode, validation or I/O failure: stop dependent steps"]
+    C -.-> X
+    D -.-> X
+    F -.-> X
+    G -.-> X
+    I -.-> X
+    M -.-> X
+    N -.-> X
+    X --> Y["ZIO failure; CLI fails without a structured error-report JSON"]
 ~~~
 
-This is an abbreviated explanation of the existing code, not an additional implementation.
+A terminology finding such as `unresolved` is a normal report result. A malformed request or database failure aborts the command. There is **no automatic retry** and no HTTP response in this CLI.
 
-A failure in a dependency stops the later steps. A PostgreSQL connection error therefore does not become a fabricated successful lookup.
+### 1. Decode fields and verify their integrity
 
-### ZIO scopes versus database transactions
+Sources: [Main.scala](src/main/scala/lab/Main.scala), [Domain.scala](src/main/scala/lab/Domain.scala).
 
-They solve different problems:
+| Function / field | Implemented decision |
+| --- | --- |
+| `readInput → raw.fromJson[AstRequest]` | zio-json decodes the file into case classes. Required fields/types must decode; `@jsonNoExtraFields` rejects unknown input keys. Decode errors become `IllegalArgumentException`. |
+| `AstRequest.mentions` | Each `Mention` already contains `originalText` (medication name), `productStrength`, `doseForm`, `dose.amount/unit`, `route`, `frequency`, role, IDs and source location. Scala reads these fields; it does not extract strength from the medication name or reparse the DSL. |
+| `InputValidation.validate` | Requires input schema `1`, policy `exact-v1`, a valid release label, nonempty mentions, unique mention/order IDs and nonempty patient/order references. |
+| Dose and role checks | Positive `BigDecimal` dose; allowed unit, route and frequency; role must be `medication`, `activeIngredient` or `medicationProduct`. These are representation checks, not prescribing-safety checks. |
+| Qualifier checks | A supplied strength must pass `ProductStrength.parse`; a supplied form must be nonblank and at most 200 characters. The requirement to supply both qualifiers is handled later by `ProductSelector.select`. |
+| Source checks | URI must match the document; line/character/offset values must agree with its UTF-16 text; range must be ordered; extracted substring must equal `source.text`, which must contain `originalText`. |
+| Integrity boundary | These checks verify internal consistency. Scala does not independently prove that every dose/qualifier field was faithfully extracted from the DSL, or that a patient reference names a real patient. |
 
-- **Resource scope:** ensures a JDBC connection is closed when its operation ends.
-- **Database transaction:** ensures the database changes are committed together or rolled back.
+### 2. Normalize lookup keys, not the whole JSON
 
-`PostgresStore.use` acquires a connection with `ZIO.acquireRelease`. `PostgresStore.transaction` turns off auto-commit, executes the operation, commits on success, and rolls back on failure.
+[`TextKey.normalize`](src/main/scala/lab/Domain.scala) applies **Unicode NFKC → trim → collapse whitespace → lowercase with Locale.ROOT**. `Rrf.normalize` implements the same steps for database lookup keys. The original mention and source text remain available in the report.
 
-ZIO does not make JDBC nonblocking. JDBC remains blocking; `attemptBlocking` keeps that work off the main compute executor. RRF reading is incremental through buffered Java readers and callbacks; this implementation does not use ZIO Streams.
+| Input / operation | Behaviour |
+| --- | --- |
+| `Aspirin`, `ASPIRIN`, ` aspirin ` | Same lookup key: `aspirin`. A match still requires that name in the imported release. |
+| `Oral   Tablet` | Lookup key becomes `oral tablet`; dose-form matching uses the same normalization. |
+| `asprin` | No spelling correction. If absent from the eligible imported names, the result is `unresolved`. |
+| Punctuation or alternative name | Punctuation is retained. A synonym matches only if imported terminology supplies it; no invented alias or fuzzy match. |
+| Strength such as `0.325 g` | Separately parsed by `ProductStrength.parse` into mass in mg and optional volume in ml; `equivalent` compares decimal masses or cross-multiplies concentrations. Administered dose is never substituted for product strength. |
+| Units, route and frequency | Input validation uses explicit case-sensitive sets; medication-name normalization does not silently repair these fields. |
+
+### 3. Connect through JDBC and load evidence
+
+Source: [PostgresStore.scala](src/main/scala/lab/PostgresStore.scala).
+
+| Function | Access / checks |
+| --- | --- |
+| `PGConfig.fromEnvironment → PostgresStore.open` | Reads PostgreSQL environment variables; requires a password, loopback host, valid port, simple database identifier and nonempty credentials. `ensureSchema` initializes the schema under an advisory transaction lock. |
+| `connect` | Calls `DriverManager.getConnection(jdbc:postgresql://..., properties)`; credentials are properties. Sets `connectTimeout=10` seconds and `sslmode=disable` for this loopback-only lab. This is not a query or whole-command timeout. |
+| `use` | `ZIO.acquireRelease` acquires/closes each operation's connection; `attemptBlocking` runs JDBC work on the blocking executor. No connection pool is implemented. |
+| `snapshotForResolution` | Reads names from `mentions.originalText` and optional `doseForm`; either product qualifier requests product-index data. |
+| `readSnapshot` | Requires a ready base release and matching scope. Product requests also require a ready product index with the supported policy. Reads names, concepts, relationships and attributes in one read-only `REPEATABLE READ` transaction. |
+| `query / strings / array` | Uses prepared statements and bound values/arrays. Name lookup compares both `md5(normalized)` and full normalized equality; the hash alone is not accepted as a match. Statements/results are closed and SQL arrays freed. |
+| Bounds and completeness | Requires 1–100 distinct terms; at most 5,000 product candidates; relationship closure bounded to 24 passes, 25,000 concepts and 100,000 edges. Exceeding a limit fails instead of returning a partial snapshot. |
+| `transaction` | Commits on success; catches `NonFatal`, attempts rollback and rethrows the original error. A rollback failure is attached as a suppressed exception. Connection-close failure becomes a ZIO defect through `orDie`. |
+
+### 4. Resolve each medication and validate its semantic role
+
+Sources: [Resolver.scala](src/main/scala/lab/Resolver.scala), [ProductSelector.scala](src/main/scala/lab/ProductSelector.scala), [ProductStrength.scala](src/main/scala/lab/ProductStrength.scala).
+
+~~~mermaid
+flowchart TD
+    A["Mention.originalText"] --> B["Resolver.candidates: exact normalized names grouped by RxCUI"]
+    B --> C{"Any candidates?"}
+    C -->|"No"| U["unresolved: UNRESOLVED_IN_DATASET"]
+    C -->|"Yes"| D["Filter canonical concept types by mention.role"]
+    D --> E{"Allowed candidates"}
+    E -->|"Zero"| V["invalidRole: SEMANTIC_TYPE_MISMATCH"]
+    E -->|"Several"| W["needsClarification: AMBIGUOUS_EXACT_MATCH"]
+    E -->|"One"| F{"Either product qualifier supplied?"}
+    F -->|"No"| G["Keep matched concept; select product only if SCD or SBD"]
+    F -->|"Yes"| H["ProductSelector.select: require strength and form"]
+    H --> I["Resolve exact DF; inspect ingredient or brand product paths"]
+    I --> J["Check one component, direct IN, form and imported RXN_STRENGTH"]
+    J --> K{"Complete evidence and number of matches"}
+    K -->|"Incomplete or several"| Q["needsClarification; retain diagnostics and candidates"]
+    K -->|"Complete, zero"| R["productNotFound"]
+    K -->|"Complete, one"| S["resolved; selectedProduct and productEvidence"]
+    G --> T["derive: permitted typed edges, cycle guard and evidence paths"]
+    S --> T
+    T --> Z["Resolution; then sharedIngredients across resolved orders"]
+~~~
+
+| Decision | Rule / result |
+| --- | --- |
+| Semantic role | `medication`: IN/PIN/MIN/BN/SCD/SBD; `activeIngredient`: IN/PIN; `medicationProduct`: SCD/SBD. A matching spelling alone does not establish the required type. |
+| Product prerequisites | Missing qualifier: `PRODUCT_FIELDS_REQUIRED`; ingredient-only role requesting a product: `PRODUCT_ROLE_MISMATCH`; unsupported initial concept: `PRODUCT_MATCH_SCOPE_UNSUPPORTED`. |
+| Dose-form resolution | Only exact candidates of type DF qualify. None: `DOSE_FORM_UNKNOWN` / `productNotFound`; several: `DOSE_FORM_AMBIGUOUS` / `needsClarification`. |
+| Product evidence | Follows permitted ingredient/brand/product links and `has_dose_form`. Requires a supported single component with a direct IN ingredient and consistent, parseable imported `RXN_STRENGTH` evidence. A single strength must not silently select a combination product. |
+| Product outcome | Zero verified matches: `PRODUCT_NOT_FOUND`; multiple: `PRODUCT_AMBIGUOUS`; missing/conflicting evidence in a potential product: `PRODUCT_EVIDENCE_INCOMPLETE`. Incomplete evidence takes priority over selecting another apparent match. |
+| Ingredients | Local `derive / visit / allowedStep` traverse allowed typed edges, track visited concepts, deduplicate ingredients and retain a deterministic supporting path. A brand alone does not establish a product's ingredients. |
+| Name-only success | May be `resolved` with `PRODUCT_NOT_SELECTED`; this is a concept match, not necessarily a selected product. A directly matched product without ingredient evidence receives `INGREDIENT_EVIDENCE_MISSING`. |
+
+### 5. Build, persist and return the JSON
+
+| Function / stage | Output and software decision |
+| --- | --- |
+| `Resolver.resolve → ResolutionReport` | Output schema `2`; policy/release/scope, snapshot fingerprint, input hash, per-mention status, original mention, matched concept, selected product, candidates, ingredient paths, diagnostics and product evidence. `clinicianConfirmed` remains `false`. |
+| `sharedIngredients` | Groups resolved ingredients by patient and distinct order IDs. Reports shared ingredients without claiming dose safety or drug interactions. |
+| `Hashing.sha256 / fingerprint` | `inputSha256` hashes the decoded request re-encoded with `a.toJson`, not the raw input-file bytes. Snapshot fingerprint hashes release, scope and sorted source-file hashes. |
+| `Main.run → runId` | Hashes input hash, snapshot fingerprint, policy and report hash. Same request/report evidence gives the same binding ID. |
+| `saveBinding` | Stores request/report in one transaction; on run-ID conflict, reads the stored values and requires exact equality. Conflicting evidence fails with `Binding runId already has different evidence`. |
+| `writeJson(report.toJsonPretty)` | Writes a temporary file in the destination directory, attempts atomic replacement, falls back to ordinary replacement if unsupported, and cleans up the temporary file. Console output then lists mention statuses and the binding ID. |
+| Output assurance | Typed report construction and derived codecs produce JSON. Scala does not re-decode the written report or run a separate output-schema validator. Source/hash/evidence fields support downstream verification. |
+
+### Failure handling and retry limits
+
+| Failure class | What the current implementation does |
+| --- | --- |
+| Invalid JSON or request | Fails before database lookup; examples: `Unsupported schemaVersion`, `Duplicate mention IDs`, `Source text mismatch`, `Unsupported product strength: use mass or mass/ml`. |
+| Missing release/product import | Fails snapshot loading with `No ready local release ...` or `Product index unavailable ...`. This occurs before per-medication matching in the normal CLI path. |
+| JDBC authentication, connection or SQL error | Propagates the exception through ZIO; dependent steps stop; active transactions attempt rollback and scoped connections close. No retry/backoff or custom SQL-error-to-JSON mapping. |
+| Terminology unknown, ambiguous or mismatched | Returns a normal `Resolution` status and diagnostic; other mentions are still processed. No guessed correction or automatic candidate selection. |
+| Persistence or output-file failure | Fails the command. Database commit precedes file writing: the binding can exist even if output writing fails. Rerunning the same request can reuse the identical binding. |
+| Existing result file | Early failure does not remove a previous output file. A caller must check process success rather than treating an old file as this run's result. |
+
+**ZIO's boundary:** `ZIOAppDefault` supplies the runtime; the `for` comprehension sequences dependent steps; `attempt / attemptBlocking` capture exceptions; `scoped / acquireRelease` manage resource lifetime. Database rollback is implemented explicitly in `transaction`. Idempotent persistence permits safe repetition with identical evidence, but is not an automatic retry mechanism.
 
 ## 4. RxNorm and the PostgreSQL data model
 
