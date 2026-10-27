@@ -1,14 +1,22 @@
 # setup options
 param(
     [string]$Root = (Get-Location).Path,
-    [int]$Port = 55433,
+    [ValidateRange(1, 65535)][int]$Port = 55433,
     [string]$ContainerName = 'aurora-medication-auto-pg',
     [string]$VolumeName = 'aurora-medication-auto-pgdata',
+    [string]$ScalaBranch = 'main',
+    [string]$LangiumBranch = 'main',
     [switch]$NoEditor,
-    [switch]$Help
+    [switch]$Help,
+    [ValidateRange(30, 600)][int]$StartupTimeoutSeconds = 180,
+    [Parameter(DontShow = $true)][ValidateRange(0, 2)][int]$RelaunchCount = 0
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
+$OriginalLocation = Get-Location
+$EntryHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+$HealthFile = $null
 $Utf8 = New-Object Text.UTF8Encoding($false)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 # stop if a command fails
@@ -20,11 +28,121 @@ function Run([scriptblock]$Command) {
 function Save-Json($Path, $Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 8), $Utf8)
 }
-if ($Help) {
-    Write-Host 'Usage: .\bootstrap-windows.ps1 [-Root directory] [-Port 55433] [-ContainerName name] [-VolumeName name] [-NoEditor]'
-    Write-Host 'The current folder is the default destination. Install Git, Java 21 (JAVA_HOME), Node 22.12+, Docker Desktop with Linux containers, and VS Code first.'
-    exit
+
+# Never reset a user's source files or unpublished commits. Only disposable build
+# outputs are stashed (and retained) so the binaries tracked by legacy clones do
+# not make every subsequent run fail its clean-worktree check.
+function Sync-Repo([string]$Name, [string]$BranchName, [string[]]$GeneratedPatterns) {
+    $directory = Join-Path $Root $Name
+    $url = "https://github.com/bogdanparvu18/$Name.git"
+    Run { git.exe check-ref-format --branch $BranchName } | Out-Null
+    $remoteRef = "refs/remotes/origin/$BranchName"
+    if (-not (Test-Path -LiteralPath $directory)) {
+        Run { git.exe clone --branch $BranchName $url $directory } | Out-Host
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $directory '.git'))) {
+        throw "$directory is not a Git checkout. Move it aside or choose another Root."
+    }
+    $origin = (Run { git.exe -C $directory remote get-url origin }).Trim()
+    if ($origin -notin @($url, $url.Substring(0, $url.Length - 4), "git@github.com:bogdanparvu18/$Name.git")) {
+        throw "Unexpected origin in $directory. Refusing to update another repository."
+    }
+    # An explicit refspec also works for older/single-branch installations.
+    Run { git.exe -C $directory fetch --prune origin "+refs/heads/${BranchName}:${remoteRef}" } | Out-Host
+    $before = (Run { git.exe -C $directory rev-parse HEAD }).Trim()
+    $remote = (Run { git.exe -C $directory rev-parse $remoteRef }).Trim()
+    $branch = [string](Run { git.exe -C $directory branch --show-current })
+    if ($branch -and $branch -ne $BranchName -and $branch -ne 'main') {
+        throw "$directory is on branch '$branch'. Switch to $BranchName before running the bootstrap."
+    }
+    if ([int](Run { git.exe -C $directory rev-list --count "${remoteRef}..HEAD" }) -ne 0) {
+        throw "$directory has unpublished or divergent commits. Reconcile them with origin/$BranchName first."
+    }
+    $localMain = @(Run { git.exe -C $directory branch --list $BranchName })
+    if ($localMain.Count -gt 0 -and [int](Run { git.exe -C $directory rev-list --count "${remoteRef}..${BranchName}" }) -ne 0) {
+        throw "$directory has a local $BranchName that is ahead of or diverges from origin/$BranchName. No commits were discarded."
+    }
+    $changed = @(Run { git.exe -c core.quotepath=false -C $directory diff --name-only -- })
+    $changed += @(Run { git.exe -c core.quotepath=false -C $directory diff --cached --name-only -- })
+    $untracked = @(Run { git.exe -c core.quotepath=false -C $directory ls-files --others --exclude-standard })
+    $paths = @(@($changed) + @($untracked) | Sort-Object -Unique)
+    $generated = @()
+    foreach ($path in $paths) {
+        if (-not $path) { continue }
+        $isGenerated = $false
+        foreach ($pattern in $GeneratedPatterns) {
+            if ($path -like $pattern) { $isGenerated = $true; break }
+        }
+        if (-not $isGenerated) {
+            throw "Local source/untracked file in ${directory}: $path. Commit, stash, or move your changes first; nothing was overwritten."
+        }
+        $generated += $path
+    }
+    if ($generated.Count -gt 0) {
+        # NUL-separated literal pathspecs handle spaces and avoid Windows' argv limit.
+        $pathspec = [IO.Path]::GetTempFileName()
+        try {
+            $literalPaths = @($generated | ForEach-Object { ':(literal)' + $_ })
+            [IO.File]::WriteAllText($pathspec, (($literalPaths -join "`0") + "`0"), $Utf8)
+            $label = 'bootstrap-generated-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            Run { git.exe -c 'user.name=Medication Lab Bootstrap' -c 'user.email=bootstrap@localhost' -C $directory stash push --include-untracked -m $label "--pathspec-from-file=$pathspec" --pathspec-file-nul } | Out-Host
+            $backup = (Run { git.exe -C $directory rev-parse refs/stash }).Trim()
+            Write-Host "Preserved generated-output changes in ${Name}: stash $backup (not reapplied)."
+        } finally { Remove-Item -LiteralPath $pathspec -Force }
+    }
+    # Migrate the old detached, pinned checkout onto the moving main branch.
+    if ($branch -ne $BranchName) {
+        if ($localMain.Count -gt 0) { Run { git.exe -C $directory checkout $BranchName } | Out-Host }
+        else { Run { git.exe -C $directory checkout --track -b $BranchName $remoteRef } | Out-Host }
+    }
+    Run { git.exe -C $directory merge --ff-only $remoteRef } | Out-Host
+    $after = (Run { git.exe -C $directory rev-parse HEAD }).Trim()
+    if ($after -ne $remote) { throw "$Name did not reach the fetched origin/$BranchName. Setup stopped." }
+    Write-Host "${Name}: $before -> $after (origin/$BranchName)"
+    return @{ repository = $Name; branch = $BranchName; before = $before; after = $after }
 }
+function Get-DockerType {
+    # Expected startup failures must not terminate Windows PowerShell 5.1 here.
+    $ErrorActionPreference = 'Continue'
+    $value = & docker.exe info --format '{{.OSType}}' 2>$null
+    if ($LASTEXITCODE -eq 0) { return ([string]$value).Trim() }
+    return ''
+}
+function Ensure-Docker {
+    $type = Get-DockerType
+    if (-not $type) {
+        $desktop = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
+        if (-not (Test-Path -LiteralPath $desktop)) { throw 'Start Docker Desktop, then rerun this script.' }
+        Write-Host 'Starting Docker Desktop and waiting for its engine...'
+        Start-Process -FilePath $desktop | Out-Null
+        $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
+        do {
+            Start-Sleep -Seconds 2
+            $type = Get-DockerType
+        } until ($type -or (Get-Date) -ge $deadline)
+    }
+    if ($type -ne 'linux') { throw 'Docker is not ready in Linux-container mode. Check Docker Desktop and rerun.' }
+}
+function Assert-Postgres {
+    $running = Run { docker.exe inspect --format '{{.State.Running}}' $ContainerName }
+    if ($running -ne 'true') { throw 'PostgreSQL container is not running.' }
+    Run { docker.exe exec $ContainerName pg_isready -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public } | Out-Host
+    $answer = Run { docker.exe exec -e PGPASSWORD $ContainerName psql -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SELECT 1;' }
+    if ($answer -ne '1') { throw 'Authenticated PostgreSQL query failed.' }
+}
+function Invoke-Sbt([string[]]$Commands) {
+    Push-Location $Scala
+    try {
+        Run { & $Java -Xmx2G '-Dsbt.supershell=false' '-Dsbt.log.noformat=true' '-Dsbt.server.autostart=false' -jar $Launcher @Commands } | Out-Host
+    } finally { Pop-Location }
+}
+
+if ($Help) {
+    Write-Host 'Usage: .\bootstrap-windows.ps1 [-Root directory] [-Port 55433] [-ContainerName name] [-VolumeName name] [-NoEditor] [-StartupTimeoutSeconds 180] [-ScalaBranch main] [-LangiumBranch main]'
+    Write-Host 'The current folder is the default destination. Install Git, Java 21 (JAVA_HOME), Node 22.12+, Docker Desktop with Linux containers, and VS Code first.'
+    return
+}
+try {
 # check the installed tools
 $Root = [IO.Path]::GetFullPath($Root)
 Write-Host "Setup folder: $Root"
@@ -38,8 +156,10 @@ $NodeHome = Split-Path (Get-Command node.exe).Source -Parent
 $env:PATH = "$JavaHome\bin;$NodeHome;$env:PATH"
 $nodeVersion = Run { node.exe --version }
 if ([version]$nodeVersion.TrimStart('v') -lt [version]'22.12.0') { throw 'Install Node 22.12 or newer.' }
-$dockerType = Run { docker.exe info --format '{{.OSType}}' }
-if ($dockerType -ne 'linux') { throw 'Start Docker Desktop with Linux containers.' }
+$npmVersion = Run { npm.cmd --version }
+if ([version]$npmVersion.Trim() -lt [version]'10.2.3') { throw 'Install npm 10.2.3 or newer.' }
+Run { & $Java -version } | Out-Host
+Ensure-Docker
 
 # keep setup files together
 $Automatic = Join-Path $Root 'medication-lab-setup\automatic'
@@ -51,6 +171,8 @@ $Profile = Join-Path $Automatic 'editor-profile'
 foreach ($directory in @($Root, $State, "$Tools\sbt\bin", $Downloads, "$Data\rrf", "$Profile\User")) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
+$HealthFile = Join-Path $State 'health.json'
+Save-Json $HealthFile @{ status = 'running'; startedAt = (Get-Date).ToUniversalTime().ToString('o') }
 # save the password in a private folder
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 Run { icacls.exe $State '/inheritance:r' '/grant:r' "${identity}:(OI)(CI)F" 'SYSTEM:(OI)(CI)F' } | Out-Null
@@ -65,37 +187,37 @@ $env:PGUSER = 'rxnorm_lab'
 $env:PGPASSWORD = $secrets.password
 $env:POSTGRES_PASSWORD = $secrets.password
 
-# clone the demo repos if missing
-foreach ($repo in @(
-    @{ name = 'scala-testing-lab'; commit = '6d5f13851c4cccd90273d3a2e25688e2ba15028b' },
-    @{ name = 'langium_dsl_lab'; commit = 'd7f75fee45838345c5b902c8f22bf8cd87bfd224' }
-)) {
-    $directory = Join-Path $Root $repo.name
-    if (-not (Test-Path $directory)) {
-        Run { git.exe clone "https://github.com/bogdanparvu18/$($repo.name).git" $directory }
-        Run { git.exe -C $directory checkout --detach $repo.commit }
-    }
-    $head = Run { git.exe -C $directory rev-parse HEAD }
-    if ($head -ne $repo.commit) { throw "$directory uses another revision. Choose a new Root to preserve that checkout." }
-}
+# Always fetch and fast-forward both repositories; there are no pinned code SHAs.
+$RepoHeads = @(
+    Sync-Repo 'scala-testing-lab' $ScalaBranch @('target/*', 'project/target/*', 'project/project/target/*', '.metals/*', '.bsp/*', '.bloop/*')
+    Sync-Repo 'langium_dsl_lab' $LangiumBranch @('clinical-dsl-demo/node_modules/*', 'clinical-dsl-demo/packages/*/node_modules/*', 'clinical-dsl-demo/packages/*/out/*', 'clinical-dsl-demo/*.tsbuildinfo', 'clinical-dsl-demo/packages/language/src/generated/*', 'clinical-dsl-demo/packages/language/syntaxes/*', 'clinical-dsl-demo/packages/extension/syntaxes/*')
+)
 $Scala = Join-Path $Root 'scala-testing-lab'
 $Langium = Join-Path $Root 'langium_dsl_lab\clinical-dsl-demo'
+# A downloaded/old bootstrap must use the newly fetched setup logic this run.
+$UpdatedScript = Join-Path $Scala 'scripts\bootstrap-windows.ps1'
+if ((Get-FileHash -LiteralPath $UpdatedScript -Algorithm SHA256).Hash -ne $EntryHash) {
+    if ($RelaunchCount -ge 2) { throw 'Bootstrap changed repeatedly while updating. Rerun once upstream is stable.' }
+    Write-Host 'Bootstrap changed upstream; restarting with the updated script.'
+    $next = @{ Root = $Root; Port = $Port; ContainerName = $ContainerName; VolumeName = $VolumeName; ScalaBranch = $ScalaBranch; LangiumBranch = $LangiumBranch; NoEditor = [bool]$NoEditor; StartupTimeoutSeconds = $StartupTimeoutSeconds; RelaunchCount = ($RelaunchCount + 1) }
+    & $UpdatedScript @next
+    return
+}
 # get the scala launcher
 $Launcher = Join-Path $Tools 'sbt\bin\sbt-launch.jar'
 if (-not (Test-Path $Launcher)) { Invoke-WebRequest -UseBasicParsing 'https://repo.maven.apache.org/maven2/org/scala-sbt/sbt-launch/1.10.2/sbt-launch-1.10.2.jar' -OutFile $Launcher }
 if ((Get-FileHash $Launcher).Hash -ne 'cdd6963b622f42690cb2e3154bde3f3257a03839f216e1b5d7420000d6a71817') { throw 'sbt launcher checksum failed.' }
 Save-Json "$Tools\layout.json" @{ javaHome = $JavaHome; nodeHome = $NodeHome; sbtHome = "$Tools\sbt" }
-# reuse the dependencies and build
-Set-Location $Langium
-$installedLock = 'node_modules\.package-lock.json'
-$install = -not (Test-Path $installedLock) -or (Get-Item package-lock.json).LastWriteTime -gt (Get-Item $installedLock -ErrorAction SilentlyContinue).LastWriteTime
-if ($install) { Run { npm.cmd ci } }
-$output = 'packages\extension\out\extension\main.cjs'
-$build = $install -or -not (Test-Path $output) -or -not (Test-Path 'packages\language\out\index.js') -or -not (Test-Path 'packages\extension\syntaxes\clinical-dsl.tmLanguage.json')
-if (-not $build) { $build = (Get-Item package-lock.json).LastWriteTime -gt (Get-Item $output).LastWriteTime }
-if ($build) {
-    Run { npm.cmd run langium:generate }
-    Run { npm.cmd run build }
+# Reinstall locked dependencies and rebuild EVERYTHING on EVERY run.
+Push-Location $Langium
+try {
+    Run { npm.cmd ci --include=dev } | Out-Host
+    Run { npm.cmd run clean } | Out-Host
+    Run { npm.cmd run langium:generate } | Out-Host
+    Run { npm.cmd run build } | Out-Host
+} finally { Pop-Location }
+foreach ($artifact in @('packages\language\out\index.js', 'packages\extension\out\extension\main.cjs', 'packages\extension\out\language\main.cjs', 'packages\extension\syntaxes\clinical-dsl.tmLanguage.json')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Langium $artifact))) { throw "Missing build artifact: $artifact" }
 }
 
 # create or start the database container
@@ -110,16 +232,18 @@ if ($ContainerName -in $containers) {
 } else {
     $volumes = @(Run { docker.exe volume ls --format '{{.Name}}' })
     if ($VolumeName -in $volumes) { throw 'This volume already exists without its matching container. Choose another VolumeName; existing data was preserved.' }
-    Run { docker.exe run -d --name $ContainerName -e POSTGRES_USER=rxnorm_lab -e POSTGRES_DB=rxnorm_public -e POSTGRES_PASSWORD -p "127.0.0.1:${Port}:5432" -v "${VolumeName}:/var/lib/postgresql/data" postgres:16 }
+    Run { docker.exe run -d --restart unless-stopped --name $ContainerName -e POSTGRES_USER=rxnorm_lab -e POSTGRES_DB=rxnorm_public -e POSTGRES_PASSWORD -p "127.0.0.1:${Port}:5432" -v "${VolumeName}:/var/lib/postgresql/data" postgres:16 }
 }
+Run { docker.exe update --restart unless-stopped $ContainerName } | Out-Host
 # wait for postgres
-for ($attempt = 0; $attempt -lt 60; $attempt++) {
+for ($attempt = 0; $attempt -lt $StartupTimeoutSeconds; $attempt++) {
     docker.exe exec $ContainerName pg_isready -U rxnorm_lab -d rxnorm_public | Out-Null
     if ($LASTEXITCODE -eq 0) { break }
     Start-Sleep -Seconds 1
 }
 if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL did not become ready. Check docker logs.' }
-Run { docker.exe exec -e PGPASSWORD $ContainerName psql -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -c 'SELECT 1;' } | Out-Null
+Assert-Postgres
+Invoke-Sbt @('clean', 'compile')
 # skip the import if this data is ready
 $query = @"
 SELECT 1 FROM rxnorm_lab.release r JOIN rxnorm_lab.product_release p USING (release)
@@ -136,16 +260,50 @@ if ($ready -ne '1') {
     if (-not (Test-Path $Zip)) { Invoke-WebRequest -UseBasicParsing 'https://download.nlm.nih.gov/rxnorm/RxNorm_full_prescribe_10052026.zip' -OutFile $Zip }
     if ((Get-FileHash $Zip).Hash -ne '8ed351c29f3cb56bedeb8e2bcb8fa56931f8d7eb88e2280dc9772d7d3eb16977') { throw 'RxNorm download checksum failed.' }
     Expand-Archive -LiteralPath $Zip -DestinationPath $Data -Force
-    Set-Location $Scala
     $rrf = '../medication-lab-setup/automatic/data/2026-10-05/rrf'
-    Run { & $Java -Xmx2G '-Dsbt.supershell=false' '-Dsbt.log.noformat=true' -jar $Launcher "run import-rxnorm $rrf 2026-10-05" }
-    Run { & $Java -Xmx2G '-Dsbt.supershell=false' '-Dsbt.log.noformat=true' -jar $Launcher "run import-product-attributes $rrf 2026-10-05" }
+    Invoke-Sbt @("run import-rxnorm $rrf 2026-10-05")
+    Invoke-Sbt @("run import-product-attributes $rrf 2026-10-05")
     Run { docker.exe exec $ContainerName psql -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -c 'ANALYZE;' }
 } else { Write-Host 'RxNorm is already imported.' }
+$verified = Run { docker.exe exec $ContainerName psql -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -Atc $query }
+if ($verified -ne '1') { throw 'RxNorm release/product index verification failed after import.' }
+Invoke-Sbt @('test')
 
 # leave an existing demo file alone
 $Demo = Join-Path $Automatic 'aspirin-demo.clinical'
 if (-not (Test-Path $Demo)) { [IO.File]::WriteAllText($Demo, "Patient P9999: age 30, condition Fever`nMedication aspirin: 100 mg, strength 325 mg, doseForm Oral Tablet, route PO, frequency PRN`nPlan DemoPlan: for P9999, prescribe aspirin`nshow DemoPlan`n", $Utf8) }
+# Fresh fixtures/results live outside both repositories. Never overwrite the user's demo.
+$Smoke = Join-Path $State ('smoke-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $Smoke | Out-Null
+$fixture = "Patient P9999: age 30, condition Fever`nMedication aspirin: 100 mg, strength 325 mg, doseForm Oral Tablet, route PO, frequency PRN`nPlan DemoPlan: for P9999, prescribe aspirin`nshow DemoPlan`n"
+foreach ($case in @('valid', 'invalid')) {
+    $text = $fixture
+    if ($case -eq 'invalid') { $text = $text.Replace('strength 325 mg', 'strength 32500 mg') }
+    $inputFile = Join-Path $Smoke "$case.clinical"
+    $astFile = Join-Path $Smoke "$case.ast.json"
+    $resultFile = Join-Path $Smoke "$case.result.json"
+    [IO.File]::WriteAllText($inputFile, $text, $Utf8)
+    Run { node.exe "$Scala\bridge\export-ast.mjs" --langium-root $Langium --input $inputFile --release 2026-10-05 --output $astFile } | Out-Host
+    # Forward slashes + quoted sbt arguments support a Root containing spaces.
+    $astArg = $astFile.Replace('\', '/')
+    $resultArg = $resultFile.Replace('\', '/')
+    Invoke-Sbt @("run resolve `"$astArg`" `"$resultArg`"")
+    $report = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+    $items = @($report.resolutions)
+    if ($report.terminologyRelease -ne '2026-10-05' -or $items.Count -ne 1) { throw "Unexpected $case smoke-test report." }
+    $item = $items[0]
+    if ($case -eq 'valid') {
+        if ($item.status -ne 'resolved' -or -not $item.selectedProduct.rxcui -or -not $item.productEvidence) {
+            throw "Valid clinical fixture did not resolve to a supported RxNorm product. Inspect $resultFile"
+        }
+    } elseif ($item.status -ne 'productNotFound' -or -not (@($item.diagnostics) -match '^PRODUCT_NOT_FOUND:')) {
+        throw "Invalid fixture did not produce PRODUCT_NOT_FOUND. Inspect $resultFile"
+    }
+    Write-Host "PASS: $case .clinical -> Langium -> Scala -> PostgreSQL/RxNorm"
+}
+# Probe the actual freshly bundled Node language server, not just node --version.
+Run { node.exe "$Scala\scripts\bootstrap-lsp-smoke.mjs" "$Langium\packages\extension\out\language\main.cjs" "$Smoke\valid.clinical" } | Out-Host
+Assert-Postgres
 # turn on auto-save and database checks
 $settings = @{}
 $settingsFile = Join-Path $Profile 'User\settings.json'
@@ -162,5 +320,23 @@ foreach ($key in $requiredSettings.Keys) { $settings[$key] = $requiredSettings[$
 Save-Json $settingsFile $settings
 # open the demo in the editor
 if (-not $NoEditor) { Run { code.cmd --new-window --user-data-dir $Profile "--extensionDevelopmentPath=$Langium\packages\extension" $Langium $Demo } }
-Write-Host "Ready: $Demo"
+Save-Json $HealthFile @{
+    status = 'ready'; checkedAt = (Get-Date).ToUniversalTime().ToString('o')
+    repositories = $RepoHeads; postgres = 'authenticated-query-pass'; rxnorm = 'ready'
+    scala = 'clean-compile-test-pass'; langium = 'clean-generate-build-pass'
+    clinicalValid = 'pass'; clinicalInvalid = 'pass'; languageServer = 'initialize-diagnostics-pass'
+    smokeDirectory = $Smoke; editorLaunchRequested = (-not $NoEditor)
+}
+Write-Host "READY: repository updates, builds, PostgreSQL, RxNorm and runtime smoke tests passed."
+Write-Host "Demo: $Demo"
+Write-Host "Health report: $HealthFile"
+Write-Host 'sbt/npm are completed build commands, not background services. The editor owns its Node language server.'
+if (-not $NoEditor) { Write-Host 'VS Code launch requested; editor-extension activation is not asserted by this headless check.' }
 Write-Host 'Change strength 325 mg to strength 32500 mg and pause to see PRODUCT_NOT_FOUND.'
+} catch {
+    if ($HealthFile) {
+        try { Save-Json $HealthFile @{ status = 'failed'; failedAt = (Get-Date).ToUniversalTime().ToString('o'); error = $_.Exception.Message } }
+        catch { Write-Warning 'Could not write the failed health report.' }
+    }
+    throw
+} finally { Set-Location $OriginalLocation }
