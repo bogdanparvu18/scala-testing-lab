@@ -273,7 +273,8 @@ Invoke-Sbt @('test')
 $Demo = Join-Path $Automatic 'aspirin-demo.clinical'
 if (-not (Test-Path $Demo)) { [IO.File]::WriteAllText($Demo, "Patient P9999: age 30, condition Fever`nMedication aspirin: 100 mg, strength 325 mg, doseForm Oral Tablet, route PO, frequency PRN`nPlan DemoPlan: for P9999, prescribe aspirin`nshow DemoPlan`n", $Utf8) }
 # Fresh fixtures/results live outside both repositories. Never overwrite the user's demo.
-$Smoke = Join-Path $State ('smoke-' + [guid]::NewGuid().ToString('N'))
+$SmokeName = 'smoke-' + [guid]::NewGuid().ToString('N')
+$Smoke = Join-Path $State $SmokeName
 New-Item -ItemType Directory -Path $Smoke | Out-Null
 $fixture = "Patient P9999: age 30, condition Fever`nMedication aspirin: 100 mg, strength 325 mg, doseForm Oral Tablet, route PO, frequency PRN`nPlan DemoPlan: for P9999, prescribe aspirin`nshow DemoPlan`n"
 foreach ($case in @('valid', 'invalid')) {
@@ -284,10 +285,12 @@ foreach ($case in @('valid', 'invalid')) {
     $resultFile = Join-Path $Smoke "$case.result.json"
     [IO.File]::WriteAllText($inputFile, $text, $Utf8)
     Run { node.exe "$Scala\bridge\export-ast.mjs" --langium-root $Langium --input $inputFile --release 2026-10-05 --output $astFile } | Out-Host
-    # Forward slashes + quoted sbt arguments support a Root containing spaces.
-    $astArg = $astFile.Replace('\', '/')
-    $resultArg = $resultFile.Replace('\', '/')
-    Invoke-Sbt @("run resolve `"$astArg`" `"$resultArg`"")
+    # Invoke-Sbt runs from the sibling Scala checkout. Relative, space-free
+    # arguments avoid Windows PowerShell 5.1's nested native-argument quoting.
+    # Root itself may contain spaces; only these generated relative names are used.
+    $astArg = "../medication-lab-setup/automatic/state/$SmokeName/$case.ast.json"
+    $resultArg = "../medication-lab-setup/automatic/state/$SmokeName/$case.result.json"
+    Invoke-Sbt @("run resolve $astArg $resultArg")
     $report = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
     $items = @($report.resolutions)
     if ($report.terminologyRelease -ne '2026-10-05' -or $items.Count -ne 1) { throw "Unexpected $case smoke-test report." }
