@@ -476,7 +476,7 @@ $DatabaseMode = 'local'
 if ($UseDocker) {
     $DatabaseMode = 'docker'
     if (($PgHost -and $PgHost -ne '127.0.0.1') -or ($Database -and $Database -ne 'rxnorm_public') -or
-        ($DbUser -and $DbUser -ne 'scala_lab') -or $PsqlPath -or $PgServiceName) {
+        ($DbUser -and $DbUser -ne 'rxnorm_lab') -or $PsqlPath -or $PgServiceName) {
         throw '-UseDocker uses its managed rxnorm_public / rxnorm_lab database on 127.0.0.1. Local-only connection/tool/service options cannot be combined with it.'
     }
     if (-not $PSBoundParameters.ContainsKey('Port')) { $Port = 55433 }
