@@ -14,12 +14,12 @@ plan DemoPlan { for DemoPatient prescribe paracetamol }
 show DemoPlan
 `;
 
-async function project(text) {
+async function project(text, release = 'test-release') {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'clinical-bridge-'));
   const input = path.join(directory, 'fixture.clinical');
   try {
     await writeFile(input, text);
-    return await exportDocument({ langiumRoot, input, release: 'test-release' });
+    return await exportDocument({ langiumRoot, input, release });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -113,4 +113,50 @@ test('colon syntax exports the same contract and exact source positions', async 
   assert.equal(colonFixture.slice(m.source.start.offset, m.source.end.offset), m.source.text);
   assert.equal(m.source.text, colonFixture.split('\n')[2]);
   assert.equal(request.schemaVersion, '1');
+});
+
+
+const boundFixture = `// UTF-16 🧪
+Patient DemoPatient: age 30, condition DemoCondition
+Medication MyLocalAlias: rxcui "10", rxnormRelease "2026-10-05", dose 1mg, route PO, frequency PRN
+Plan DemoPlan: prescribe mylocalalias, for DemoPatient
+show DemoPlan
+`;
+test('exports explicit RxCUI identity and release without treating the local alias as a product name', async () => {
+  const request = await project(boundFixture, '2026-10-05');
+  assert.equal(request.schemaVersion, '2');
+  assert.equal(request.policyVersion, 'explicit-product-v1');
+  const m = request.mentions[0];
+  assert.equal(m.originalText, 'MyLocalAlias');
+  assert.deepEqual(m.productBinding, { rxcui: '10', release: '2026-10-05' });
+  assert.deepEqual(m.dose, { amount: 1, unit: 'mg' });
+  assert.equal(boundFixture.slice(m.source.start.offset, m.source.end.offset), m.source.text);
+  assert.equal(m.source.text, boundFixture.split('\n')[2]);
+  assert.equal('productStrength' in m, false);
+  assert.equal('doseForm' in m, false);
+  const reopened = await project(boundFixture, '2026-10-05');
+  assert.deepEqual(reopened.mentions[0].productBinding, m.productBinding);
+});
+
+test('rejects binding/version mismatch before producing a terminology request', async () => {
+  await assert.rejects(project(boundFixture, '2026-09-07'), /selected from RxNorm|release/i);
+});
+
+test('rejects partial, invalid and duplicate bindings', async () => {
+  await assert.rejects(project(boundFixture.replace('rxcui "10", ', ''), '2026-10-05'), /together|RxCUI|binding/i);
+  await assert.rejects(project(boundFixture.replace('rxnormRelease "2026-10-05", ', ''), '2026-10-05'), /together|release|binding/i);
+  await assert.rejects(project(boundFixture.replace('rxcui "10"', 'rxcui "0"'), '2026-10-05'), /RxCUI/i);
+  await assert.rejects(project(boundFixture.replace('rxcui "10"', 'rxcui "10", rxcui "11"'), '2026-10-05'), /duplicate|once/i);
+});
+
+test('mixed bound and unbound medications use schema2 without inventing bindings', async () => {
+  const text = boundFixture + `Medication paracetamol: dose 2mg route PO frequency PRN
+Plan OtherPlan: prescribe paracetamol for DemoPatient
+show OtherPlan
+`;
+  const request = await project(text, '2026-10-05');
+  assert.equal(request.schemaVersion, '2');
+  assert.equal(request.mentions.length, 2);
+  assert.deepEqual(request.mentions[0].productBinding, { rxcui: '10', release: '2026-10-05' });
+  assert.equal('productBinding' in request.mentions[1], false);
 });

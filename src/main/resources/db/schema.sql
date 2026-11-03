@@ -54,6 +54,11 @@ DROP INDEX IF EXISTS rxnorm_lab.lexical_name_lookup;
 CREATE INDEX IF NOT EXISTS lexical_name_lookup_md5
   ON rxnorm_lab.lexical_name(release,md5(normalized));
 
+-- Autocomplete accepts at most 100 normalized characters. Indexing a bounded
+-- prefix keeps long source labels below PostgreSQL's B-tree entry-size limit.
+CREATE INDEX IF NOT EXISTS lexical_name_prefix
+  ON rxnorm_lab.lexical_name(release,(left(normalized,128)) text_pattern_ops);
+
 CREATE INDEX IF NOT EXISTS rxnrel_outgoing
   ON rxnorm_lab.rxnrel(release,rxcui2)
   WHERE sab='RXNORM' AND suppress IN ('','N')

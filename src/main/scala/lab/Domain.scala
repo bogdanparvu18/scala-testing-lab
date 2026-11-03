@@ -15,10 +15,13 @@ final case class DocumentSource(uri: String, text: String) derives JsonCodec
 @jsonNoExtraFields
 final case class Dose(amount: BigDecimal, unit: String) derives JsonCodec
 @jsonNoExtraFields
+final case class ProductBinding(rxcui: String, release: String) derives JsonCodec
+@jsonNoExtraFields
 final case class Mention(
   id: String, originalText: String, role: String, source: SourceLocation,
   dose: Dose, route: String, frequency: String, patientRef: String, orderId: String,
-  productStrength: Option[String] = None, doseForm: Option[String] = None
+  productStrength: Option[String] = None, doseForm: Option[String] = None,
+  productBinding: Option[ProductBinding] = None
 ) derives JsonCodec
 @jsonNoExtraFields
 final case class AstRequest(
@@ -69,8 +72,9 @@ object InputValidation:
   private val routes = Set("PO", "IV", "IM", "SC", "PR", "SL", "BUCC")
   private val frequencies = Set("QD", "BID", "TID", "QID", "PRN", "Q4H", "Q6H", "Q8H", "Q12H", "Q24H")
   def validate(a: AstRequest): Unit =
-    require(a.schemaVersion == "1", "Unsupported schemaVersion")
-    require(a.policyVersion == "exact-v1", "Unsupported policyVersion")
+    require(Set("1", "2")(a.schemaVersion), "Unsupported schemaVersion")
+    require((a.schemaVersion, a.policyVersion) == ("1", "exact-v1") ||
+      (a.schemaVersion, a.policyVersion) == ("2", "explicit-product-v1"), "Unsupported schema/policy combination")
     require(a.terminologyRelease.matches("[A-Za-z0-9][A-Za-z0-9._-]{0,79}"), "Invalid terminologyRelease")
     require(a.mentions.nonEmpty, "No medication mentions")
     require(a.mentions.map(_.id).distinct.size == a.mentions.size, "Duplicate mention IDs")
@@ -90,6 +94,12 @@ object InputValidation:
       require(routes(m.route) && frequencies(m.frequency), "Unsupported route or frequency")
       require(m.productStrength.forall(value => ProductStrength.parse(value).nonEmpty), "Unsupported product strength: use mass or mass/ml")
       require(m.doseForm.forall(value => value.trim.nonEmpty && value.length <= 200), "Invalid dose form")
+      m.productBinding.foreach { binding =>
+        require(a.schemaVersion == "2", "Explicit product bindings require schemaVersion 2")
+        require(binding.rxcui.matches("[1-9][0-9]{0,19}"), "Invalid product RxCUI")
+        require(!binding.release.startsWith("0000-") && binding.release.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}") &&
+          scala.util.Try(java.time.LocalDate.parse(binding.release)).isSuccess, "Invalid product binding release")
+      }
       require(m.source.uri == a.document.uri, "Source URI mismatch")
       require(positionValid(m.source.start) && positionValid(m.source.end), "Invalid UTF-16 source positions")
       require(m.source.start.offset <= m.source.end.offset, "Reversed source range")

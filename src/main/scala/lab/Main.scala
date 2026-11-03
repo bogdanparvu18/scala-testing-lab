@@ -4,7 +4,7 @@ import zio.*
 import zio.json.*
 import java.nio.file.{Files, Paths, StandardCopyOption}
 
-/** Runtime I/O is limited to local files and the loopback PostgreSQL connection. */
+/** Runtime I/O uses local files and loopback PostgreSQL/product-search connections. */
 object Main extends ZIOAppDefault:
   private def readInput(path: String): Task[AstRequest] = ZIO.attemptBlocking {
     val raw = Files.readString(Paths.get(path))
@@ -27,6 +27,19 @@ object Main extends ZIOAppDefault:
 
   def run = getArgs.flatMap { args =>
     args.toList match
+      case "serve-products" :: portText :: Nil => ZIO.scoped {
+        for
+          port <- ZIO.attempt {
+            val value=portText.toInt
+            require(value > 0 && value <= 65535,"Product-search port must be between 1 and 65535")
+            value
+          }
+          store <- PostgresStore.open
+          boundPort <- ProductSearchService.start(port,store.searchProducts)
+          _ <- Console.printLine(s"Product search ready at http://127.0.0.1:$boundPort/products; leave this process running for editor autocomplete.")
+          _ <- ZIO.never
+        yield ()
+      }
       case "import-product-attributes" :: dir :: release :: Nil => ZIO.scoped {
         for
           prepared <- ZIO.attemptBlocking(ProductAttributes.prepare(Paths.get(dir),release))
@@ -79,5 +92,5 @@ object Main extends ZIOAppDefault:
         }.flatMap(Console.printLine(_))
       case _ => ZIO.fail(new IllegalArgumentException(
         "Usage: import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> | " +
-        "lookup <release> <name> | inspect-rxnorm <rrf-dir> <release> | import-product-attributes <rrf-dir> <release>. No seed or alias argument is accepted."))
+        "lookup <release> <name> | serve-products <port> | inspect-rxnorm <rrf-dir> <release> | import-product-attributes <rrf-dir> <release>. No seed or alias argument is accepted."))
   }
