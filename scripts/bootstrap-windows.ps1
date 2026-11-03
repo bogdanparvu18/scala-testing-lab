@@ -1,6 +1,9 @@
 # setup options
 param(
     [string]$Root = (Get-Location).Path,
+    [string]$ScalaRepoPath,
+    [string]$LangiumRepoPath,
+    [string]$SetupPath,
     [switch]$UseDocker,
     [ValidateRange(1, 65535)][int]$Port = 5432,
     [string]$PgHost,
@@ -40,13 +43,138 @@ function Save-Json($Path, $Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 8), $Utf8)
 }
 
-# Root is a managed installation: GitHub is the source of the active code.
+# Resolve only ordinary descendants of Root. Never cross a junction/symlink or
+# operate on Root itself: replacing that directory would also move setup state.
+function Resolve-ManagedPath([string]$Path, [string]$Label) {
+    if (-not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path $Root $Path }
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]'\/')
+    $prefix = $Root.TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label must be strictly inside Root '$Root': $full"
+    }
+    $cursor = $full
+    while ($cursor.TrimEnd([char[]]'\/') -ne $Root.TrimEnd([char[]]'\/')) {
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "$Label crosses a link/junction at '$cursor'. External paths are not managed."
+            }
+            if ($cursor -ne $full -and -not $item.PSIsContainer) { throw "Not a directory: $cursor" }
+        }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    return $full
+}
+function Test-PathOverlap([string]$First, [string]$Second) {
+    $a = $First.TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar
+    $b = $Second.TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar
+    return ($a.StartsWith($b, [StringComparison]::OrdinalIgnoreCase) -or $b.StartsWith($a, [StringComparison]::OrdinalIgnoreCase))
+}
+function Find-InstallLayout {
+    $names = @('scala-testing-lab', 'langium_dsl_lab')
+    $candidatesByRepo = @{}
+    foreach ($name in $names) { $candidatesByRepo[$name] = New-Object 'System.Collections.Generic.List[string]' }
+    $setups = New-Object 'System.Collections.Generic.List[string]'
+    $overrides = @{ 'scala-testing-lab' = $ScalaRepoPath; 'langium_dsl_lab' = $LangiumRepoPath }
+    foreach ($name in $names) {
+        if ($overrides[$name]) { $overrides[$name] = Resolve-ManagedPath $overrides[$name] $name }
+    }
+    if ($SetupPath) { $SetupPath = Resolve-ManagedPath $SetupPath 'SetupPath' }
+    $skip = @('.git', 'node_modules', 'target', 'out', 'dist', 'build', '.metals', '.bloop', '.bsp', '.idea', '.vscode', '.venv', 'venv', '__pycache__', 'backups', 'tools')
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
+    $queue.Enqueue($Root)
+    $visited = 0
+    Write-Host "Searching for repositories under: $Root"
+    while ($queue.Count -gt 0) {
+        $parent = $queue.Dequeue()
+        $visited++
+        if ($visited -gt 20000) { throw 'Repository search exceeded 20000 directories. Choose a narrower -Root; no repositories were changed.' }
+        try { $children = @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction Stop | Sort-Object Name) }
+        catch { throw "Cannot complete repository discovery in '$parent'. Choose an accessible -Root. $($_.Exception.Message)" }
+        foreach ($child in $children) {
+            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                if ($child.Name -in $names) { throw "Repository candidate is a link/junction: $($child.FullName). No repositories were changed." }
+                continue
+            }
+            if ($child.Name -eq 'medication-lab-setup') {
+                $automatic = Join-Path $child.FullName 'automatic'
+                if (Test-Path -LiteralPath $automatic -PathType Container) { $setups.Add((Resolve-ManagedPath $automatic 'Setup directory')) }
+                continue # Never rediscover archived clones in setup/backups.
+            }
+            if ($child.Name -in $skip -or $child.Name -like '.bootstrap-*') { continue }
+            if (($SetupPath -and $child.FullName -eq $SetupPath) -or $child.FullName -in @($overrides.Values)) { continue }
+            $identity = $null
+            if ($child.Name -in $names) { $identity = $child.Name }
+            $gitPath = Join-Path $child.FullName '.git'
+            $hasGit = Test-Path -LiteralPath $gitPath
+            if ($hasGit) {
+                $gitItem = Get-Item -LiteralPath $gitPath -Force -ErrorAction Stop
+                if (-not ($gitItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $gitItem.PSIsContainer) {
+                    $origin = Read-GitMetadata $child.FullName @('remote', 'get-url', 'origin')
+                    foreach ($name in $names) {
+                        $url = "https://github.com/bogdanparvu18/$name.git"
+                        if ($origin.ok -and $origin.text -in @($url, $url.Substring(0, $url.Length - 4), "git@github.com:bogdanparvu18/$name.git")) {
+                            $identity = $name
+                            break
+                        }
+                    }
+                }
+            }
+            if ($identity) { $candidatesByRepo[$identity].Add($child.FullName); continue }
+            if ($hasGit) { continue } # Do not search within another project's checkout.
+            $queue.Enqueue($child.FullName)
+        }
+    }
+    $selected = @{}
+    foreach ($name in $names) {
+        if ($overrides[$name]) { $selected[$name] = $overrides[$name]; continue }
+        $candidates = @($candidatesByRepo[$name] | Sort-Object -Unique)
+        if ($candidates.Count -gt 1) {
+            $option = if ($name -eq 'scala-testing-lab') { '-ScalaRepoPath' } else { '-LangiumRepoPath' }
+            throw "Multiple copies of $name were found:`n$($candidates -join "`n")`nSelect one with $option (absolute or relative to Root). No repositories were changed."
+        }
+        if ($candidates.Count -eq 1) { $selected[$name] = $candidates[0] }
+    }
+    # Place a missing partner beside the discovered repo. With no matches, reuse
+    # Root/repos if present; otherwise retain the original direct-child layout.
+    $destinationParent = $Root
+    if ($selected.Count -eq 1) {
+        $oneRepo = @($selected.Values)[0]
+        $destinationParent = Split-Path -Parent $oneRepo
+    }
+    elseif ($selected.Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $Root 'repos') -PathType Container)) { $destinationParent = Join-Path $Root 'repos' }
+    foreach ($name in $names) {
+        if (-not $selected.ContainsKey($name)) { $selected[$name] = Join-Path $destinationParent $name }
+        $selected[$name] = Resolve-ManagedPath $selected[$name] $name
+        $ancestor = Split-Path -Parent $selected[$name]
+        while ($ancestor.TrimEnd([char[]]'\/') -ne $Root.TrimEnd([char[]]'\/')) {
+            if (Test-Path -LiteralPath (Join-Path $ancestor '.git')) { throw "Managed repo is nested inside another Git checkout: $($selected[$name])" }
+            if ((Split-Path -Leaf $ancestor) -in @('medication-lab-setup', 'backups')) { throw 'Archived/setup directories cannot be selected as active repositories.' }
+            $ancestor = Split-Path -Parent $ancestor
+        }
+    }
+    if (Test-PathOverlap $selected[$names[0]] $selected[$names[1]]) { throw 'The two repository paths must be separate, non-nested directories.' }
+    if (-not $SetupPath) {
+        $existingSetups = @($setups | Sort-Object -Unique)
+        if ($existingSetups.Count -gt 1) { throw "Multiple setup directories were found:`n$($existingSetups -join "`n")`nSelect the existing automatic directory with -SetupPath. No repositories were changed." }
+        $SetupPath = if ($existingSetups.Count -eq 1) { $existingSetups[0] } else { Join-Path $Root 'medication-lab-setup\automatic' }
+    }
+    $SetupPath = Resolve-ManagedPath $SetupPath 'SetupPath'
+    foreach ($name in $names) {
+        if (Test-PathOverlap $selected[$name] $SetupPath) { throw 'The setup directory must be outside both repositories.' }
+    }
+    return @{ repositories = $selected; automatic = $SetupPath }
+}
+
+# Root is the search boundary: GitHub is the source of the active code.
 # An incompatible existing copy is retained whole before a verified clone is
 # installed. Database/state directories and copies outside Root are never moved.
 function Install-FreshRepo([string]$Name, [string]$BranchName, [string]$Reason) {
-    $directory = Join-Path $Root $Name
+    $directory = $RepoDirectories[$Name]
     $url = "https://github.com/bogdanparvu18/$Name.git"
-    $stage = Join-Path $Root ('.bootstrap-' + $Name + '-' + [guid]::NewGuid().ToString('N'))
+    $parent = Split-Path -Parent $directory
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $stage = Join-Path $parent ('.bootstrap-' + $Name + '-' + [guid]::NewGuid().ToString('N'))
     $backup = $null
     $previousWasDirectory = $false
     Write-Host "${Name}: $Reason. Preparing the latest origin/$BranchName."
@@ -63,7 +191,7 @@ function Install-FreshRepo([string]$Name, [string]$BranchName, [string]$Reason) 
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
                 throw "$directory is a link/junction, not a managed copy. Choose a Root with ordinary directories; the external target was not modified."
             }
-            $backups = Join-Path $Root 'medication-lab-setup\automatic\backups'
+            $backups = Join-Path $Automatic 'backups'
             New-Item -ItemType Directory -Path $backups -Force | Out-Null
             $backup = Join-Path $backups ($Name + '-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N'))
             $previousWasDirectory = [bool]$item.PSIsContainer
@@ -85,7 +213,7 @@ function Install-FreshRepo([string]$Name, [string]$BranchName, [string]$Reason) 
             throw "Could not install $Name. Preserved copy, if any: $backup. $installError"
         }
         Write-Host "${Name}: installed $after (origin/$BranchName)."
-        return @{ repository = $Name; branch = $BranchName; before = $null; after = $after; action = 'clone'; backupPath = $backup; reason = $Reason }
+        return @{ repository = $Name; path = $directory; branch = $BranchName; before = $null; after = $after; action = 'clone'; backupPath = $backup; reason = $Reason }
     } finally {
         # Only remove this invocation's private staging clone, never the backup.
         if (Test-Path -LiteralPath $stage) {
@@ -105,7 +233,7 @@ function Read-GitMetadata([string]$Directory, [string[]]$Arguments) {
 }
 function Sync-Repo([string]$Name, [string]$BranchName, [string[]]$GeneratedPatterns) {
     if ($Name -notin @('scala-testing-lab', 'langium_dsl_lab')) { throw 'Unsupported managed repository name.' }
-    $directory = Join-Path $Root $Name
+    $directory = $RepoDirectories[$Name]
     $url = "https://github.com/bogdanparvu18/$Name.git"
     Run { git.exe check-ref-format --branch $BranchName } | Out-Null
     $remoteRef = "refs/remotes/origin/$BranchName"
@@ -197,7 +325,7 @@ function Sync-Repo([string]$Name, [string]$BranchName, [string[]]$GeneratedPatte
         return (Install-FreshRepo $Name $BranchName 'In-place update could not reach the remote branch')
     }
     Write-Host "${Name}: $before -> $after (origin/$BranchName)"
-    return @{ repository = $Name; branch = $BranchName; before = $before; after = $after; action = 'pull'; backupPath = $null }
+    return @{ repository = $Name; path = $directory; branch = $BranchName; before = $before; after = $after; action = 'pull'; backupPath = $null }
 }
 # Docker is strictly opt-in. No Docker command or installation check runs in local mode.
 function Get-DockerType {
@@ -302,17 +430,39 @@ function Assert-Postgres {
     catch { throw "PostgreSQL login failed at ${PgHost}:$Port for database '$Database', user '$DbUser'. Check the existing database, role and password. $($_.Exception.Message)" }
     if ($answer -ne '1') { throw 'Authenticated PostgreSQL query failed.' }
 }
+function ConvertTo-SbtPath([string]$Path) {
+    # Absolute paths decouple imports/results from repository depth and siblings.
+    $full = [IO.Path]::GetFullPath($Path).Replace('\', '/')
+    if ($full -match '["\r\n\x00]') { throw 'Unsupported character in an sbt input/output path.' }
+    return '"' + $full + '"'
+}
+function ConvertTo-WindowsArgument([string]$Value) {
+    # Preserve embedded quotes and trailing backslashes for CreateProcess/Java.
+    # Avoid PowerShell 5.1 versus 7 native-argument forwarding differences.
+    $escaped = $Value -replace '(\\*)"', '$1$1\"'
+    $escaped = $escaped -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
+}
 function Invoke-Sbt([string[]]$Commands) {
-    Push-Location $Scala
+    $arguments = @('-Xmx2G', '-Dsbt.supershell=false', '-Dsbt.log.noformat=true', '-Dsbt.server.autostart=false', '-jar', $Launcher) + $Commands
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $Java
+    $start.WorkingDirectory = $Scala
+    $start.UseShellExecute = $false
+    $start.Arguments = (@($arguments | ForEach-Object { ConvertTo-WindowsArgument $_ }) -join ' ')
+    $process = [Diagnostics.Process]::Start($start)
     try {
-        Run { & $Java -Xmx2G '-Dsbt.supershell=false' '-Dsbt.log.noformat=true' '-Dsbt.server.autostart=false' -jar $Launcher @Commands } | Out-Host
-    } finally { Pop-Location }
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw "sbt failed (exit $($process.ExitCode))." }
+    } finally { $process.Dispose() }
 }
 
 if ($Help) {
-    Write-Host 'Usage: .\bootstrap-windows.ps1 [-Root directory] [-Port port] [-PgHost host] [-Database name] [-DbUser user] [-PsqlPath path] [-PgServiceName name] [-UseDocker] [-ContainerName name] [-VolumeName name] [-NoEditor] [-StartupTimeoutSeconds 180] [-ScalaBranch main] [-LangiumBranch main]'
-    Write-Host 'Root contains the two managed repositories and setup files. Each run pulls the selected remote branches. Old ZIP folders, source edits or divergent copies are backed up and replaced automatically after a successful fresh download.'
-    Write-Host 'Backups remain under Root\medication-lab-setup\automatic\backups; local source changes are not reapplied. Git-generated output backups remain in git stash. Run only one bootstrap at a time for a given Root.'
+    Write-Host 'Usage: .\bootstrap-windows.ps1 [-Root directory] [-ScalaRepoPath path] [-LangiumRepoPath path] [-SetupPath path] [-Port port] [-PgHost host] [-Database name] [-DbUser user] [-PsqlPath path] [-PgServiceName name] [-UseDocker] [-ContainerName name] [-VolumeName name] [-NoEditor] [-StartupTimeoutSeconds 180] [-ScalaBranch main] [-LangiumBranch main]'
+    Write-Host 'Root is a search boundary. Discover both repositories recursively (including Root\repos), then update/build them in place; names or their Git origin identify existing clones. No duplicate copies are created when unique matches exist.'
+    Write-Host 'Multiple matches require -ScalaRepoPath / -LangiumRepoPath, absolute or relative to Root. Missing partners are cloned beside the existing repo; with neither present, use Root\repos if it exists, otherwise Root.'
+    Write-Host 'Discovery excludes setup/backups, tools, dependencies, build outputs, linked directories and the inside of Git checkouts. Old ordinary ZIP/source copies are backed up and replaced only after a successful fresh download.'
+    Write-Host 'Reuse the unique existing medication-lab-setup\automatic directory below Root; otherwise create it directly below Root. Multiple setup directories require -SetupPath. Backups remain inside that automatic directory; local changes are not reapplied. Run one bootstrap at a time.'
     Write-Host 'Default: existing local PostgreSQL, no Docker checks or commands. Connection defaults: PGHOST/PGPORT/PGDATABASE/PGUSER, then 127.0.0.1:5432 / scala_testing_lab / scala_lab. Explicit arguments override those defaults.'
     Write-Host 'Local mode uses PGPASSWORD or asks securely for the existing password. The database and login must already exist; no local role/password/database is created or replaced.'
     Write-Host 'A ready local RxNorm import with compatible manifests is reused. Empty databases receive the verified prescribable archive; incomplete/incompatible existing releases are not replaced.'
@@ -326,7 +476,7 @@ $DatabaseMode = 'local'
 if ($UseDocker) {
     $DatabaseMode = 'docker'
     if (($PgHost -and $PgHost -ne '127.0.0.1') -or ($Database -and $Database -ne 'rxnorm_public') -or
-        ($DbUser -and $DbUser -ne 'rxnorm_lab') -or $PsqlPath -or $PgServiceName) {
+        ($DbUser -and $DbUser -ne 'scala_lab') -or $PsqlPath -or $PgServiceName) {
         throw '-UseDocker uses its managed rxnorm_public / rxnorm_lab database on 127.0.0.1. Local-only connection/tool/service options cannot be combined with it.'
     }
     if (-not $PSBoundParameters.ContainsKey('Port')) { $Port = 55433 }
@@ -346,8 +496,14 @@ if ($Database -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw 'Database must 
 if ([string]::IsNullOrWhiteSpace($DbUser)) { throw 'DbUser must not be empty.' }
 Write-Host "PostgreSQL mode: $DatabaseMode; endpoint: ${PgHost}:$Port; database: $Database; user: $DbUser"
 # check the installed tools
+$Root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
 $Root = [IO.Path]::GetFullPath($Root)
-Write-Host "Setup folder: $Root"
+if (-not (Test-Path -LiteralPath $Root)) { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
+$rootItem = Get-Item -LiteralPath $Root -Force
+if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Root must be an ordinary directory, not a file or link/junction.' }
+if (Test-Path -LiteralPath (Join-Path $Root '.git')) { throw 'Root must be a parent/search directory, not a Git checkout itself.' }
+$Root = $rootItem.FullName
+Write-Host "Search root: $Root"
 foreach ($tool in @('git.exe', 'node.exe', 'npm.cmd')) { Get-Command $tool | Out-Null }
 if (-not $NoEditor) { Get-Command code.cmd | Out-Null }
 if (-not $env:JAVA_HOME) { throw 'Set JAVA_HOME to your Java 21 installation.' }
@@ -370,8 +526,16 @@ if ($UseDocker) {
     Run { & $PsqlPath --version } | Out-Host
 }
 
-# keep setup files together
-$Automatic = Join-Path $Root 'medication-lab-setup\automatic'
+# Resolve both paths before modifying either checkout or requesting credentials.
+$layout = Find-InstallLayout
+$RepoDirectories = $layout.repositories
+$Automatic = $layout.automatic
+$Scala = $RepoDirectories['scala-testing-lab']
+$Langium = Join-Path $RepoDirectories['langium_dsl_lab'] 'clinical-dsl-demo'
+Write-Host "Scala repository: $Scala"
+Write-Host "Langium repository: $($RepoDirectories['langium_dsl_lab'])"
+Write-Host "Setup directory: $Automatic"
+# Keep state/data separate from the discovered repositories.
 $State = Join-Path $Automatic 'state'
 $Tools = Join-Path $Automatic 'tools'
 $Downloads = Join-Path $Automatic 'downloads'
@@ -416,14 +580,13 @@ $RepoHeads = @(
     Sync-Repo 'scala-testing-lab' $ScalaBranch @('target/*', 'project/target/*', 'project/project/target/*', '.metals/*', '.bsp/*', '.bloop/*')
     Sync-Repo 'langium_dsl_lab' $LangiumBranch @('clinical-dsl-demo/node_modules/*', 'clinical-dsl-demo/packages/*/node_modules/*', 'clinical-dsl-demo/packages/*/out/*', 'clinical-dsl-demo/*.tsbuildinfo', 'clinical-dsl-demo/packages/language/src/generated/*', 'clinical-dsl-demo/packages/language/syntaxes/*', 'clinical-dsl-demo/packages/extension/syntaxes/*')
 )
-$Scala = Join-Path $Root 'scala-testing-lab'
-$Langium = Join-Path $Root 'langium_dsl_lab\clinical-dsl-demo'
 # A downloaded/old bootstrap must use the newly fetched setup logic this run.
 $UpdatedScript = Join-Path $Scala 'scripts\bootstrap-windows.ps1'
 if ((Get-FileHash -LiteralPath $UpdatedScript -Algorithm SHA256).Hash -ne $EntryHash) {
     if ($RelaunchCount -ge 2) { throw 'Bootstrap changed repeatedly while updating. Rerun once upstream is stable.' }
     Write-Host 'Bootstrap changed upstream; restarting with the updated script.'
     $next = @{ Root = $Root; Port = $Port; ContainerName = $ContainerName; VolumeName = $VolumeName; ScalaBranch = $ScalaBranch; LangiumBranch = $LangiumBranch; NoEditor = [bool]$NoEditor; StartupTimeoutSeconds = $StartupTimeoutSeconds; RelaunchCount = ($RelaunchCount + 1) }
+    $next.ScalaRepoPath = $Scala; $next.LangiumRepoPath = $RepoDirectories['langium_dsl_lab']; $next.SetupPath = $Automatic
     $next.UseDocker = [bool]$UseDocker
     if (-not $UseDocker) {
         $next.PgHost = $PgHost; $next.Database = $Database; $next.DbUser = $DbUser
@@ -515,7 +678,7 @@ if ($ready -ne '1') {
     if (-not (Test-Path $Zip)) { Invoke-WebRequest -UseBasicParsing 'https://download.nlm.nih.gov/rxnorm/RxNorm_full_prescribe_10052026.zip' -OutFile $Zip }
     if ((Get-FileHash $Zip).Hash -ne '8ed351c29f3cb56bedeb8e2bcb8fa56931f8d7eb88e2280dc9772d7d3eb16977') { throw 'RxNorm download checksum failed.' }
     Expand-Archive -LiteralPath $Zip -DestinationPath $Data -Force
-    $rrf = '../medication-lab-setup/automatic/data/2026-10-05/rrf'
+    $rrf = ConvertTo-SbtPath (Join-Path $Data 'rrf')
     Invoke-Sbt @("run import-rxnorm $rrf 2026-10-05")
     Invoke-Sbt @("run import-product-attributes $rrf 2026-10-05")
     Invoke-DatabaseSql 'ANALYZE;' | Out-Host
@@ -540,11 +703,9 @@ foreach ($case in @('valid', 'invalid')) {
     $resultFile = Join-Path $Smoke "$case.result.json"
     [IO.File]::WriteAllText($inputFile, $text, $Utf8)
     Run { node.exe "$Scala\bridge\export-ast.mjs" --langium-root $Langium --input $inputFile --release 2026-10-05 --output $astFile } | Out-Host
-    # Invoke-Sbt runs from the sibling Scala checkout. Relative, space-free
-    # arguments avoid Windows PowerShell 5.1's nested native-argument quoting.
-    # Root itself may contain spaces; only these generated relative names are used.
-    $astArg = "../medication-lab-setup/automatic/state/$SmokeName/$case.ast.json"
-    $resultArg = "../medication-lab-setup/automatic/state/$SmokeName/$case.result.json"
+    # Repository and state directories can be at different depths or contain spaces.
+    $astArg = ConvertTo-SbtPath $astFile
+    $resultArg = ConvertTo-SbtPath $resultFile
     Invoke-Sbt @("run resolve $astArg $resultArg")
     $report = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
     $items = @($report.resolutions)
@@ -694,6 +855,7 @@ Save-Json $settingsFile $settings
 if (-not $NoEditor) { Run { code.cmd --new-window --user-data-dir $Profile "--extensionDevelopmentPath=$Langium\packages\extension" $Langium $Demo } }
 Save-Json $HealthFile @{
     status = 'ready'; checkedAt = (Get-Date).ToUniversalTime().ToString('o')
+    root = $Root; setupDirectory = $Automatic; scalaRoot = $Scala; langiumRoot = $Langium
     repositories = $RepoHeads; postgres = 'authenticated-query-pass'; rxnorm = 'ready'
     databaseMode = $DatabaseMode; pgHost = $PgHost; pgPort = $Port; pgDatabase = $Database; pgUser = $DbUser
     scala = 'clean-compile-test-pass'; langium = 'clean-generate-build-pass'
