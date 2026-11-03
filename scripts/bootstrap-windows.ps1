@@ -1,7 +1,13 @@
 # setup options
 param(
     [string]$Root = (Get-Location).Path,
-    [ValidateRange(1, 65535)][int]$Port = 55433,
+    [switch]$UseDocker,
+    [ValidateRange(1, 65535)][int]$Port = 5432,
+    [string]$PgHost,
+    [string]$Database,
+    [string]$DbUser,
+    [string]$PsqlPath,
+    [string]$PgServiceName,
     [string]$ContainerName = 'aurora-medication-auto-pg',
     [string]$VolumeName = 'aurora-medication-auto-pgdata',
     [string]$ScalaBranch = 'main',
@@ -17,6 +23,11 @@ $PSNativeCommandUseErrorActionPreference = $false
 $OriginalLocation = Get-Location
 $EntryHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $HealthFile = $null
+# Do not leave a prompted password or connection overrides in the caller's shell.
+$PreviousEnvironment = @{}
+foreach ($name in @('PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'POSTGRES_PASSWORD', 'PGCONNECT_TIMEOUT', 'PGSSLMODE', 'PGHOSTADDR', 'PGSERVICE')) {
+    $PreviousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
 $Utf8 = New-Object Text.UTF8Encoding($false)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 # stop if a command fails
@@ -101,18 +112,22 @@ function Sync-Repo([string]$Name, [string]$BranchName, [string[]]$GeneratedPatte
     Write-Host "${Name}: $before -> $after (origin/$BranchName)"
     return @{ repository = $Name; branch = $BranchName; before = $before; after = $after }
 }
+# Docker is strictly opt-in. No Docker command or installation check runs in local mode.
 function Get-DockerType {
-    # Expected startup failures must not terminate Windows PowerShell 5.1 here.
     $ErrorActionPreference = 'Continue'
     $value = & docker.exe info --format '{{.OSType}}' 2>$null
     if ($LASTEXITCODE -eq 0) { return ([string]$value).Trim() }
     return ''
 }
 function Ensure-Docker {
+    if (-not $UseDocker) { return }
+    if (-not (Get-Command docker.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+        throw 'The explicitly selected -UseDocker mode needs Docker Desktop. Omit -UseDocker to use local PostgreSQL.'
+    }
     $type = Get-DockerType
     if (-not $type) {
         $desktop = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
-        if (-not (Test-Path -LiteralPath $desktop)) { throw 'Start Docker Desktop, then rerun this script.' }
+        if (-not (Test-Path -LiteralPath $desktop)) { throw 'Start Docker Desktop, then rerun with -UseDocker.' }
         Write-Host 'Starting Docker Desktop and waiting for its engine...'
         Start-Process -FilePath $desktop | Out-Null
         $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
@@ -123,11 +138,81 @@ function Ensure-Docker {
     }
     if ($type -ne 'linux') { throw 'Docker is not ready in Linux-container mode. Check Docker Desktop and rerun.' }
 }
+function Resolve-PsqlPath([string]$RequestedPath) {
+    if ($RequestedPath) {
+        if (-not (Test-Path -LiteralPath $RequestedPath -PathType Leaf)) { throw "psql.exe was not found at $RequestedPath" }
+        return (Get-Item -LiteralPath $RequestedPath).FullName
+    }
+    $command = Get-Command psql.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    $installRoot = Join-Path $env:ProgramFiles 'PostgreSQL'
+    if (Test-Path -LiteralPath $installRoot) {
+        $versions = @(Get-ChildItem -LiteralPath $installRoot -Directory | Sort-Object -Property {
+            try { [version]$_.Name } catch { [version]'0.0' }
+        } -Descending)
+        foreach ($version in $versions) {
+            $candidate = Join-Path $version.FullName 'bin\psql.exe'
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        }
+    }
+    throw 'Local PostgreSQL mode needs psql.exe. Install PostgreSQL command-line tools or pass -PsqlPath "C:\Program Files\PostgreSQL\18\bin\psql.exe".'
+}
+function Test-PostgresReady {
+    $ErrorActionPreference = 'Continue'
+    if ($UseDocker) {
+        & docker.exe exec $ContainerName pg_isready -h 127.0.0.1 -p 5432 -U $DbUser -d $Database -t 3 *> $null
+    } else {
+        & $PgIsReady -h $PgHost -p $Port -U $DbUser -d $Database -t 3 *> $null
+    }
+    return ($LASTEXITCODE -eq 0)
+}
+function Wait-Postgres {
+    $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
+    do {
+        if (Test-PostgresReady) { return }
+        Start-Sleep -Seconds 1
+    } until ((Get-Date) -ge $deadline)
+    throw "PostgreSQL did not become ready at ${PgHost}:$Port. Check the selected database service and port."
+}
+function Ensure-LocalPostgres {
+    if (Test-PostgresReady) { return }
+    if ($PgServiceName) {
+        $services = @(Get-Service | Where-Object { $_.Name -eq $PgServiceName })
+    } else {
+        $services = @(Get-Service -Name '*postgres*' -ErrorAction SilentlyContinue)
+    }
+    if ($services.Count -ne 1) {
+        throw "No responding PostgreSQL at ${PgHost}:$Port. Start the intended Windows PostgreSQL service, or specify its exact -PgServiceName (found $($services.Count) candidates)."
+    }
+    $service = $services[0]
+    if ($service.Status -ne 'Running') {
+        Write-Host "Starting PostgreSQL Windows service: $($service.Name)"
+        try {
+            Start-Service -InputObject $service -ErrorAction Stop
+            $service.WaitForStatus('Running', [TimeSpan]::FromSeconds($StartupTimeoutSeconds))
+        } catch {
+            throw "Could not start PostgreSQL service '$($service.Name)'. Start it from Windows Services with the necessary permissions, then rerun. $($_.Exception.Message)"
+        }
+    }
+    Wait-Postgres
+}
+function Invoke-DatabaseSql([string]$Sql) {
+    # Ignore psqlrc, disallow additional password prompts, and stop on SQL errors.
+    # Passwords are inherited via the environment, never command-line arguments.
+    if ($UseDocker) {
+        Run { docker.exe exec -e PGPASSWORD $ContainerName psql -X -w -h 127.0.0.1 -p 5432 -U $DbUser -d $Database -v ON_ERROR_STOP=1 -Atc $Sql }
+    } else {
+        Run { & $PsqlPath -X -w -h $PgHost -p $Port -U $DbUser -d $Database -v ON_ERROR_STOP=1 -Atc $Sql }
+    }
+}
 function Assert-Postgres {
-    $running = Run { docker.exe inspect --format '{{.State.Running}}' $ContainerName }
-    if ($running -ne 'true') { throw 'PostgreSQL container is not running.' }
-    Run { docker.exe exec $ContainerName pg_isready -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public } | Out-Host
-    $answer = Run { docker.exe exec -e PGPASSWORD $ContainerName psql -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SELECT 1;' }
+    if ($UseDocker) {
+        $running = Run { docker.exe inspect --format '{{.State.Running}}' $ContainerName }
+        if ($running -ne 'true') { throw 'PostgreSQL container is not running.' }
+    }
+    if (-not (Test-PostgresReady)) { throw "PostgreSQL is not accepting connections at ${PgHost}:$Port." }
+    try { $answer = Invoke-DatabaseSql 'SELECT 1;' }
+    catch { throw "PostgreSQL login failed at ${PgHost}:$Port for database '$Database', user '$DbUser'. Check the existing database, role and password. $($_.Exception.Message)" }
     if ($answer -ne '1') { throw 'Authenticated PostgreSQL query failed.' }
 }
 function Invoke-Sbt([string[]]$Commands) {
@@ -138,15 +223,43 @@ function Invoke-Sbt([string[]]$Commands) {
 }
 
 if ($Help) {
-    Write-Host 'Usage: .\bootstrap-windows.ps1 [-Root directory] [-Port 55433] [-ContainerName name] [-VolumeName name] [-NoEditor] [-StartupTimeoutSeconds 180] [-ScalaBranch main] [-LangiumBranch main]'
-    Write-Host 'The current folder is the default destination. Install Git, Java 21 (JAVA_HOME), Node 22.12+, Docker Desktop with Linux containers, and VS Code first.'
+    Write-Host 'Usage: .\bootstrap-windows.ps1 [-Root directory] [-Port port] [-PgHost host] [-Database name] [-DbUser user] [-PsqlPath path] [-PgServiceName name] [-UseDocker] [-ContainerName name] [-VolumeName name] [-NoEditor] [-StartupTimeoutSeconds 180] [-ScalaBranch main] [-LangiumBranch main]'
+    Write-Host 'Default: existing local PostgreSQL, no Docker checks or commands. Connection defaults: PGHOST/PGPORT/PGDATABASE/PGUSER, then 127.0.0.1:5432 / scala_testing_lab / scala_lab. Explicit arguments override those defaults.'
+    Write-Host 'Local mode uses PGPASSWORD or asks securely for the existing password. The database and login must already exist; no local role/password/database is created or replaced.'
+    Write-Host 'A ready local RxNorm import with compatible manifests is reused. Empty databases receive the verified prescribable archive; incomplete/incompatible existing releases are not replaced.'
+    Write-Host 'psql.exe is found on PATH or under Program Files\PostgreSQL; -PsqlPath supports custom installations. A single stopped PostgreSQL Windows service can be started; use -PgServiceName when several exist.'
+    Write-Host 'Install Git, Java 21 (JAVA_HOME), Node 22.12+, PostgreSQL client tools, and VS Code first. Docker Desktop is needed ONLY with -UseDocker (port 55433 by default, rxnorm_public / rxnorm_lab).'
     return
 }
 try {
+# The two backends are explicit, never selected by probing Docker installation.
+$DatabaseMode = 'local'
+if ($UseDocker) {
+    $DatabaseMode = 'docker'
+    if (($PgHost -and $PgHost -ne '127.0.0.1') -or ($Database -and $Database -ne 'rxnorm_public') -or
+        ($DbUser -and $DbUser -ne 'rxnorm_lab') -or $PsqlPath -or $PgServiceName) {
+        throw '-UseDocker uses its managed rxnorm_public / rxnorm_lab database on 127.0.0.1. Local-only connection/tool/service options cannot be combined with it.'
+    }
+    if (-not $PSBoundParameters.ContainsKey('Port')) { $Port = 55433 }
+    $PgHost = '127.0.0.1'; $Database = 'rxnorm_public'; $DbUser = 'rxnorm_lab'
+} else {
+    if (-not $PSBoundParameters.ContainsKey('PgHost')) { $PgHost = if ($env:PGHOST) { $env:PGHOST } else { '127.0.0.1' } }
+    if (-not $PSBoundParameters.ContainsKey('Database')) { $Database = if ($env:PGDATABASE) { $env:PGDATABASE } else { 'scala_testing_lab' } }
+    if (-not $PSBoundParameters.ContainsKey('DbUser')) { $DbUser = if ($env:PGUSER) { $env:PGUSER } else { 'scala_lab' } }
+    if (-not $PSBoundParameters.ContainsKey('Port') -and $env:PGPORT) {
+        $parsedPort = 0
+        if (-not [int]::TryParse($env:PGPORT, [ref]$parsedPort) -or $parsedPort -lt 1 -or $parsedPort -gt 65535) { throw 'PGPORT must be an integer from 1 to 65535.' }
+        $Port = $parsedPort
+    }
+}
+if ($PgHost -notin @('127.0.0.1', 'localhost', '::1')) { throw 'This lab supports a loopback PostgreSQL host only.' }
+if ($Database -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw 'Database must be a simple PostgreSQL identifier, not a connection string.' }
+if ([string]::IsNullOrWhiteSpace($DbUser)) { throw 'DbUser must not be empty.' }
+Write-Host "PostgreSQL mode: $DatabaseMode; endpoint: ${PgHost}:$Port; database: $Database; user: $DbUser"
 # check the installed tools
 $Root = [IO.Path]::GetFullPath($Root)
 Write-Host "Setup folder: $Root"
-foreach ($tool in @('git.exe', 'node.exe', 'npm.cmd', 'docker.exe')) { Get-Command $tool | Out-Null }
+foreach ($tool in @('git.exe', 'node.exe', 'npm.cmd')) { Get-Command $tool | Out-Null }
 if (-not $NoEditor) { Get-Command code.cmd | Out-Null }
 if (-not $env:JAVA_HOME) { throw 'Set JAVA_HOME to your Java 21 installation.' }
 $JavaHome = $env:JAVA_HOME
@@ -159,7 +272,14 @@ if ([version]$nodeVersion.TrimStart('v') -lt [version]'22.12.0') { throw 'Instal
 $npmVersion = Run { npm.cmd --version }
 if ([version]$npmVersion.Trim() -lt [version]'10.2.3') { throw 'Install npm 10.2.3 or newer.' }
 Run { & $Java -version } | Out-Host
-Ensure-Docker
+if ($UseDocker) {
+    Ensure-Docker
+} else {
+    $PsqlPath = Resolve-PsqlPath $PsqlPath
+    $PgIsReady = Join-Path (Split-Path -Parent $PsqlPath) 'pg_isready.exe'
+    if (-not (Test-Path -LiteralPath $PgIsReady -PathType Leaf)) { throw "pg_isready.exe is missing beside $PsqlPath. Install the PostgreSQL command-line tools." }
+    Run { & $PsqlPath --version } | Out-Host
+}
 
 # keep setup files together
 $Automatic = Join-Path $Root 'medication-lab-setup\automatic'
@@ -173,19 +293,32 @@ foreach ($directory in @($Root, $State, "$Tools\sbt\bin", $Downloads, "$Data\rrf
 }
 $HealthFile = Join-Path $State 'health.json'
 Save-Json $HealthFile @{ status = 'running'; startedAt = (Get-Date).ToUniversalTime().ToString('o') }
-# save the password in a private folder
+# protect setup state and (Docker mode only) its generated password
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 Run { icacls.exe $State '/inheritance:r' '/grant:r' "${identity}:(OI)(CI)F" 'SYSTEM:(OI)(CI)F' } | Out-Null
-$secretsFile = Join-Path $State 'secrets.json'
-if (-not (Test-Path $secretsFile)) { Save-Json $secretsFile @{ password = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'); port = $Port } }
-$secrets = Get-Content $secretsFile -Raw | ConvertFrom-Json
-if (($secrets.port -and $secrets.port -ne $Port) -or -not $secrets.password) { throw 'Use this setup with its original Root and Port.' }
-$env:PGHOST = '127.0.0.1'
+if ($UseDocker) {
+    # Local mode never reads, creates or overwrites this Docker secrets file.
+    $secretsFile = Join-Path $State 'secrets.json'
+    if (-not (Test-Path $secretsFile)) { Save-Json $secretsFile @{ password = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'); port = $Port } }
+    $secrets = Get-Content $secretsFile -Raw | ConvertFrom-Json
+    if (($secrets.port -and $secrets.port -ne $Port) -or -not $secrets.password) { throw 'Use this Docker setup with its original Root and Port.' }
+    $env:PGPASSWORD = $secrets.password
+    $env:POSTGRES_PASSWORD = $secrets.password
+} elseif (-not $env:PGPASSWORD) {
+    $securePassword = Read-Host "Existing PostgreSQL password for $DbUser" -AsSecureString
+    try { $env:PGPASSWORD = [System.Net.NetworkCredential]::new('', $securePassword).Password }
+    finally { $securePassword.Dispose(); Remove-Variable securePassword }
+    if (-not $env:PGPASSWORD) { throw 'A PostgreSQL password is required by the Scala application.' }
+}
+$env:PGHOST = $PgHost
 $env:PGPORT = [string]$Port
-$env:PGDATABASE = 'rxnorm_public'
-$env:PGUSER = 'rxnorm_lab'
-$env:PGPASSWORD = $secrets.password
-$env:POSTGRES_PASSWORD = $secrets.password
+$env:PGDATABASE = $Database
+$env:PGUSER = $DbUser
+$env:PGCONNECT_TIMEOUT = '10'
+# Match the loopback-only JDBC connection; do not let inherited libpq settings
+# redirect only psql to another server. The original values are restored on exit.
+$env:PGSSLMODE = 'disable'
+Remove-Item Env:PGHOSTADDR, Env:PGSERVICE -ErrorAction SilentlyContinue
 
 # Always fetch and fast-forward both repositories; there are no pinned code SHAs.
 $RepoHeads = @(
@@ -200,6 +333,11 @@ if ((Get-FileHash -LiteralPath $UpdatedScript -Algorithm SHA256).Hash -ne $Entry
     if ($RelaunchCount -ge 2) { throw 'Bootstrap changed repeatedly while updating. Rerun once upstream is stable.' }
     Write-Host 'Bootstrap changed upstream; restarting with the updated script.'
     $next = @{ Root = $Root; Port = $Port; ContainerName = $ContainerName; VolumeName = $VolumeName; ScalaBranch = $ScalaBranch; LangiumBranch = $LangiumBranch; NoEditor = [bool]$NoEditor; StartupTimeoutSeconds = $StartupTimeoutSeconds; RelaunchCount = ($RelaunchCount + 1) }
+    $next.UseDocker = [bool]$UseDocker
+    if (-not $UseDocker) {
+        $next.PgHost = $PgHost; $next.Database = $Database; $next.DbUser = $DbUser
+        $next.PsqlPath = $PsqlPath; $next.PgServiceName = $PgServiceName
+    }
     & $UpdatedScript @next
     return
 }
@@ -220,28 +358,26 @@ foreach ($artifact in @('packages\language\out\index.js', 'packages\extension\ou
     if (-not (Test-Path -LiteralPath (Join-Path $Langium $artifact))) { throw "Missing build artifact: $artifact" }
 }
 
-# create or start the database container
-$containers = @(Run { docker.exe ps -a --format '{{.Names}}' })
-if ($ContainerName -in $containers) {
-    $container = @(Run { docker.exe inspect $ContainerName } | ConvertFrom-Json)[0]
-    $binding = @($container.HostConfig.PortBindings.'5432/tcp')
-    if ($binding.Count -ne 1 -or $binding[0].HostPort -ne [string]$Port -or $binding[0].HostIp -ne '127.0.0.1' -or
-        "POSTGRES_PASSWORD=$($secrets.password)" -notin $container.Config.Env -or 'POSTGRES_USER=rxnorm_lab' -notin $container.Config.Env -or 'POSTGRES_DB=rxnorm_public' -notin $container.Config.Env -or
-        $VolumeName -notin @($container.Mounts | Where-Object Destination -eq '/var/lib/postgresql/data' | ForEach-Object Name)) { throw 'Existing container does not match this setup.' }
-    if (-not $container.State.Running) { Run { docker.exe start $ContainerName } }
+if ($UseDocker) {
+    # Only the explicitly selected Docker backend manages containers/volumes.
+    $containers = @(Run { docker.exe ps -a --format '{{.Names}}' })
+    if ($ContainerName -in $containers) {
+        $container = @(Run { docker.exe inspect $ContainerName } | ConvertFrom-Json)[0]
+        $binding = @($container.HostConfig.PortBindings.'5432/tcp')
+        if ($binding.Count -ne 1 -or $binding[0].HostPort -ne [string]$Port -or $binding[0].HostIp -ne '127.0.0.1' -or
+            "POSTGRES_PASSWORD=$($secrets.password)" -notin $container.Config.Env -or 'POSTGRES_USER=rxnorm_lab' -notin $container.Config.Env -or 'POSTGRES_DB=rxnorm_public' -notin $container.Config.Env -or
+            $VolumeName -notin @($container.Mounts | Where-Object Destination -eq '/var/lib/postgresql/data' | ForEach-Object Name)) { throw 'Existing container does not match this setup.' }
+        if (-not $container.State.Running) { Run { docker.exe start $ContainerName } }
+    } else {
+        $volumes = @(Run { docker.exe volume ls --format '{{.Name}}' })
+        if ($VolumeName -in $volumes) { throw 'This volume already exists without its matching container. Choose another VolumeName; existing data was preserved.' }
+        Run { docker.exe run -d --restart unless-stopped --name $ContainerName -e POSTGRES_USER=rxnorm_lab -e POSTGRES_DB=rxnorm_public -e POSTGRES_PASSWORD -p "127.0.0.1:${Port}:5432" -v "${VolumeName}:/var/lib/postgresql/data" postgres:16 }
+    }
+    Run { docker.exe update --restart unless-stopped $ContainerName } | Out-Host
+    Wait-Postgres
 } else {
-    $volumes = @(Run { docker.exe volume ls --format '{{.Name}}' })
-    if ($VolumeName -in $volumes) { throw 'This volume already exists without its matching container. Choose another VolumeName; existing data was preserved.' }
-    Run { docker.exe run -d --restart unless-stopped --name $ContainerName -e POSTGRES_USER=rxnorm_lab -e POSTGRES_DB=rxnorm_public -e POSTGRES_PASSWORD -p "127.0.0.1:${Port}:5432" -v "${VolumeName}:/var/lib/postgresql/data" postgres:16 }
+    Ensure-LocalPostgres
 }
-Run { docker.exe update --restart unless-stopped $ContainerName } | Out-Host
-# wait for postgres
-for ($attempt = 0; $attempt -lt $StartupTimeoutSeconds; $attempt++) {
-    docker.exe exec $ContainerName pg_isready -U rxnorm_lab -d rxnorm_public | Out-Null
-    if ($LASTEXITCODE -eq 0) { break }
-    Start-Sleep -Seconds 1
-}
-if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL did not become ready. Check docker logs.' }
 Assert-Postgres
 Invoke-Sbt @('clean', 'compile')
 # skip the import if this data is ready
@@ -253,7 +389,35 @@ AND r.sha256_json::jsonb->>'RXNCONSO.RRF'='555730c3ff2a981796dc5d649acc482e4685f
 AND r.sha256_json::jsonb->>'RXNREL.RRF'='cca47f32a2c32ef60d65c6789851385ff5dcf287750ca01a53f800a5cf5ef694'
 AND p.sha256_json::jsonb->>'RXNSAT.RRF'='b5a476f2bfbef9082144fd2bf00eb0de46f7b0b63da822d856067b9935914dda';
 "@
-try { $ready = docker.exe exec $ContainerName psql -U rxnorm_lab -d rxnorm_public -Atc $query 2>$null; if ($LASTEXITCODE -ne 0) { $ready = '' } } catch { $ready = '' }
+# A native installation may already contain the Full archive documented in the
+# README, rather than the bootstrap's prescribable subset. Reuse a ready local
+# import only when its release, policies and base/product provenance agree.
+if (-not $UseDocker) {
+    $query = @"
+SELECT 1 FROM rxnorm_lab.release r JOIN rxnorm_lab.product_release p USING (release)
+WHERE r.release='2026-10-05' AND r.state='ready' AND p.state='ready' AND p.base_identity=r.identity
+AND r.scope='all-active-rxnorm-pg-v4' AND p.policy='single-component-mass-v1'
+AND r.sha256_json::jsonb->>'RXNCONSO.RRF' ~ '^[0-9a-fA-F]{64}$'
+AND r.sha256_json::jsonb->>'RXNREL.RRF' ~ '^[0-9a-fA-F]{64}$'
+AND p.sha256_json::jsonb->>'RXNSAT.RRF' ~ '^[0-9a-fA-F]{64}$'
+AND p.sha256_json::jsonb->>'RXNCONSO.RRF'=r.sha256_json::jsonb->>'RXNCONSO.RRF'
+AND p.sha256_json::jsonb->>'RXNREL.RRF'=r.sha256_json::jsonb->>'RXNREL.RRF';
+"@
+}
+# Missing schema is a normal first-install state. Authentication/SQL failures
+# must not be swallowed and mistaken for an absent import.
+$hasManifest = Invoke-DatabaseSql "SELECT CASE WHEN to_regclass('rxnorm_lab.release') IS NOT NULL AND to_regclass('rxnorm_lab.product_release') IS NOT NULL THEN 1 ELSE 0 END;"
+$ready = ''
+if ($hasManifest -eq '1') { $ready = Invoke-DatabaseSql $query }
+if (-not $UseDocker -and $ready -ne '1') {
+    $hasBase = Invoke-DatabaseSql "SELECT CASE WHEN to_regclass('rxnorm_lab.release') IS NOT NULL THEN 1 ELSE 0 END;"
+    if ($hasBase -eq '1') {
+        $existingRelease = Invoke-DatabaseSql "SELECT count(*) FROM rxnorm_lab.release WHERE release='2026-10-05';"
+        if ($existingRelease -ne '0') {
+            throw 'The local 2026-10-05 import is incomplete or incompatible. Complete it using its original matching RxNorm archive (README section 7), or select a separate empty database. No existing release was replaced.'
+        }
+    }
+}
 if ($ready -ne '1') {
     # download and import the rxnorm files
     $Zip = Join-Path $Downloads 'RxNorm_full_prescribe_10052026.zip'
@@ -263,9 +427,9 @@ if ($ready -ne '1') {
     $rrf = '../medication-lab-setup/automatic/data/2026-10-05/rrf'
     Invoke-Sbt @("run import-rxnorm $rrf 2026-10-05")
     Invoke-Sbt @("run import-product-attributes $rrf 2026-10-05")
-    Run { docker.exe exec $ContainerName psql -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -c 'ANALYZE;' }
+    Invoke-DatabaseSql 'ANALYZE;' | Out-Host
 } else { Write-Host 'RxNorm is already imported.' }
-$verified = Run { docker.exe exec $ContainerName psql -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -Atc $query }
+$verified = Invoke-DatabaseSql $query
 if ($verified -ne '1') { throw 'RxNorm release/product index verification failed after import.' }
 Invoke-Sbt @('test')
 
@@ -429,8 +593,8 @@ $requiredSettings = @{
     'clinicalDsl.rxnorm.scalaRoot' = $Scala; 'clinicalDsl.rxnorm.toolsRoot' = $Tools
     'clinicalDsl.rxnorm.release' = '2026-10-05'; 'clinicalDsl.rxnorm.onSave' = $true
     'files.autoSave' = 'afterDelay'; 'files.autoSaveDelay' = 1000
-    'clinicalDsl.rxnorm.pgHost' = '127.0.0.1'; 'clinicalDsl.rxnorm.pgPort' = $Port
-    'clinicalDsl.rxnorm.pgDatabase' = 'rxnorm_public'; 'clinicalDsl.rxnorm.pgUser' = 'rxnorm_lab'
+    'clinicalDsl.rxnorm.pgHost' = $PgHost; 'clinicalDsl.rxnorm.pgPort' = $Port
+    'clinicalDsl.rxnorm.pgDatabase' = $Database; 'clinicalDsl.rxnorm.pgUser' = $DbUser
     'clinicalDsl.rxnorm.timeoutSeconds' = 300
 }
 foreach ($key in $requiredSettings.Keys) { $settings[$key] = $requiredSettings[$key] }
@@ -440,6 +604,7 @@ if (-not $NoEditor) { Run { code.cmd --new-window --user-data-dir $Profile "--ex
 Save-Json $HealthFile @{
     status = 'ready'; checkedAt = (Get-Date).ToUniversalTime().ToString('o')
     repositories = $RepoHeads; postgres = 'authenticated-query-pass'; rxnorm = 'ready'
+    databaseMode = $DatabaseMode; pgHost = $PgHost; pgPort = $Port; pgDatabase = $Database; pgUser = $DbUser
     scala = 'clean-compile-test-pass'; langium = 'clean-generate-build-pass'
     clinicalValid = 'pass'; clinicalInvalid = 'pass'; languageServer = 'initialize-diagnostics-pass'
     smokeDirectory = $Smoke; editorLaunchRequested = (-not $NoEditor)
@@ -456,4 +621,7 @@ Write-Host 'Change strength 325 mg to strength 32500 mg and pause to see PRODUCT
         catch { Write-Warning 'Could not write the failed health report.' }
     }
     throw
-} finally { Set-Location $OriginalLocation }
+} finally {
+    foreach ($name in $PreviousEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $PreviousEnvironment[$name], 'Process') }
+    Set-Location $OriginalLocation
+}
