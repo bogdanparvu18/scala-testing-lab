@@ -40,44 +40,122 @@ function Save-Json($Path, $Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 8), $Utf8)
 }
 
-# Never reset a user's source files or unpublished commits. Only disposable build
-# outputs are stashed (and retained) so the binaries tracked by legacy clones do
-# not make every subsequent run fail its clean-worktree check.
+# Root is a managed installation: GitHub is the source of the active code.
+# An incompatible existing copy is retained whole before a verified clone is
+# installed. Database/state directories and copies outside Root are never moved.
+function Install-FreshRepo([string]$Name, [string]$BranchName, [string]$Reason) {
+    $directory = Join-Path $Root $Name
+    $url = "https://github.com/bogdanparvu18/$Name.git"
+    $stage = Join-Path $Root ('.bootstrap-' + $Name + '-' + [guid]::NewGuid().ToString('N'))
+    $backup = $null
+    $previousWasDirectory = $false
+    Write-Host "${Name}: $Reason. Preparing the latest origin/$BranchName."
+    Push-Location -LiteralPath $Root
+    try {
+        # Download and verify FIRST. A failed clone leaves the old copy in place.
+        Run { git.exe clone --branch $BranchName -- $url $stage } | Out-Host
+        $remoteRef = "refs/remotes/origin/$BranchName"
+        $expected = (Run { git.exe -C $stage rev-parse $remoteRef }).Trim()
+        $after = (Run { git.exe -C $stage rev-parse HEAD }).Trim()
+        if ($after -ne $expected) { throw "$Name clone does not match origin/$BranchName." }
+        if (Test-Path -LiteralPath $directory) {
+            $item = Get-Item -LiteralPath $directory -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "$directory is a link/junction, not a managed copy. Choose a Root with ordinary directories; the external target was not modified."
+            }
+            $backups = Join-Path $Root 'medication-lab-setup\automatic\backups'
+            New-Item -ItemType Directory -Path $backups -Force | Out-Null
+            $backup = Join-Path $backups ($Name + '-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N'))
+            $previousWasDirectory = [bool]$item.PSIsContainer
+            # Same-volume rename, not a recursive copy/delete or destructive reset.
+            if ($previousWasDirectory) { [IO.Directory]::Move($directory, $backup) }
+            else { [IO.File]::Move($directory, $backup) }
+            Write-Host "Preserved previous copy: $backup"
+        }
+        try { [IO.Directory]::Move($stage, $directory) }
+        catch {
+            $installError = $_.Exception.Message
+            if ($backup -and -not (Test-Path -LiteralPath $directory)) {
+                try {
+                    if ($previousWasDirectory) { [IO.Directory]::Move($backup, $directory) }
+                    else { [IO.File]::Move($backup, $directory) }
+                } catch { throw "Could not install $Name or restore its original path. Original copy remains at $backup. $($_.Exception.Message)" }
+                throw "Could not install $Name; the previous copy was restored. $installError"
+            }
+            throw "Could not install $Name. Preserved copy, if any: $backup. $installError"
+        }
+        Write-Host "${Name}: installed $after (origin/$BranchName)."
+        return @{ repository = $Name; branch = $BranchName; before = $null; after = $after; action = 'clone'; backupPath = $backup; reason = $Reason }
+    } finally {
+        # Only remove this invocation's private staging clone, never the backup.
+        if (Test-Path -LiteralPath $stage) {
+            try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
+            catch { Write-Warning "Temporary clone could not be removed: $stage" }
+        }
+        Pop-Location
+    }
+}
+function Read-GitMetadata([string]$Directory, [string[]]$Arguments) {
+    # Read-only probes may fail for a corrupt/partial old checkout. Such a copy
+    # will be backed up, not treated as a reason to stop installing current code.
+    $ErrorActionPreference = 'Continue'
+    $output = @(& git.exe -C $Directory @Arguments 2>$null)
+    $exitCode = $LASTEXITCODE
+    return @{ ok = ($exitCode -eq 0); text = ($output -join "`n").Trim() }
+}
 function Sync-Repo([string]$Name, [string]$BranchName, [string[]]$GeneratedPatterns) {
+    if ($Name -notin @('scala-testing-lab', 'langium_dsl_lab')) { throw 'Unsupported managed repository name.' }
     $directory = Join-Path $Root $Name
     $url = "https://github.com/bogdanparvu18/$Name.git"
     Run { git.exe check-ref-format --branch $BranchName } | Out-Null
     $remoteRef = "refs/remotes/origin/$BranchName"
     if (-not (Test-Path -LiteralPath $directory)) {
-        Run { git.exe clone --branch $BranchName $url $directory } | Out-Host
+        return (Install-FreshRepo $Name $BranchName 'No local copy exists')
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $directory '.git'))) {
-        throw "$directory is not a Git checkout. Move it aside or choose another Root."
+    $item = Get-Item -LiteralPath $directory -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$directory is a link/junction. Choose an installation Root with ordinary directories."
     }
-    $origin = (Run { git.exe -C $directory remote get-url origin }).Trim()
-    if ($origin -notin @($url, $url.Substring(0, $url.Length - 4), "git@github.com:bogdanparvu18/$Name.git")) {
-        throw "Unexpected origin in $directory. Refusing to update another repository."
+    $gitPath = Join-Path $directory '.git'
+    if (Test-Path -LiteralPath $gitPath -PathType Leaf) {
+        throw "$directory uses external Git metadata (worktree/submodule). Choose a separate installation Root; that working tree was not changed."
     }
-    # An explicit refspec also works for older/single-branch installations.
+    if (-not (Test-Path -LiteralPath $gitPath -PathType Container)) {
+        return (Install-FreshRepo $Name $BranchName 'Existing files have no Git metadata')
+    }
+    if ((Get-Item -LiteralPath $gitPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$gitPath is a link/junction. External Git metadata will not be modified."
+    }
+    $origin = Read-GitMetadata $directory @('remote', 'get-url', 'origin')
+    $head = Read-GitMetadata $directory @('rev-parse', '--verify', 'HEAD')
+    $currentBranch = Read-GitMetadata $directory @('branch', '--show-current')
+    if (-not $origin.ok -or -not $head.ok -or -not $currentBranch.ok) {
+        return (Install-FreshRepo $Name $BranchName 'Existing Git metadata is incomplete or invalid')
+    }
+    if ($origin.text -notin @($url, $url.Substring(0, $url.Length - 4), "git@github.com:bogdanparvu18/$Name.git")) {
+        return (Install-FreshRepo $Name $BranchName 'Existing copy has a different origin')
+    }
+    # A failed network/authentication request is still a real failure, never READY
+    # with stale code. No local source is changed by this explicit fetch.
     Run { git.exe -C $directory fetch --prune origin "+refs/heads/${BranchName}:${remoteRef}" } | Out-Host
-    $before = (Run { git.exe -C $directory rev-parse HEAD }).Trim()
-    $remote = (Run { git.exe -C $directory rev-parse $remoteRef }).Trim()
-    $branch = [string](Run { git.exe -C $directory branch --show-current })
+    $before = $head.text
+    $branch = $currentBranch.text
     if ($branch -and $branch -ne $BranchName -and $branch -ne 'main') {
-        throw "$directory is on branch '$branch'. Switch to $BranchName before running the bootstrap."
+        return (Install-FreshRepo $Name $BranchName "Existing copy is on branch '$branch'")
     }
     if ([int](Run { git.exe -C $directory rev-list --count "${remoteRef}..HEAD" }) -ne 0) {
-        throw "$directory has unpublished or divergent commits. Reconcile them with origin/$BranchName first."
+        return (Install-FreshRepo $Name $BranchName 'Existing copy has local or divergent commits')
     }
     $localMain = @(Run { git.exe -C $directory branch --list $BranchName })
     if ($localMain.Count -gt 0 -and [int](Run { git.exe -C $directory rev-list --count "${remoteRef}..${BranchName}" }) -ne 0) {
-        throw "$directory has a local $BranchName that is ahead of or diverges from origin/$BranchName. No commits were discarded."
+        return (Install-FreshRepo $Name $BranchName "Local $BranchName differs from the remote history")
     }
     $changed = @(Run { git.exe -c core.quotepath=false -C $directory diff --name-only -- })
     $changed += @(Run { git.exe -c core.quotepath=false -C $directory diff --cached --name-only -- })
     $untracked = @(Run { git.exe -c core.quotepath=false -C $directory ls-files --others --exclude-standard })
-    $paths = @(@($changed) + @($untracked) | Sort-Object -Unique)
-    $generated = @()
+    # Preserve ignored personal files too, without enumerating entire node_modules.
+    $ignored = @(Run { git.exe -c core.quotepath=false -C $directory ls-files --others --ignored --exclude-standard --directory })
+    $paths = @(@($changed) + @($untracked) + @($ignored) | Sort-Object -Unique)
     foreach ($path in $paths) {
         if (-not $path) { continue }
         $isGenerated = $false
@@ -85,12 +163,13 @@ function Sync-Repo([string]$Name, [string]$BranchName, [string[]]$GeneratedPatte
             if ($path -like $pattern) { $isGenerated = $true; break }
         }
         if (-not $isGenerated) {
-            throw "Local source/untracked file in ${directory}: $path. Commit, stash, or move your changes first; nothing was overwritten."
+            return (Install-FreshRepo $Name $BranchName 'Existing copy contains local source or personal files')
         }
-        $generated += $path
     }
+    $generated = @(@($changed) + @($untracked) | Where-Object { $_ } | Sort-Object -Unique)
     if ($generated.Count -gt 0) {
-        # NUL-separated literal pathspecs handle spaces and avoid Windows' argv limit.
+        # Legacy repos track build products. Keep their existing stash behavior
+        # so unchanged reruns do not clone/archive node_modules and target again.
         $pathspec = [IO.Path]::GetTempFileName()
         try {
             $literalPaths = @($generated | ForEach-Object { ':(literal)' + $_ })
@@ -101,16 +180,24 @@ function Sync-Repo([string]$Name, [string]$BranchName, [string[]]$GeneratedPatte
             Write-Host "Preserved generated-output changes in ${Name}: stash $backup (not reapplied)."
         } finally { Remove-Item -LiteralPath $pathspec -Force }
     }
-    # Migrate the old detached, pinned checkout onto the moving main branch.
-    if ($branch -ne $BranchName) {
-        if ($localMain.Count -gt 0) { Run { git.exe -C $directory checkout $BranchName } | Out-Host }
-        else { Run { git.exe -C $directory checkout --track -b $BranchName $remoteRef } | Out-Host }
+    try {
+        # Migrate the old detached checkout, then pull the moving remote branch.
+        if ($branch -ne $BranchName) {
+            if ($localMain.Count -gt 0) { Run { git.exe -C $directory checkout $BranchName } | Out-Host }
+            else { Run { git.exe -C $directory checkout --track -b $BranchName $remoteRef } | Out-Host }
+        }
+        Run { git.exe -C $directory pull --ff-only --no-rebase --no-autostash origin "+refs/heads/${BranchName}:${remoteRef}" } | Out-Host
+        $remote = (Run { git.exe -C $directory rev-parse $remoteRef }).Trim()
+        $after = (Run { git.exe -C $directory rev-parse HEAD }).Trim()
+        if ($after -ne $remote) { throw "$Name did not reach the fetched origin/$BranchName." }
+    } catch {
+        # A rewrite upstream or a leftover checkout conflict must not require
+        # manual cleanup. A replacement download must succeed before swapping.
+        Write-Warning "In-place update failed for ${Name}: $($_.Exception.Message)"
+        return (Install-FreshRepo $Name $BranchName 'In-place update could not reach the remote branch')
     }
-    Run { git.exe -C $directory merge --ff-only $remoteRef } | Out-Host
-    $after = (Run { git.exe -C $directory rev-parse HEAD }).Trim()
-    if ($after -ne $remote) { throw "$Name did not reach the fetched origin/$BranchName. Setup stopped." }
     Write-Host "${Name}: $before -> $after (origin/$BranchName)"
-    return @{ repository = $Name; branch = $BranchName; before = $before; after = $after }
+    return @{ repository = $Name; branch = $BranchName; before = $before; after = $after; action = 'pull'; backupPath = $null }
 }
 # Docker is strictly opt-in. No Docker command or installation check runs in local mode.
 function Get-DockerType {
@@ -224,6 +311,8 @@ function Invoke-Sbt([string[]]$Commands) {
 
 if ($Help) {
     Write-Host 'Usage: .\bootstrap-windows.ps1 [-Root directory] [-Port port] [-PgHost host] [-Database name] [-DbUser user] [-PsqlPath path] [-PgServiceName name] [-UseDocker] [-ContainerName name] [-VolumeName name] [-NoEditor] [-StartupTimeoutSeconds 180] [-ScalaBranch main] [-LangiumBranch main]'
+    Write-Host 'Root contains the two managed repositories and setup files. Each run pulls the selected remote branches. Old ZIP folders, source edits or divergent copies are backed up and replaced automatically after a successful fresh download.'
+    Write-Host 'Backups remain under Root\medication-lab-setup\automatic\backups; local source changes are not reapplied. Git-generated output backups remain in git stash. Run only one bootstrap at a time for a given Root.'
     Write-Host 'Default: existing local PostgreSQL, no Docker checks or commands. Connection defaults: PGHOST/PGPORT/PGDATABASE/PGUSER, then 127.0.0.1:5432 / scala_testing_lab / scala_lab. Explicit arguments override those defaults.'
     Write-Host 'Local mode uses PGPASSWORD or asks securely for the existing password. The database and login must already exist; no local role/password/database is created or replaced.'
     Write-Host 'A ready local RxNorm import with compatible manifests is reused. Empty databases receive the verified prescribable archive; incomplete/incompatible existing releases are not replaced.'
@@ -320,7 +409,9 @@ $env:PGCONNECT_TIMEOUT = '10'
 $env:PGSSLMODE = 'disable'
 Remove-Item Env:PGHOSTADDR, Env:PGSERVICE -ErrorAction SilentlyContinue
 
-# Always fetch and fast-forward both repositories; there are no pinned code SHAs.
+# Work from Root so a managed checkout is not the current directory while moved.
+Set-Location -LiteralPath $Root
+# Always pull both moving branches; back up and replace incompatible old copies.
 $RepoHeads = @(
     Sync-Repo 'scala-testing-lab' $ScalaBranch @('target/*', 'project/target/*', 'project/project/target/*', '.metals/*', '.bsp/*', '.bloop/*')
     Sync-Repo 'langium_dsl_lab' $LangiumBranch @('clinical-dsl-demo/node_modules/*', 'clinical-dsl-demo/packages/*/node_modules/*', 'clinical-dsl-demo/packages/*/out/*', 'clinical-dsl-demo/*.tsbuildinfo', 'clinical-dsl-demo/packages/language/src/generated/*', 'clinical-dsl-demo/packages/language/syntaxes/*', 'clinical-dsl-demo/packages/extension/syntaxes/*')
