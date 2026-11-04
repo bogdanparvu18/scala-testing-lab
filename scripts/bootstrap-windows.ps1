@@ -296,17 +296,52 @@ function Sync-Repo([string]$Name, [string]$BranchName, [string[]]$GeneratedPatte
     }
     $generated = @(@($changed) + @($untracked) | Where-Object { $_ } | Sort-Object -Unique)
     if ($generated.Count -gt 0) {
-        # Legacy repos track build products. Keep their existing stash behavior
-        # so unchanged reruns do not clone/archive node_modules and target again.
-        $pathspec = [IO.Path]::GetTempFileName()
-        try {
-            $literalPaths = @($generated | ForEach-Object { ':(literal)' + $_ })
-            [IO.File]::WriteAllText($pathspec, (($literalPaths -join "`0") + "`0"), $Utf8)
-            $label = 'bootstrap-generated-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-            Run { git.exe -c 'user.name=Medication Lab Bootstrap' -c 'user.email=bootstrap@localhost' -C $directory stash push --include-untracked -m $label "--pathspec-from-file=$pathspec" --pathspec-file-nul } | Out-Host
-            $backup = (Run { git.exe -C $directory rev-parse refs/stash }).Trim()
-            Write-Host "Preserved generated-output changes in ${Name}: stash $backup (not reapplied)."
-        } finally { Remove-Item -LiteralPath $pathspec -Force }
+        # A per-file pathspec file still becomes argv in Git's stash subprocesses.
+        # Compact only directory-wide allowlist entries to concrete directories;
+        # keep file-only patterns (such as *.tsbuildinfo) as individual files.
+        $scopePaths = @{}
+        foreach ($generatedPath in $generated) {
+            $scope = $generatedPath
+            foreach ($pattern in $GeneratedPatterns) {
+                if (-not $pattern.EndsWith('/*') -or $generatedPath -notlike $pattern) { continue }
+                $prefix = $pattern.Substring(0, $pattern.Length - 2)
+                $expression = '^(?<scope>' + [regex]::Escape($prefix).Replace('\*', '.*') + ')/.+$'
+                $match = [regex]::Match($generatedPath, $expression, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if ($match.Success) { $scope = $match.Groups['scope'].Value; break }
+            }
+            # Never broaden a file-only rule to the repository/workspace root.
+            if ([string]::IsNullOrWhiteSpace($scope) -or $scope -in @('.', '..') -or
+                [IO.Path]::IsPathRooted($scope) -or $scope -match '(^|/)\.\.(/|$)' -or
+                $scope -match '[\\"\x00\r\n]' -or $scope.Length -gt 4096) {
+                throw "Cannot safely save generated-output path '$scope' in $Name. Existing stashes were retained."
+            }
+            $scopePaths[':(top,literal)' + $scope] = $true
+        }
+        $scopes = @($scopePaths.Keys | Sort-Object)
+        $runLabel = 'bootstrap-generated-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N')
+        $scopeNumber = 0
+        foreach ($scopePath in $scopes) {
+            # One literal scope per command also bounds Git's internal cleanup
+            # arguments, regardless of the number of files under that directory.
+            $scopeNumber++
+            $previousStash = Read-GitMetadata $directory @('rev-parse', '--verify', 'refs/stash')
+            $label = $runLabel + '-' + $scopeNumber
+            Write-Host "Saving generated outputs in ${Name}: $scopePath ($scopeNumber/$($scopes.Count))"
+            try {
+                Run { git.exe -c 'user.name=Medication Lab Bootstrap' -c 'user.email=bootstrap@localhost' -C $directory stash push --include-untracked -m $label -- $scopePath } | Out-Host
+            } catch {
+                $stashError = $_.Exception.Message
+                # Git can save a stash before cleanup fails. Keep that recovery
+                # point and all earlier stashes; do not pop/drop/reset or re-clone.
+                $saved = Read-GitMetadata $directory @('rev-parse', '--verify', 'refs/stash')
+                if ($saved.ok) { Write-Warning "Latest retained stash in ${Name}: $($saved.text)" }
+                throw "Generated-output backup/cleanup failed for $Name at '$scopePath'. Existing stashes were retained; checkout/pull has not started. Resolve the reported Git error and rerun. $stashError"
+            }
+            $saved = Read-GitMetadata $directory @('rev-parse', '--verify', 'refs/stash')
+            if ($saved.ok -and (-not $previousStash.ok -or $saved.text -ne $previousStash.text)) {
+                Write-Host "Preserved generated-output changes in ${Name}: stash $($saved.text) (not reapplied)."
+            }
+        }
     }
     try {
         # Migrate the old detached checkout, then pull the moving remote branch.
