@@ -109,6 +109,21 @@ export async function exportDocument({ langiumRoot, input, release }) {
     if (!cst) throw new Error(`Medication ${medication.name} has no source CST.`);
     const amount = Number(medication.amount);
     if (!Number.isFinite(amount)) throw new Error(`Medication ${medication.name} has a nonfinite amount.`);
+    const hasBinding = medication.rxcui !== undefined || medication.rxnormRelease !== undefined;
+    if (hasBinding && (!/^[1-9][0-9]{0,19}$/.test(medication.rxcui ?? '') ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(medication.rxnormRelease ?? ''))) {
+      throw new Error(`Medication ${medication.name} requires a valid RxCUI and RxNorm release together.`);
+    }
+    if (hasBinding) {
+      const date = new Date(`${medication.rxnormRelease}T00:00:00.000Z`);
+      if (medication.rxnormRelease.startsWith('0000-') || !Number.isFinite(date.getTime()) ||
+          date.toISOString().slice(0, 10) !== medication.rxnormRelease) {
+        throw new Error(`Medication ${medication.name} has an invalid RxNorm release date.`);
+      }
+    }
+    if (hasBinding && medication.rxnormRelease !== release.trim()) {
+      throw new Error(`Medication ${medication.name} was selected from RxNorm ${medication.rxnormRelease}, but validation uses ${release.trim()}. Select a product from the configured release.`);
+    }
     const position = value => ({
       line: value.line,
       character: value.character,
@@ -128,6 +143,7 @@ export async function exportDocument({ langiumRoot, input, release }) {
       dose: { amount, unit: medication.unit },
       ...(medication.productStrength !== undefined ? { productStrength: medication.productStrength } : {}),
       ...(medication.doseForm !== undefined ? { doseForm: medication.doseForm } : {}),
+      ...(hasBinding ? { productBinding: { rxcui: medication.rxcui, release: medication.rxnormRelease } } : {}),
       route: medication.route,
       frequency: medication.frequency,
       patientRef: patient.name,
@@ -135,8 +151,8 @@ export async function exportDocument({ langiumRoot, input, release }) {
     };
   });
   return {
-    schemaVersion: '1',
-    policyVersion: 'exact-v1',
+    schemaVersion: mentions.some(m => m.productBinding) ? '2' : '1',
+    policyVersion: mentions.some(m => m.productBinding) ? 'explicit-product-v1' : 'exact-v1',
     terminologyRelease: release.trim(),
     document: { uri: uri.toString(), text: sourceText },
     mentions

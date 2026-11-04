@@ -229,13 +229,36 @@ final class PostgresStore private (config: PGConfig) extends TerminologyReposito
 
   def snapshot(release: String, terms: Vector[String]): Task[RxSnapshot] = readSnapshot(release,terms,false)
 
+  /** Read-only prefix search over the same immutable release used by resolution.
+    * Input is already normalized/validated; wildcard characters remain literal.
+    */
+  def searchProducts(request: ProductSearchQuery): Task[ProductSearchResponse] = use { c => transaction(c,true) {
+    val ready = query(c,"SELECT scope FROM rxnorm_lab.release WHERE release=? AND state='ready'",strings(request.release))(_.getString(1))
+    if ready != Vector(Rrf.scope) then
+      throw ProductSearchFailure(404,"RXNORM_RELEASE_UNAVAILABLE","The requested RxNorm release is not imported and ready.")
+    val rows = query(c,"""SELECT DISTINCT p.rxcui,p.display,p.tty FROM rxnorm_lab.lexical_name l
+      JOIN rxnorm_lab.rx_concept p ON p.release=l.release AND p.rxcui=l.rxcui
+      WHERE l.release=? AND left(l.normalized,128) LIKE ? ESCAPE E'\\' AND p.tty IN ('SCD','SBD')
+      ORDER BY p.display,p.rxcui,p.tty LIMIT ?""", p => {
+      p.setString(1,request.release)
+      p.setString(2,ProductSearchQuery.literalPrefix(request.query))
+      p.setInt(3,request.limit+1)
+      p.setQueryTimeout(3)
+    })(r => ProductSearchItem(r.getString(1),r.getString(2),r.getString(3),request.release))
+    ProductSearchResponse("1",request.release,request.query,rows.take(request.limit),rows.size > request.limit)
+  }}
+
   def snapshotForResolution(ast: AstRequest): Task[RxSnapshot] =
     val productRequested = ast.mentions.exists(m => m.productStrength.nonEmpty || m.doseForm.nonEmpty)
-    readSnapshot(ast.terminologyRelease,ast.mentions.flatMap(m => Vector(m.originalText) ++ m.doseForm.toVector),productRequested)
+    val terms=ast.mentions.flatMap(m => (if m.productBinding.isEmpty then Vector(m.originalText) else Vector.empty) ++ m.doseForm.toVector)
+    readSnapshot(ast.terminologyRelease,terms,productRequested,
+      ast.mentions.flatMap(_.productBinding.map(_.rxcui)))
 
-  private def readSnapshot(release: String, terms: Vector[String], productRequested: Boolean): Task[RxSnapshot] = use { c => transaction(c,true) {
+  private def readSnapshot(release: String, terms: Vector[String], productRequested: Boolean,
+      explicitIds: Vector[String] = Vector.empty): Task[RxSnapshot] = use { c => transaction(c,true) {
     val normalized = terms.map(Rrf.normalize).filter(_.nonEmpty).distinct.sorted
-    require(normalized.nonEmpty && normalized.size <= 100,"Resolve expects 1–100 distinct nonempty terms")
+    require((normalized.nonEmpty || explicitIds.nonEmpty) && normalized.size + explicitIds.distinct.size <= 100,
+      "Resolve expects 1–100 distinct terminology terms/product identifiers")
     val metadata = query(c,"SELECT scope,sha256_json FROM rxnorm_lab.release WHERE release=? AND state='ready'",strings(release))(
       r => (r.getString(1),r.getString(2)))
     require(metadata.size == 1,s"No ready local release '$release'; finish import-rxnorm first")
@@ -255,6 +278,14 @@ final class PostgresStore private (config: PGConfig) extends TerminologyReposito
         WHERE l.release=? ORDER BY l.rxaui""",p => {p.setArray(1,termsArray);p.setString(2,release)}) { r =>
         val id=r.getString("rxcui");concepts(id)=RxConcept(id,r.getString("canonical_tty"),r.getString("display"))
         RxDescription(id,r.getString("rxaui"),r.getString("text"),r.getString("normalized"),r.getString("tty"),r.getString("sab"))
+      }
+    }
+    // A selected product is addressed by its persisted RxCUI. Its DSL name is
+    // a local identifier and need not be a terminology label or synonym.
+    if explicitIds.nonEmpty then array(c,explicitIds.distinct.sorted) { ids =>
+      query(c,"SELECT rxcui,tty,display FROM rxnorm_lab.rx_concept WHERE release=? AND rxcui=ANY(?)",
+        p => {p.setString(1,release);p.setArray(2,ids)}) { r =>
+        val id=r.getString(1); concepts(id)=RxConcept(id,r.getString(2),r.getString(3))
       }
     }
     val edges = mutable.HashSet.empty[RxRelation]

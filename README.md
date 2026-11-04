@@ -54,7 +54,7 @@ There are two related workflows:
 
 RxNorm is downloaded once per imported release. A normal lookup or resolution does not make an RxNorm API call. Building the project for the first time still requires internet access to obtain dependencies.
 
-The Scala application is a CLI. It does not start an HTTP server. The VS Code extension launches the exporter and Scala CLI as local child processes.
+The Scala application provides CLI commands for import and final resolution, plus an optional long-running loopback HTTP service for product autocomplete. The VS Code extension launches the exporter and resolver as local child processes; start `serve-products` once separately for interactive search. See [product search and explicit bindings](PRODUCT-AUTOCOMPLETE.md).
 
 ### Repository responsibilities
 
@@ -165,7 +165,7 @@ Sources: [Main.scala](src/main/scala/lab/Main.scala), [Domain.scala](src/main/sc
 | --- | --- |
 | `readInput → raw.fromJson[AstRequest]` | zio-json decodes the file into case classes. Required fields/types must decode; `@jsonNoExtraFields` rejects unknown input keys. Decode errors become `IllegalArgumentException`. |
 | `AstRequest.mentions` | Each `Mention` already contains `originalText` (medication name), `productStrength`, `doseForm`, `dose.amount/unit`, `route`, `frequency`, role, IDs and source location. Scala reads these fields; it does not extract strength from the medication name or reparse the DSL. |
-| `InputValidation.validate` | Requires input schema `1`, policy `exact-v1`, a valid release label, nonempty mentions, unique mention/order IDs and nonempty patient/order references. |
+| `InputValidation.validate` | Accepts schema `1` / policy `exact-v1` for legacy input, or schema `2` / policy `explicit-product-v1` for explicit product bindings. Also checks release labels, nonempty mentions, unique mention/order IDs and nonempty patient/order references. |
 | Dose and role checks | Positive `BigDecimal` dose; allowed unit, route and frequency; role must be `medication`, `activeIngredient` or `medicationProduct`. These are representation checks, not prescribing-safety checks. |
 | Qualifier checks | A supplied strength must pass `ProductStrength.parse`; a supplied form must be nonblank and at most 200 characters. The requirement to supply both qualifiers is handled later by `ProductSelector.select`. |
 | Source checks | URI must match the document; line/character/offset values must agree with its UTF-16 text; range must be ordered; extracted substring must equal `source.text`, which must contain `originalText`. |
@@ -725,8 +725,8 @@ The contract includes:
 
 | Field | Purpose |
 | --- | --- |
-| `schemaVersion: "1"` | Input contract version. |
-| `policyVersion: "exact-v1"` | Resolution policy version. |
+| `schemaVersion` | `"1"` without bindings; `"2"` when an exported mention has `productBinding`. |
+| `policyVersion` | `"exact-v1"` for schema 1; `"explicit-product-v1"` for schema 2. |
 | `terminologyRelease` | Exact local release to use. |
 | `document.uri` / `document.text` | Original document identity and text. |
 | `mentions[].originalText` | Medication name from the AST. |
@@ -735,6 +735,7 @@ The contract includes:
 | `dose` / `route` / `frequency` | Administration information already represented by the grammar. |
 | `patientRef` / `orderId` | Patient and plan context. |
 | `productStrength` / `doseForm` | Optional explicit product qualifiers. |
+| `productBinding` | Optional `{rxcui, release}` selected in the editor and persisted in the DSL; overrides lexical lookup of the local alias. |
 
 The JSON is an AST projection. It does not serialize all Langium internals and their object references/cycles.
 
@@ -878,7 +879,7 @@ Missing or conflicting strength evidence produces `PRODUCT_EVIDENCE_INCOMPLETE` 
 
 ### Colon syntax and contextual help
 
-Use `:` after the declaration name and commas between fields. Names remain identifiers; product strength and multiword dose forms do not need quotes in colon syntax.
+Use `:` after the declaration name. Medication and Plan fields can appear in any order, with optional commas. Names remain identifiers; quote dose forms containing field keywords to make their boundary explicit.
 
 ```text
 Patient DemoPatient: age 30, condition DemoCondition
@@ -892,16 +893,16 @@ This is a syntax example, not a treatment recommendation. `15 mg` is the adminis
 In a writable `.clinical` editor:
 
 1. Press **Ctrl+Space** for completion suggestions.
-2. Press **?** for help based on the text before the cursor: declaration name, amount, strength, dose form, route, frequency, patient, plan, or `show`.
+2. Press **?** for missing fields and concrete examples. Help parses the entire declaration, including fields after the cursor, while the cursor determines the example to show.
 3. Choose **Show suggestions** in the help message to open completion at that position.
 
 The command is **Clinical DSL: Context Help (?)** in the Command Palette. Its default keybinding is **Shift+/**; on other keyboard layouts, rebind that command in Keyboard Shortcuts. The shortcut consumes the key without inserting `?`: it is editor help, not part of the grammar, saved document, or JSON sent to Scala. A question mark pasted into the source is not automatically removed and can cause a syntax error.
 
-Lowercase `patient`, `medication`, and `plan` remain accepted, as do legacy brace declarations. `show` stays lowercase. Completion provides local language suggestions; it does not query RxNorm on every keystroke.
+Medication, Plan and `show` accept mixed case; Patient keeps its existing keyword casing and structure. Completion provides local language suggestions and, with `serve-products` running, debounced RxNorm product-prefix suggestions accepted with Tab.
 
-The AST/JSON contract is unchanged. The bridge still exports the plans selected by `show`, preserving source positions. No PostgreSQL reimport is needed for the syntax/help update.
+Documents without bindings keep the original JSON contract. Bound documents add `productBinding` and use request schema `2`. The bridge still exports plans selected by `show`, preserving source positions. Search startup adds a prefix index; it does not require an RxNorm reimport.
 
-The grammar and editor command live in the companion Langium repository; Scala continues to consume the same exported JSON. For legacy brace syntax, product qualifiers remain quoted. See the [Langium grammar guide](https://github.com/bogdanparvu18/langium_dsl_lab/blob/main/clinical-dsl-demo/README.md) and this repository's [colon example](examples/colon-help.clinical).
+The grammar and editor command live in the companion Langium repository. Both repositories must support explicit bindings before using them. For legacy brace syntax, product qualifiers remain quoted; new binding fields use colon syntax. See the [Langium grammar guide](https://github.com/bogdanparvu18/langium_dsl_lab/blob/main/clinical-dsl-demo/README.md), [product autocomplete guide](PRODUCT-AUTOCOMPLETE.md), and this repository's [colon example](examples/colon-help.clinical).
 
 After updating the Langium checkout, rebuild it and reload Extension Development Host:
 

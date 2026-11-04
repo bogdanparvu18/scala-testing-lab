@@ -51,33 +51,60 @@ object Resolver:
       else visit(start, Vector.empty, Set(start.rxcui)).groupBy(_.concept.rxcui).toVector.sortBy(_._1)
         .map { (_, paths) => paths.minBy(p => (p.path.size, p.path.map(_.rui).mkString("|"))) }
     val results = a.mentions.sortBy(_.id).map { m =>
-      val found = candidates(m.originalText,s)
-      val allowed = found.filter { c => m.role match
-        case "activeIngredient" => ingredients(c.concept.tty)
-        case "medicationProduct" => products(c.concept.tty)
-        case _ => medicationTypes(c.concept.tty)
-      }
-      val hasProductFields = m.productStrength.nonEmpty || m.doseForm.nonEmpty
-      if found.isEmpty then Resolution(m,"unresolved",None,None,Vector.empty,Vector.empty,"none",
-        Vector("UNRESOLVED_IN_DATASET: no exact imported name in this local release; this does not mean the medication does not exist"))
-      else if allowed.isEmpty then Resolution(m,"invalidRole",None,None,Vector.empty,found,"none",
-        Vector("SEMANTIC_TYPE_MISMATCH: name exists but cannot fill this AST role"))
-      else if allowed.size > 1 then Resolution(m,"needsClarification",None,None,Vector.empty,allowed,"none",
-        Vector("AMBIGUOUS_EXACT_MATCH: explicit selection required"))
-      else
-        val c = allowed.head.concept
-        if hasProductFields then
-          val selected = ProductSelector.select(m,c,s)
-          val derived = selected.selected.toVector.flatMap(p => derive(concepts(p.rxcui)))
-          Resolution(m,selected.status,Some(c),selected.selected,derived,selected.candidates,
-            "exact_name_and_imported_product_attributes",selected.diagnostics,productEvidence=selected.evidence)
-        else
-          val product = if products(c.tty) then Some(c) else None
-          val derived = derive(concepts(c.rxcui))
-          val diagnostics =
-            (if product.isEmpty then Vector("PRODUCT_NOT_SELECTED: administered dose is not product strength") else Vector.empty) ++
-            (if products(c.tty) && derived.isEmpty then Vector("INGREDIENT_EVIDENCE_MISSING") else Vector.empty)
-          Resolution(m,"resolved",Some(c),product,derived,allowed,"exact_imported_name",diagnostics)
+      m.productBinding match
+        case Some(binding) =>
+          // An explicit identifier is authoritative. The DSL name is a local alias;
+          // never fall back to lexical matching or a different product on failure.
+          if binding.release != s.release then
+            Resolution(m,"needsClarification",None,None,Vector.empty,Vector.empty,"explicit_rxcui",
+              Vector("PRODUCT_RELEASE_MISMATCH: the selected product belongs to a different RxNorm release; select a product again"))
+          else concepts.get(binding.rxcui) match
+            case None =>
+              Resolution(m,"productNotFound",None,None,Vector.empty,Vector.empty,"explicit_rxcui",
+                Vector("PRODUCT_RXCUI_NOT_FOUND: the selected product is not present in this imported release"))
+            case Some(c) if !products(c.tty) || m.role == "activeIngredient" =>
+              Resolution(m,"invalidRole",None,None,Vector.empty,Vector(Candidate(ref(c),Vector.empty)),"explicit_rxcui",
+                Vector("PRODUCT_RXCUI_TYPE_MISMATCH: explicit product bindings require SCD or SBD and a medication/product role"))
+            case Some(c) =>
+              if m.productStrength.nonEmpty || m.doseForm.nonEmpty then
+                // ProductSelector restricts an SCD/SBD starting concept to this ID.
+                val selected = ProductSelector.select(m,ref(c),s)
+                val derived = selected.selected.toVector.flatMap(p => derive(concepts(p.rxcui)))
+                Resolution(m,selected.status,Some(ref(c)),selected.selected,derived,selected.candidates,
+                  "explicit_rxcui",selected.diagnostics,productEvidence=selected.evidence)
+              else
+                val derived = derive(c)
+                val diagnostics = if derived.isEmpty then Vector("INGREDIENT_EVIDENCE_MISSING") else Vector.empty
+                Resolution(m,"resolved",Some(ref(c)),Some(ref(c)),derived,Vector(Candidate(ref(c),Vector.empty)),
+                  "explicit_rxcui",diagnostics)
+        case None =>
+          val found = candidates(m.originalText,s)
+          val allowed = found.filter { c => m.role match
+            case "activeIngredient" => ingredients(c.concept.tty)
+            case "medicationProduct" => products(c.concept.tty)
+            case _ => medicationTypes(c.concept.tty)
+          }
+          val hasProductFields = m.productStrength.nonEmpty || m.doseForm.nonEmpty
+          if found.isEmpty then Resolution(m,"unresolved",None,None,Vector.empty,Vector.empty,"none",
+            Vector("UNRESOLVED_IN_DATASET: no exact imported name in this local release; this does not mean the medication does not exist"))
+          else if allowed.isEmpty then Resolution(m,"invalidRole",None,None,Vector.empty,found,"none",
+            Vector("SEMANTIC_TYPE_MISMATCH: name exists but cannot fill this AST role"))
+          else if allowed.size > 1 then Resolution(m,"needsClarification",None,None,Vector.empty,allowed,"none",
+            Vector("AMBIGUOUS_EXACT_MATCH: explicit selection required"))
+          else
+            val c = allowed.head.concept
+            if hasProductFields then
+              val selected = ProductSelector.select(m,c,s)
+              val derived = selected.selected.toVector.flatMap(p => derive(concepts(p.rxcui)))
+              Resolution(m,selected.status,Some(c),selected.selected,derived,selected.candidates,
+                "exact_name_and_imported_product_attributes",selected.diagnostics,productEvidence=selected.evidence)
+            else
+              val product = if products(c.tty) then Some(c) else None
+              val derived = derive(concepts(c.rxcui))
+              val diagnostics =
+                (if product.isEmpty then Vector("PRODUCT_NOT_SELECTED: administered dose is not product strength") else Vector.empty) ++
+                (if products(c.tty) && derived.isEmpty then Vector("INGREDIENT_EVIDENCE_MISSING") else Vector.empty)
+              Resolution(m,"resolved",Some(c),product,derived,allowed,"exact_imported_name",diagnostics)
     }
     val shared = results.filter(_.status == "resolved").flatMap { r =>
       r.ingredients.map(i => (r.mention.patientRef, i.concept.rxcui) -> (r.mention.orderId,i.concept))
