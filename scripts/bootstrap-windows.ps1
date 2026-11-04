@@ -18,7 +18,6 @@ param(
     [string]$DockerPath,
     [string[]]$AdditionalSearchPath = @(),
     [switch]$SessionOnlyEnvironment,
-    [switch]$DockerWorkspace,
     [string]$RuntimeContainerName = 'aurora-medication-runtime',
     [string]$RuntimeVolumeName = 'aurora-medication-workspace',
     [string]$RuntimeCacheVolumeName = 'aurora-medication-caches',
@@ -706,25 +705,26 @@ function Invoke-DockerRuntime {
     if ($RuntimeImage -match '[\s\x00]' -or -not $RuntimeImage) { throw 'Invalid runtime image name.' }
     $Root = [IO.Path]::GetFullPath($Root)
     if (-not (Test-Path -LiteralPath $Root)) { New-Item -ItemType Directory -Path $Root | Out-Null }
-    # Never silently switch an existing host checkout into a second active copy.
-    if (-not $DockerWorkspace) {
-        $pending = New-Object 'Collections.Generic.Stack[string]'
-        $pending.Push($Root)
-        while ($pending.Count) {
-            $current = $pending.Pop()
-            $gitConfig = Join-Path $current '.git\config'
-            if (Test-Path -LiteralPath $gitConfig -PathType Leaf) {
-                if ((Get-Content -LiteralPath $gitConfig -Raw -ErrorAction Stop) -match 'bogdanparvu18[/:](scala-testing-lab|langium_dsl_lab)(\.git)?(?:[\s\r\n]|$)') {
-                    throw "Native repository found at '$current'. To deliberately use the separate persistent Linux workspace, rerun with --Docker -DockerWorkspace. No repository was copied or switched."
-                }
+    # --Docker explicitly selects the Linux workspace. Report any native copies
+    # so the location change is visible; never copy or modify those repositories.
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    $pending.Push($Root)
+    while ($pending.Count) {
+        $current = $pending.Pop()
+        $gitConfig = Join-Path $current '.git\config'
+        if (Test-Path -LiteralPath $gitConfig -PathType Leaf) {
+            if ((Get-Content -LiteralPath $gitConfig -Raw -ErrorAction Stop) -match 'bogdanparvu18[/:](scala-testing-lab|langium_dsl_lab)(\.git)?(?:[\s\r\n]|$)') {
+                Write-Host "Native repository retained at '$current'; --Docker selects the separate persistent Linux workspace."
             }
-            foreach ($entry in @(Get-ChildItem -LiteralPath $current -Directory -Force -ErrorAction Stop)) {
-                if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
-                if ($entry.Name -in @('scala-testing-lab', 'langium_dsl_lab')) {
-                    throw "Native repository found at '$($entry.FullName)'. To deliberately use the separate persistent Linux workspace, rerun with --Docker -DockerWorkspace. No repository was copied or switched."
-                }
-                if ($entry.Name -notin @('.git', 'node_modules', 'target', '.metals', '.bloop', '.bsp', 'data', 'downloads', 'backups')) { $pending.Push($entry.FullName) }
+            continue
+        }
+        foreach ($entry in @(Get-ChildItem -LiteralPath $current -Directory -Force -ErrorAction Stop)) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($entry.Name -in @('scala-testing-lab', 'langium_dsl_lab')) {
+                Write-Host "Native repository retained at '$($entry.FullName)'; --Docker selects the separate persistent Linux workspace."
+                continue
             }
+            if ($entry.Name -notin @('.git', 'node_modules', 'target', '.metals', '.bloop', '.bsp', 'data', 'downloads', 'backups')) { $pending.Push($entry.FullName) }
         }
     }
     $databaseContainer = Get-DockerObject 'container' $ContainerName
@@ -947,7 +947,7 @@ if ($Help) {
     Write-Host 'Existing tools are discovered and version-checked outside PATH, including Program Files, registry/services and user installs. Only genuinely missing tools may use WinGet --no-upgrade.'
     Write-Host 'Options: -JavaPath/-NodePath/-GitPath/-CodePath/-DockerPath select executables; -AdditionalSearchPath adds search roots; -SessionOnlyEnvironment avoids saving tool homes/PATH to the user environment.'
     Write-Host 'Incompatible/incomplete tools or inaccessible discovery locations require explicit repair; they never trigger an automatic reinstall.'
-    Write-Host '--Docker runs the complete toolchain in persistent Linux containers. -DockerWorkspace explicitly selects that separate workspace when native repositories exist.'
+    Write-Host '--Docker selects the complete toolchain in a persistent Linux workspace; existing native repository locations are reported and their files are preserved.'
     Write-Host 'Docker selection: -RuntimeContainerName, -RuntimeVolumeName, -RuntimeCacheVolumeName and -RuntimeImage (default ubuntu:24.04). Existing volumes/credentials are reused, never reset.'
     return
 }
