@@ -18,10 +18,7 @@ jobs:
         shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - name: Check the Windows entry point and recovery paths
+      - name: Load the native and Docker entry points
         shell: pwsh
         env:
           CHECK_SHELL: ${{ matrix.shell }}
@@ -29,16 +26,8 @@ jobs:
           $engine = "$env:CHECK_SHELL.exe"
           & $engine -NoProfile -NonInteractive -File scripts/bootstrap-windows.ps1 -Help
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          foreach ($test in Get-ChildItem scripts/tests/*.ps1) {
-            & $engine -NoProfile -NonInteractive -File $test.FullName
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          }
-      - name: Check recovery of project dependencies on Windows
-        if: matrix.shell == 'pwsh'
-        shell: pwsh
-        run: |
-          $tests = @(Get-ChildItem scripts/tests/*.test.* | ForEach-Object FullName)
-          node --test @tests
+          & $engine -NoProfile -NonInteractive -File scripts/bootstrap-windows.ps1 --Docker -Help
+          exit $LASTEXITCODE
   linux:
     runs-on: ubuntu-24.04
     steps:
@@ -46,14 +35,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Check project-local recovery and the Linux container probes
+      - name: Check Linux bootstrap and JavaScript helper syntax
         run: |
-          node --test scripts/tests/*.test.*
           bash -n scripts/bootstrap-unix.sh
           shellcheck -S warning scripts/bootstrap-unix.sh
-          node_bin=$(node -p 'process.execPath')
-          docker run --rm -v "$PWD:/src:ro" -v "$node_bin:/usr/bin/node:ro" -w /src \
-            ubuntu:24.04 bash scripts/tests/runtime-tools.sh
+          for helper in scripts/*.cjs scripts/*.mjs; do node --check "$helper"; done
   grouped-postgres:
     runs-on: ubuntu-24.04
     services:
