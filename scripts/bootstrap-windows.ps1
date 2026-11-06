@@ -13,6 +13,10 @@ param(
     [string]$PsqlPath,
     [string]$JavaPath,
     [string]$NodePath,
+    [string]$NpmPath,
+    [string]$SbtLauncherPath,
+    [switch]$AllowToolUpgrade,
+    [switch]$LocateToolsOnFixedDrives,
     [string]$GitPath,
     [string]$CodePath,
     [string]$DockerPath,
@@ -22,7 +26,12 @@ param(
     [string]$RuntimeVolumeName = 'aurora-medication-workspace',
     [string]$RuntimeCacheVolumeName = 'aurora-medication-caches',
     [string]$RuntimeImage = 'ubuntu:24.04',
+    [switch]$DockerUseHostPostgres,
+    [switch]$DockerUseManagedPostgres,
+    [string[]]$DockerToolSearchPath = @(),
     [string]$PgServiceName,
+    [switch]$ProvisionDatabase,
+    [string]$PgAdminUser = 'postgres',
     [string]$ContainerName = 'aurora-medication-auto-pg',
     [string]$VolumeName = 'aurora-medication-auto-pgdata',
     [string]$ScalaBranch = 'main',
@@ -61,56 +70,88 @@ function Run([scriptblock]$Command) {
 }
 # save json without a bom
 function Save-Json($Path, $Value) {
-    [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 8), $Utf8)
+    $json = $Value | ConvertTo-Json -Depth 8
+    if ([IO.File]::Exists($Path) -and [IO.File]::ReadAllText($Path) -ceq $json) { return }
+    $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temp, $json, $Utf8)
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temp, $Path, [NullString]::Value) }
+        else { [IO.File]::Move($temp, $Path) }
+    } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
 }
 
 # Discover once, then reuse verified executables. A failed search is never absence.
 function Initialize-ToolDiscovery {
     $script:ToolInventory = $null
-    $script:ToolSearchErrors = New-Object 'System.Collections.Generic.List[string]'
+    $script:RejectedJava = @{}
+    $script:PortableEvidence = @{}
+    $script:ToolSearchErrors = @{}
+    $script:ToolVendorLoaded = @{}
+    $script:UninstallRecordsLoaded = $false
     $script:ToolRecords = @{}
     $script:ToolRoots = New-Object 'System.Collections.Generic.List[string]'
     $script:ToolDefinitions = @{
         Java = @{ executable = 'java.exe'; hint = 'JAVA_HOME'; relative = 'bin\java.exe'; registry = 'Java|JDK|OpenJDK|Temurin|Corretto|Zulu'; package = 'Microsoft.OpenJDK.21' }
         Node = @{ executable = 'node.exe'; hint = 'NODE_HOME'; relative = 'node.exe'; registry = 'Node[.]?js|Node.js'; package = 'OpenJS.NodeJS.LTS' }
+        Sbt = @{ executable = 'sbt.bat'; registry = '^sbt(?: |$)|Scala Build Tool' }
         Git = @{ executable = 'git.exe'; hint = 'GIT_HOME'; relative = 'cmd\git.exe'; registry = '^Git( |$)|Git for Windows'; package = 'Git.Git' }
         PostgreSQL = @{ executable = 'psql.exe'; hint = 'PGHOME'; relative = 'bin\psql.exe'; registry = 'PostgreSQL'; package = 'PostgreSQL.PostgreSQL.18' }
         Code = @{ executable = 'code.cmd'; hint = 'VSCODE_HOME'; relative = 'bin\code.cmd'; registry = 'Visual Studio Code'; package = 'Microsoft.VisualStudioCode' }
         Docker = @{ executable = 'docker.exe'; hint = 'DOCKER_HOME'; relative = 'resources\bin\docker.exe'; registry = 'Docker Desktop'; package = 'Docker.DockerDesktop' }
     }
     if ($UseDocker) {
-        foreach ($name in @('Java', 'Node', 'Git', 'PostgreSQL')) { $script:ToolDefinitions.Remove($name) }
+        foreach ($name in @('Java', 'Node', 'Git', 'PostgreSQL','Sbt')) { $script:ToolDefinitions.Remove($name) }
     } else { $script:ToolDefinitions.Remove('Docker') }
     if ($NoEditor) { $script:ToolDefinitions.Remove('Code') }
     foreach ($name in $script:ToolDefinitions.Keys) {
+        $script:ToolSearchErrors[$name] = New-Object 'System.Collections.Generic.List[string]'
         $script:ToolRecords[$name] = New-Object 'System.Collections.Generic.List[object]'
     }
-    # Do not use Win32_Product: it can trigger MSI repair operations.
-    foreach ($registryRoot in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')) {
-        try {
-            if (-not (Test-Path -LiteralPath $registryRoot -ErrorAction Stop)) { continue }
-            foreach ($key in Get-ChildItem -LiteralPath $registryRoot -ErrorAction Stop) {
-                $record = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
-                foreach ($name in $script:ToolDefinitions.Keys) {
-                    if ([string]$record.DisplayName -match $script:ToolDefinitions[$name].registry) {
-                        $script:ToolRecords[$name].Add(@{ description = [string]$record.DisplayName; location = [string]$record.InstallLocation })
+    $script:ToolSearchErrors['Shared'] = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($directory in @($AdditionalSearchPath) + @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432,
+            "$env:LOCALAPPDATA\Programs", "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
+            "$env:LOCALAPPDATA\nvm", "$env:APPDATA\nvm", "$env:LOCALAPPDATA\fnm_multishells",
+            "$env:APPDATA\fnm", "$env:LOCALAPPDATA\Volta\tools", "$env:USERPROFILE\.jdks",
+            "$env:USERPROFILE\scoop\apps", "$env:USERPROFILE\.sdkman\candidates",
+            "$env:ProgramData\scoop\apps", "$env:ProgramData\chocolatey\lib", $env:ChocolateyInstall,
+            $env:SCOOP, $env:SCOOP_GLOBAL, $env:NVM_HOME, $env:NVM_SYMLINK, $env:FNM_DIR, $env:VOLTA_HOME,
+            $env:JDK_HOME, $env:SBT_HOME)) {
+        if ($directory -and -not $script:ToolRoots.Contains($directory)) { $script:ToolRoots.Add($directory) }
+    }
+}
+function Read-ToolRegistrations([string]$Name) {
+    if ($script:ToolVendorLoaded[$Name]) { return }
+    $script:ToolVendorLoaded[$Name] = $true
+    if (-not $script:UninstallRecordsLoaded) {
+        $script:UninstallRecordsLoaded = $true
+        # Do not use Win32_Product: it can trigger MSI repair operations.
+        foreach ($registryRoot in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')) {
+            try {
+                if (-not (Test-Path -LiteralPath $registryRoot -ErrorAction Stop)) { continue }
+                foreach ($key in Get-ChildItem -LiteralPath $registryRoot -ErrorAction Stop) {
+                    $record = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+                    foreach ($kind in $script:ToolDefinitions.Keys) {
+                        if ([string]$record.DisplayName -match $script:ToolDefinitions[$kind].registry) {
+                            $script:ToolRecords[$kind].Add(@{ description = [string]$record.DisplayName; location = [string]$record.InstallLocation })
+                        }
                     }
                 }
-            }
-        } catch { $script:ToolSearchErrors.Add("Registry discovery failed at ${registryRoot}: $($_.Exception.Message)") }
+            } catch { $script:ToolSearchErrors.Shared.Add("Registry discovery failed at ${registryRoot}: $($_.Exception.Message)") }
+        }
     }
-    # Vendor records include installations not represented by uninstall entries.
-    if (-not $UseDocker) {
-    foreach ($vendorRoot in @('HKLM:\SOFTWARE\JavaSoft\JDK', 'HKLM:\SOFTWARE\JavaSoft\Java Development Kit', 'HKLM:\SOFTWARE\Eclipse Adoptium\JDK', 'HKLM:\SOFTWARE\Microsoft\JDK')) {
-        try {
-            if (-not (Test-Path -LiteralPath $vendorRoot -ErrorAction Stop)) { continue }
-            foreach ($key in @(Get-Item -LiteralPath $vendorRoot) + @(Get-ChildItem -LiteralPath $vendorRoot -Recurse -ErrorAction Stop)) {
-                $record = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
-                foreach ($property in @('JavaHome', 'Path', 'InstallationPath')) {
-                    if ($record.$property) { $script:ToolRecords.Java.Add(@{ description = "Java vendor registry: $($key.Name)"; location = [string]$record.$property }) }
+    # Query only the relevant vendor or service if PATH and environment discovery failed.
+    if ($Name -eq 'Java') {
+        foreach ($vendorRoot in @('HKLM:\SOFTWARE\JavaSoft\JDK', 'HKLM:\SOFTWARE\JavaSoft\Java Development Kit', 'HKLM:\SOFTWARE\Eclipse Adoptium\JDK', 'HKLM:\SOFTWARE\Microsoft\JDK', 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft', 'HKCU:\SOFTWARE\JavaSoft')) {
+            try {
+                if (-not (Test-Path -LiteralPath $vendorRoot -ErrorAction Stop)) { continue }
+                foreach ($key in @(Get-Item -LiteralPath $vendorRoot) + @(Get-ChildItem -LiteralPath $vendorRoot -Recurse -ErrorAction Stop)) {
+                    $record = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+                    foreach ($property in @('JavaHome', 'Path', 'InstallationPath')) {
+                        if ($record.$property) { $script:ToolRecords.Java.Add(@{ description = "Java vendor registry: $($key.Name)"; location = [string]$record.$property }) }
+                    }
                 }
-            }
-        } catch { $script:ToolSearchErrors.Add("Java registry discovery failed at ${vendorRoot}: $($_.Exception.Message)") }
+            } catch { $script:ToolSearchErrors.Java.Add("Java registry discovery failed at ${vendorRoot}: $($_.Exception.Message)") }
+        }
     }
     foreach ($vendor in @(
         @{ name = 'Node'; path = 'HKLM:\SOFTWARE\Node.js'; property = 'InstallPath' },
@@ -119,6 +160,7 @@ function Initialize-ToolDiscovery {
         @{ name = 'Git'; path = 'HKCU:\SOFTWARE\GitForWindows'; property = 'InstallPath' },
         @{ name = 'PostgreSQL'; path = 'HKLM:\SOFTWARE\PostgreSQL\Installations'; property = 'Base Directory' }
     )) {
+        if ($Name -ne $vendor.name) { continue }
         try {
             if (-not (Test-Path -LiteralPath $vendor.path -ErrorAction Stop)) { continue }
             foreach ($key in @(Get-Item -LiteralPath $vendor.path) + @(Get-ChildItem -LiteralPath $vendor.path -ErrorAction Stop)) {
@@ -127,22 +169,82 @@ function Initialize-ToolDiscovery {
                     $script:ToolRecords[$vendor.name].Add(@{ description = "Vendor registry: $($key.Name)"; location = [string]$record.($vendor.property) })
                 }
             }
-        } catch { $script:ToolSearchErrors.Add("Vendor registry discovery failed at $($vendor.path): $($_.Exception.Message)") }
+        } catch { $script:ToolSearchErrors[$Name].Add("Vendor registry discovery failed at $($vendor.path): $($_.Exception.Message)") }
     }
+    if ($Name -eq 'PostgreSQL') { Read-PostgresServices }
+}
+function Read-PostgresServices {
+    if ($script:ToolVendorLoaded['Services']) { return }
+    $script:ToolVendorLoaded['Services'] = $true
     try {
         foreach ($service in @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -match 'postgres' -or $_.PathName -match '(?:pg_ctl|postgres)[.]exe' })) {
             $match = [regex]::Match([string]$service.PathName, '^\s*(?:"(?<exe>[^"]+)"|(?<exe>.*?\.exe))(?:\s|$)')
             $location = if ($match.Success) { Split-Path (Split-Path $match.Groups['exe'].Value -Parent) -Parent } else { '' }
-            $script:ToolRecords.PostgreSQL.Add(@{ description = "Windows service $($service.Name)"; location = $location })
+            $script:ToolRecords.PostgreSQL.Add(@{ description = "Windows service $($service.Name)"; location = $location; service = $service.Name })
         }
-    } catch { $script:ToolSearchErrors.Add("PostgreSQL service discovery failed: $($_.Exception.Message)") }
+    } catch { $script:ToolSearchErrors.PostgreSQL.Add("PostgreSQL service discovery failed: $($_.Exception.Message)") }
+}
+function Get-PostgresServiceCandidates([string]$PsqlPath) {
+    Read-PostgresServices
+    $installation = Split-Path (Split-Path $PsqlPath -Parent) -Parent
+    foreach ($record in $script:ToolRecords.PostgreSQL) {
+        if ($record.service -and $record.location -and ([IO.Path]::GetFullPath($record.location) -eq [IO.Path]::GetFullPath($installation))) { $record.service }
     }
-    foreach ($directory in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432) + @($AdditionalSearchPath)) {
-        if ($directory -and -not $script:ToolRoots.Contains($directory)) { $script:ToolRoots.Add($directory) }
+}
+function Show-FixedDriveToolLocations {
+    # This opt-in inventory prints paths only. A portable program on an arbitrary
+    # drive must be explicitly selected before the bootstrap runs any of its code.
+    $drives = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })
+    $names = @('java.exe','javac.exe','node.exe','npm.cmd','sbt.bat','sbt.cmd','sbt.exe',
+               'scala.exe','scala.bat','scala.cmd','scalac.bat','langium.cmd','psql.exe','pg_isready.exe','postgres.exe')
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    foreach ($drive in $drives) { $pending.Push($drive.RootDirectory.FullName) }
+    $unreadable = 0
+    $links = 0
+    while ($pending.Count) {
+        $directory = $pending.Pop()
+        try {
+            foreach ($item in Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) {
+                if ($item.PSIsContainer) {
+                    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $links++; continue }
+                    $pending.Push($item.FullName)
+                } elseif (($item.Name -in $names) -or $item.Name -like 'sbt-launch*.jar' -or
+                    ($item.Name -eq 'package.json' -and $item.Directory.Name -in @('langium','langium-cli'))) {
+                    Write-Output $item.FullName
+                }
+            }
+        } catch { $unreadable++; Write-Verbose "Skipped $directory ($($_.Exception.Message))" }
     }
-    # User installations and version managers; never recursively search all of HOME.
-    foreach ($directory in @("$env:LOCALAPPDATA\Programs", "$env:LOCALAPPDATA\Microsoft\WinGet\Packages", "$env:LOCALAPPDATA\nvm", "$env:APPDATA\nvm", "$env:USERPROFILE\.jdks", "$env:USERPROFILE\scoop\apps", $env:NVM_HOME, $env:JDK_HOME)) {
-        if ($directory -and (Test-Path -LiteralPath $directory)) { $script:ToolRoots.Add($directory) }
+    Write-Host "Inventory finished. Unreadable directories: $unreadable. Skipped directory links: $links."
+    Write-Host 'Select trusted paths with -JavaPath, -NodePath, -NpmPath, -PsqlPath, -SbtLauncherPath or -AdditionalSearchPath on the next run.'
+}
+
+function Get-RegisteredToolPackageRoots {
+    # WindowsApps is an ACL-protected package store, not a directory of
+    # conventional installers. Windows publishes the current user's packages
+    # and launches their commands through %LOCALAPPDATA%\Microsoft\WindowsApps.
+    try { $packages = @(Get-AppxPackage -ErrorAction Stop) }
+    catch {
+        # The Appx module may require Windows PowerShell even when setup runs on 7.
+        $windowsShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path -LiteralPath $windowsShell -PathType Leaf)) { throw }
+        $listing = & $windowsShell -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; @(Get-AppxPackage | Select-Object Name,InstallLocation) | ConvertTo-Json -Compress' 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot read Windows package registrations for the current user.' }
+        if ($listing) { $packages = @(($listing -join ' ') | ConvertFrom-Json) } else { $packages = @() }
+    }
+    foreach ($package in $packages) {
+        if ($package.InstallLocation -and $package.Name -match 'jdk|java|temurin|adoptium|corretto|zulu|nodejs|postgres|scala|langium|(?:^|[.])sbt|docker|visualstudiocode|gitforwindows') {
+            $package.InstallLocation
+        }
+    }
+}
+function Get-FixedDrivePortableRoots {
+    if ($env:OS -ne 'Windows_NT') { return }
+    # A drive-root tools folder may be writable by other users. Its contents
+    # count as installation evidence, but only an explicit selection may run them.
+    foreach ($drive in [IO.DriveInfo]::GetDrives()) {
+        if ($drive.DriveType -ne 'Fixed' -or -not $drive.IsReady) { continue }
+        foreach ($relative in @('Tools','DevTools','scoop\apps')) { Join-Path $drive.RootDirectory.FullName $relative }
     }
 }
 function Get-ToolInventory {
@@ -151,30 +253,72 @@ function Get-ToolInventory {
     foreach ($name in $script:ToolDefinitions.Keys) { $inventory[$name] = New-Object 'System.Collections.Generic.List[string]' }
     $names = @{}
     foreach ($name in $script:ToolDefinitions.Keys) { $names[$script:ToolDefinitions[$name].executable] = $name }
+    $inventory['Npm'] = New-Object 'System.Collections.Generic.List[string]'
+    $inventory['Sbt'] = New-Object 'System.Collections.Generic.List[string]'
+    $inventory['Scala'] = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($alias in @('scala.exe','scalac.exe','scala.bat','scala.cmd','scalac.bat','scalac.cmd')) { $names[$alias] = 'Scala' }
+    $inventory['Readiness'] = New-Object 'System.Collections.Generic.List[string]'
+    $names['pg_isready.exe'] = 'Readiness'
+    $names['npm.cmd'] = 'Npm'
+    $names['sbt-launch.jar'] = 'Sbt'
+    $names['sbt.bat'] = 'Sbt'
+    $names['sbt.cmd'] = 'Sbt'
     $seen = @{}
-    $pending = New-Object 'System.Collections.Generic.Stack[string]'
-    foreach ($directory in $script:ToolRoots) { $pending.Push($directory) }
+    $appStores = @($env:ProgramFiles,${env:ProgramFiles(x86)},$env:ProgramW6432) | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'WindowsApps' }
+    $pending = New-Object 'System.Collections.Generic.Stack[object]'
+    foreach ($kind in $inventory.Keys) { $script:PortableEvidence[$kind] = New-Object 'System.Collections.Generic.List[string]' }
+    foreach ($portable in @(Get-FixedDrivePortableRoots)) { $pending.Push(@{ Path=$portable; SelectFirst=$true }) }
+    # LIFO: known installation locations and explicitly supplied roots take priority.
+    foreach ($directory in $script:ToolRoots) { $pending.Push(@{ Path=$directory; SelectFirst=$false }) }
     while ($pending.Count -gt 0) {
-        $directory = $pending.Pop()
+        $current = $pending.Pop()
+        $directory = $current.Path
         if ($seen.ContainsKey($directory)) { continue }
         $seen[$directory] = $true
         try {
+            if ($directory -in $appStores -and $directory -notin $AdditionalSearchPath) {
+                foreach ($registered in @(Get-RegisteredToolPackageRoots)) { $pending.Push(@{ Path=$registered; SelectFirst=$false }) }
+                continue
+            }
             if (-not (Test-Path -LiteralPath $directory -ErrorAction Stop)) {
                 # Additional search roots are explicit evidence requirements.
                 if ($directory -in $AdditionalSearchPath) { throw 'Configured search directory does not exist.' }
                 continue
             }
             $item = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
-            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if (-not $item.PSIsContainer) { throw 'Search root is not a directory.' }
+            # Enumerate a selected root (including a version-manager junction) once.
+            # Never follow nested directory links, which may loop or cross volumes.
             foreach ($child in Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) {
-                if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
-                if ($child.PSIsContainer) { $pending.Push($child.FullName) }
-                elseif ($names.ContainsKey($child.Name)) { $inventory[$names[$child.Name]].Add($child.FullName) }
+                if ($child.PSIsContainer -and ($child.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    foreach ($configured in $AdditionalSearchPath) {
+                        $boundary = [IO.Path]::GetFullPath($configured).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+                        if ($child.FullName.StartsWith($boundary, [StringComparison]::OrdinalIgnoreCase)) {
+                            $script:ToolSearchErrors.Shared.Add("Skipped nested link $($child.FullName). Select its target or an executable explicitly.")
+                            break
+                        }
+                    }
+                    continue
+                }
+                if ($child.PSIsContainer) { $pending.Push(@{ Path=$child.FullName; SelectFirst=$current.SelectFirst }); continue }
+                $kind = $names[$child.Name]
+                if ($child.Name -like 'sbt-launch-*.jar') { $kind = 'Sbt' }
+                if ($child.Name -like 'scala3-compiler_3-*.jar') { $kind = 'Scala' }
+                if ($kind) {
+                    if ($current.SelectFirst) { $script:PortableEvidence[$kind].Add($child.FullName) }
+                    else { $inventory[$kind].Add($child.FullName) }
+                }
             }
-        } catch { $script:ToolSearchErrors.Add("Cannot inspect ${directory}: $($_.Exception.Message)") }
+        } catch { $script:ToolSearchErrors.Shared.Add("Cannot inspect ${directory}: $($_.Exception.Message)") }
     }
     $script:ToolInventory = $inventory
     return $inventory
+}
+function Get-PortableToolMessage([string]$Name) {
+    if ($script:PortableEvidence[$Name].Count) {
+        $examples = @($script:PortableEvidence[$Name] | Select-Object -First 3) -join ', '
+        return "Possible $Name installation: $examples. Select a trusted executable or specify its directory with -AdditionalSearchPath."
+    }
 }
 function Invoke-ToolVersion([string]$Executable, [string[]]$Arguments) {
     # Java writes its version to stderr, including on success. PS 5.1 must not
@@ -189,7 +333,7 @@ function Invoke-ToolVersion([string]$Executable, [string[]]$Arguments) {
 function Test-ToolCandidate([string]$Name, [string]$Executable) {
     $result = @{ state = 'incompatible'; name = $Name; path = $Executable; reason = ''; version = $null }
     if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { $result.reason = 'Executable is missing or inaccessible.'; return $result }
-    $arguments = if ($Name -eq 'Java') { @('-version') } else { @('--version') }
+    $arguments = if ($Name -eq 'Java') { @('-XshowSettings:properties', '-version') } else { @('--version') }
     $probe = Invoke-ToolVersion $Executable $arguments
     if (-not $probe.ok) { $result.reason = "Version command failed: $($probe.text)"; return $result }
     $versionPattern = if ($Name -eq 'Java') { '(?:openjdk|java)\s+version\s+"(?<major>\d+)(?:\.(?<minor>\d+))?(?:\.(?<patch>\d+))?' } else { '(?<![\d.])v?(?<major>\d+)\.(?<minor>\d+)(?:\.(?<patch>\d+))?' }
@@ -201,59 +345,119 @@ function Test-ToolCandidate([string]$Name, [string]$Executable) {
     $result.version = $version
     switch ($Name) {
         Java {
-            if ($version.Major -ne 21) { $result.reason = 'Java 21 is required.'; return $result }
-            # PATH can point at an Oracle javapath shim, not the runtime's bin
-            # directory. Ask the selected executable which installation it uses.
-            $settings = Invoke-ToolVersion $Executable @('-XshowSettings:properties', '-version')
-            $homeMatch = [regex]::Match($settings.text, '(?m)^\s*java[.]home\s*=\s*([^\r\n]+)\s*$')
-            if (-not $settings.ok -or -not $homeMatch.Success) {
-                $result.reason = 'The selected Java cannot report java.home; repair or select a complete installation.'; return $result
-            }
+            if ($version.Major -lt 11) { $result.reason = 'The project uses Java 11 Files.readString/writeString APIs.'; $result.canUpgrade = $true; return $result }
+            # This probe reports version and the real JDK home, including for javapath shims.
+            $homeMatch = [regex]::Match($probe.text, '(?m)^\s*java[.]home\s*=\s*([^\r\n]+)$')
+            if (-not $homeMatch.Success) { $result.reason = 'Java did not report java.home.'; return $result }
             $runtimeHome = $homeMatch.Groups[1].Value.Trim()
             if (-not [IO.Path]::IsPathRooted($runtimeHome) -or $runtimeHome -match '[\x00\r\n]') {
-                $result.reason = 'The selected Java reported an invalid java.home.'; return $result
+                $result.reason = 'Java reported an invalid java.home.'; return $result
             }
             $canonicalJava = Join-Path ([IO.Path]::GetFullPath($runtimeHome)) 'bin\java.exe'
             if (-not (Test-Path -LiteralPath $canonicalJava -PathType Leaf)) {
-                $result.reason = "Java reports '$runtimeHome', but its bin\java.exe is missing or inaccessible."; return $result
+                $result.reason = "Java reports '$runtimeHome', but bin\java.exe is inaccessible."; return $result
             }
-            $canonicalProbe = Invoke-ToolVersion $canonicalJava @('-version')
-            $canonicalMatch = [regex]::Match($canonicalProbe.text, $versionPattern)
-            if (-not $canonicalProbe.ok -or -not $canonicalMatch.Success -or $canonicalMatch.Groups['major'].Value -ne '21') {
-                $result.reason = 'The executable under the reported java.home is not a runnable Java 21 installation.'; return $result
+            if ([IO.Path]::GetFullPath($Executable) -ne [IO.Path]::GetFullPath($canonicalJava)) {
+                $actual = Invoke-ToolVersion $canonicalJava @('-version')
+                $actualVersion = [regex]::Match($actual.text, $versionPattern)
+                if (-not $actual.ok -or -not $actualVersion.Success -or [int]$actualVersion.Groups['major'].Value -ne $version.Major) {
+                    $result.reason = 'The reported Java home does not run the selected Java major version.'; return $result
+                }
             }
-            $result.discoveredPath = $Executable
             $result.path = $canonicalJava
+            if ($script:RejectedJava.ContainsKey($canonicalJava)) {
+                $result.canUpgrade = $true; $result.reason = 'This Java failed the pinned Scala build compatibility probe.'; return $result
+            }
             $result.javaHome = [IO.Path]::GetFullPath($runtimeHome)
-            $canonicalMinor = if ($canonicalMatch.Groups['minor'].Success) { $canonicalMatch.Groups['minor'].Value } else { '0' }
-            $canonicalPatch = if ($canonicalMatch.Groups['patch'].Success) { $canonicalMatch.Groups['patch'].Value } else { '0' }
-            $result.version = [version]("21.{0}.{1}" -f $canonicalMinor, $canonicalPatch)
+            $result.probeBuild = $version.Major -notin @(11,17,21)
         }
         Node {
-            if ($version -lt [version]'22.12.0') { $result.reason = 'Node >=22.12 is required.'; return $result }
-            $npm = Join-Path (Split-Path $Executable -Parent) 'npm.cmd'
-            if (-not (Test-Path -LiteralPath $npm -PathType Leaf)) { $result.reason = 'The Node installation is incomplete: npm.cmd is missing.'; return $result }
-            $previousPath = $env:PATH
-            try { $env:PATH = (Split-Path $Executable -Parent) + ';' + $previousPath; $npmProbe = Invoke-ToolVersion $npm @('--version') }
-            finally { $env:PATH = $previousPath }
-            $npmMatch = [regex]::Match($npmProbe.text, '(?m)^\s*(\d+\.\d+\.\d+)\s*$')
-            if (-not $npmProbe.ok -or -not $npmMatch.Success -or [version]$npmMatch.Groups[1].Value -lt [version]'10.2.3') {
-                $result.reason = 'The installed npm must be runnable and >=10.2.3; explicit repair is required.'; return $result
+            if ($version -lt [version]'22.12.0' -or $version.Major -eq 23) { $result.reason = 'The project lock requires Node 22.12+ on 22.x, or >=24.'; $result.canUpgrade = $true; return $result }
+            $npm = Find-NpmForNode $Executable
+            if (-not $npm.path) {
+                $result.reason = $npm.reason
+                if ($npm.recoverable) { $result.state = 'npm-recovery'; $result.oldNpm = $npm.oldNpm }
+                return $result
             }
-            $result.npm = $npm; $result.npmVersion = $npmMatch.Groups[1].Value
+            $result.npm = $npm.path
+            $result.npmVersion = $npm.version
         }
-        Git { if ($version -lt [version]'2.23.0') { $result.reason = 'Git >=2.23 is required for restore and branch --show-current.'; return $result } }
+        Git { if ($version -lt [version]'2.23.0') { $result.canUpgrade = $true; $result.reason = 'Git >=2.23 is required for restore and branch --show-current.'; return $result } }
         PostgreSQL {
-            if ($version.Major -lt 16) { $result.reason = 'PostgreSQL client >=16 is required.'; return $result }
+            if ($version.Major -lt 15) { $result.canUpgrade = $true; $result.reason = 'PostgreSQL client >=15 is required.'; return $result }
             $ready = Join-Path (Split-Path $Executable -Parent) 'pg_isready.exe'
-            if (-not (Test-Path -LiteralPath $ready -PathType Leaf)) { $result.reason = 'The PostgreSQL tools are incomplete: pg_isready.exe is missing.'; return $result }
-            $readyProbe = Invoke-ToolVersion $ready @('--version')
-            if (-not $readyProbe.ok -or $readyProbe.text -notmatch ('\b' + $version.Major + '\.')) { $result.reason = 'pg_isready must be runnable and match the selected psql major version.'; return $result }
+            $choices = @($ready) + @(Get-PathToolCandidates 'pg_isready.exe')
+            $checked = @{}
+            foreach ($phase in @('quick','inventory')) {
+                if ($phase -eq 'inventory') { $choices = (Get-ToolInventory).Readiness }
+                foreach ($candidate in $choices) {
+                    if ($checked[$candidate] -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+                    $checked[$candidate] = $true
+                    $probe = Invoke-ToolVersion $candidate @('--version')
+                    if ($probe.ok -and $probe.text -match '\b(\d+)\.' -and [int]$Matches[1] -ge 15) { $result.ready = $candidate; break }
+                }
+                if ($result.ready) { break }
+            }
+            if (-not $result.ready) { $result.reason = 'No runnable pg_isready >=15 was found for this psql client.'; return $result }
         }
-        Docker { if ($version.Major -lt 20) { $result.reason = 'Docker CLI >=20 is required.'; return $result } }
+        Docker { if ($version.Major -lt 20) { $result.canUpgrade = $true; $result.reason = 'Docker CLI >=20 is required.'; return $result } }
     }
     $result.state = 'compatible'
     return $result
+}
+function Find-NpmForNode([string]$NodeExecutable) {
+    $bin = Split-Path $NodeExecutable -Parent
+    $candidates = @()
+    if ($NpmPath) { $candidates = @([IO.Path]::GetFullPath($NpmPath)) }
+    else {
+        $candidates = @((Join-Path $bin 'npm.cmd')) + @(Get-PathToolCandidates 'npm.cmd')
+        if ($Tools) { $candidates += Join-Path $Tools 'npm-10.9.4\npm.cmd' }
+        foreach ($prefix in @($env:NPM_CONFIG_PREFIX, "$env:APPDATA\npm", $env:NVM_SYMLINK)) {
+            if ($prefix) { $candidates += Join-Path $prefix 'npm.cmd' }
+        }
+    }
+    $previous = $env:PATH
+    $tested = @{}
+    $oldNpm = $false
+    $failedProbe = $false
+    try {
+        $env:PATH = Add-UniqueToolPath @($bin) $previous
+        foreach ($phase in @('quick', 'inventory')) {
+            if ($phase -eq 'inventory') {
+                if ($NpmPath) { break }
+                $candidates = (Get-ToolInventory).Npm
+            }
+            foreach ($candidate in $candidates) {
+                if ($tested.ContainsKey($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+                $tested[$candidate] = $true
+                # npm.cmd prefers node.exe beside itself. A launcher belonging to
+                # another Node must never silently run npm with the wrong runtime.
+                $localNode = Join-Path (Split-Path $candidate -Parent) 'node.exe'
+                if ((Test-Path -LiteralPath $localNode -PathType Leaf) -and
+                    [IO.Path]::GetFullPath($localNode) -ne [IO.Path]::GetFullPath($NodeExecutable)) { continue }
+                $probe = Invoke-ToolVersion $candidate @('--version')
+                $v = [regex]::Match($probe.text, '(?m)^\s*(\d+\.\d+\.\d+)\s*$')
+                if ($probe.ok -and $v.Success) {
+                    if ([version]$v.Groups[1].Value -ge [version]'10.2.3') { return @{ path=$candidate; version=$v.Groups[1].Value } }
+                    $oldNpm = $true
+                } else { $failedProbe = $true }
+            }
+        }
+    } finally { $env:PATH = $previous }
+    return @{ reason="No runnable npm >=10.2.3 for $NodeExecutable. Select an existing npm.cmd with -NpmPath."; recoverable=($oldNpm -or (-not $NpmPath -and -not $failedProbe)); oldNpm=$oldNpm }
+}
+function Get-PathToolCandidates([string]$Executable) {
+    @(Get-Command $Executable -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+    if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA ("Microsoft\WindowsApps\" + $Executable) }
+    # This shell may predate an installation that already updated user/machine PATH.
+    foreach ($scope in @('User','Machine')) {
+        foreach ($entry in ([Environment]::GetEnvironmentVariable('Path',$scope) -split ';')) {
+            if ($entry) {
+                $directory = [Environment]::ExpandEnvironmentVariables($entry.Trim('"'))
+                if ([IO.Path]::IsPathRooted($directory)) { Join-Path $directory $Executable }
+            }
+        }
+    }
 }
 function Find-SystemTool([string]$Name, [string]$ExplicitPath) {
     $definition = $script:ToolDefinitions[$Name]
@@ -264,12 +468,35 @@ function Find-SystemTool([string]$Name, [string]$ExplicitPath) {
     }
     $candidates = New-Object 'System.Collections.Generic.List[string]'
     $evidence = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($command in @(Get-Command $definition.executable -CommandType Application -All -ErrorAction SilentlyContinue)) { $candidates.Add($command.Source) }
-    $hint = [Environment]::GetEnvironmentVariable($definition.hint, 'Process')
-    if ($hint) {
-        $candidates.Add((Join-Path $hint $definition.relative))
-        if (Test-Path -LiteralPath $hint) { $evidence.Add("$($definition.hint)=$hint") }
+    foreach ($candidate in @(Get-PathToolCandidates $definition.executable)) { $candidates.Add($candidate) }
+    foreach ($scope in @('Process','User','Machine')) {
+        $hint = [Environment]::GetEnvironmentVariable($definition.hint, $scope)
+        if ($hint) {
+            $candidates.Add((Join-Path $hint $definition.relative))
+            if (Test-Path -LiteralPath $hint) { $evidence.Add("$($definition.hint)=$hint") }
+        }
     }
+    $search = @{ Tested=@{}; Failures=(New-Object 'System.Collections.Generic.List[string]'); CanUpgrade=$false; Provisional=$null; NpmRecovery=$null }
+    function Select-ToolCandidate($Paths) {
+        foreach ($candidate in $Paths) {
+            if ($search.Tested.ContainsKey($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            $search.Tested[$candidate] = $true
+            $result = Test-ToolCandidate $Name $candidate
+            if ($result.state -eq 'compatible') {
+                if (-not $result.probeBuild) { return $result }
+                if (-not $search.Provisional) { $search.Provisional = $result }
+            } elseif ($result.state -eq 'npm-recovery') {
+                if (-not $search.NpmRecovery) { $search.NpmRecovery = $result }
+            } else {
+                if ($result.canUpgrade) { $search.CanUpgrade = $true }
+                $search.Failures.Add("${candidate}: $($result.reason) (version $($result.version))")
+            }
+        }
+    }
+    $choice = Select-ToolCandidate $candidates
+    if ($choice) { return $choice }
+    $candidates.Clear()
+    Read-ToolRegistrations $Name
     foreach ($record in $script:ToolRecords[$Name]) {
         $evidence.Add($record.description)
         if ($record.location) {
@@ -306,45 +533,103 @@ function Find-SystemTool([string]$Name, [string]$ExplicitPath) {
                 foreach ($item in @(Get-Item -Path (Join-Path $directory $relative) -ErrorAction SilentlyContinue)) {
                     if (-not $item.PSIsContainer) { $candidates.Add($item.FullName) }
                 }
-            } catch { $script:ToolSearchErrors.Add("Cannot inspect vendor path under ${directory}: $($_.Exception.Message)") }
+            } catch { $script:ToolSearchErrors[$Name].Add("Cannot inspect vendor path under ${directory}: $($_.Exception.Message)") }
         }
     }
-    $tested = @{}; $failures = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($candidate in $candidates) {
-        if ($tested.ContainsKey($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
-        $tested[$candidate] = $true
-        $result = Test-ToolCandidate $Name $candidate
-        if ($result.state -eq 'compatible') { return $result }
-        $failures.Add("${candidate}: $($result.reason) (version $($result.version))")
+    $choice = Select-ToolCandidate $candidates
+    if ($choice) { return $choice }
+    $choice = Select-ToolCandidate ((Get-ToolInventory)[$Name])
+    if ($choice) { return $choice }
+    if ($search.Provisional) { return $search.Provisional }
+    $errors = @($script:ToolSearchErrors.Shared.ToArray()) + @($script:ToolSearchErrors[$Name].ToArray())
+    if ($errors.Count -gt 0) { return @{ state = 'inconclusive'; name = $Name; reason = ($errors -join '; ') } }
+    $portable = Get-PortableToolMessage $Name
+    if ($portable) { return @{ state='inconclusive'; name=$Name; reason=$portable } }
+    if ($search.NpmRecovery) { return $search.NpmRecovery }
+    if ($search.Failures.Count -gt 0 -or $evidence.Count -gt 0) {
+        return @{ state = 'incompatible'; name = $Name; canUpgrade = $search.CanUpgrade; reason = ((@($search.Failures.ToArray()) + @($evidence.ToArray())) -join '; ') }
     }
-    $inventory = Get-ToolInventory
-    foreach ($candidate in $inventory[$Name]) {
-        if ($tested.ContainsKey($candidate)) { continue }
-        $tested[$candidate] = $true
-        $result = Test-ToolCandidate $Name $candidate
-        if ($result.state -eq 'compatible') { return $result }
-        $failures.Add("${candidate}: $($result.reason) (version $($result.version))")
-    }
-    if ($failures.Count -gt 0 -or $evidence.Count -gt 0) {
-        return @{ state = 'incompatible'; name = $Name; reason = (@($failures) + @($evidence) -join '; ') }
-    }
-    if ($script:ToolSearchErrors.Count -gt 0) { return @{ state = 'inconclusive'; name = $Name; reason = ($script:ToolSearchErrors -join '; ') } }
     return @{ state = 'missing'; name = $Name; reason = 'No installation found after complete discovery.' }
+}
+function Test-BootstrapInteractive {
+    return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and
+        -not (@([Environment]::GetCommandLineArgs()) -match '^(?:-|/)(?:noni|noninteractive)$'))
+}
+function Confirm-ToolUpgrade([string]$Component, [string]$Detail) {
+    Write-Host "$Component requires a change. $Detail"
+    if ($AllowToolUpgrade) { return $true }
+    if (-not (Test-BootstrapInteractive)) { return $false }
+    try { $reply = Read-Host 'Proceed with this change? [y/N]' }
+    catch { return $false }
+    return (([string]$reply).Trim() -match '^(y|yes|d|da)$')
+}
+function Repair-NodeNpm($Node) {
+    $portable = Get-PortableToolMessage 'Npm'
+    if ($portable) { throw $portable }
+    if ($script:ToolSearchErrors.Shared.Count) { throw "npm discovery incomplete: $($script:ToolSearchErrors.Shared -join '; ')" }
+    if ($Node.oldNpm -and -not (Confirm-ToolUpgrade 'npm' "Keep Node $($Node.version) and add npm 10.9.4 under $Tools.")) { throw 'npm upgrade declined.' }
+    $target = Join-Path $Tools 'npm-10.9.4'
+    $command = Join-Path $target 'npm.cmd'
+    if (Test-Path -LiteralPath $target) { throw "Existing managed npm installation is incomplete. Inspect $target before retrying." }
+    $tar = Get-Command tar.exe -CommandType Application -ErrorAction Stop
+    New-Item -ItemType Directory -Path $Tools -Force | Out-Null
+    $archive = Join-Path $Tools 'npm-10.9.4.tgz'
+    Get-VerifiedDownload -Uri 'https://registry.npmjs.org/npm/-/npm-10.9.4.tgz' -Path $archive -Sha256 '4bfba8a0c823024d1926ec9d97a37a00eb60fd2adf44b3d34a686fc32e8f51e4'
+    $stage = Join-Path $Tools ("npm-stage-" + [guid]::NewGuid().ToString('N'))
+    try {
+        $modules = New-Item -Type Directory -Path (Join-Path $stage 'node_modules') -Force
+        Run { & $tar.Source -xzf $archive -C $modules.FullName } | Out-Host
+        Rename-Item -LiteralPath (Join-Path $modules.FullName 'package') -NewName 'npm'
+        # Keep the chosen Node first on PATH; use this verified npm rather than
+        # a different CLI from a user's global npm prefix.
+        [IO.File]::WriteAllText((Join-Path $stage 'npm.cmd'), "@echo off`r`nnode.exe `"%~dp0node_modules\npm\bin\npm-cli.js`" %*`r`n", [Text.Encoding]::ASCII)
+        $probe = Invoke-ToolVersion $Node.path @((Join-Path $stage 'node_modules\npm\bin\npm-cli.js'), '--version')
+        if (-not $probe.ok -or $probe.text.Trim() -ne '10.9.4') { throw 'The recovered npm failed its version check.' }
+        [IO.Directory]::Move($stage, $target)
+    } finally { if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force } }
+    $NpmPath = $command
+    $result = Test-ToolCandidate 'Node' $Node.path
+    if ($result.state -ne 'compatible') { throw "Managed npm failed under selected Node: $($result.reason)" }
+    return $result
 }
 function Resolve-SystemTool([string]$Name, [string]$ExplicitPath) {
     $result = Find-SystemTool $Name $ExplicitPath
-    if ($result.state -eq 'missing') {
-        $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue
-        if (-not $winget) { throw "$Name is not installed. WinGet is unavailable; install $($script:ToolDefinitions[$Name].package), then rerun." }
-        Write-Host "$Name is not installed. Installing only $($script:ToolDefinitions[$Name].package); WinGet may request elevation, configuration, or a reboot."
-        & $winget.Source install --id $script:ToolDefinitions[$Name].package --exact --source winget --no-upgrade --accept-source-agreements --accept-package-agreements
-        $installerExit = $LASTEXITCODE
-        if ($installerExit -ne 0) { throw "$Name installer returned $installerExit. Complete any required elevation/reboot/configuration and rerun; setup is not ready." }
-        Initialize-ToolDiscovery
-        $result = Find-SystemTool $Name $ExplicitPath
-        if ($result.state -ne 'compatible') { throw "$Name did not pass post-install discovery/version validation ($($result.state)): $($result.reason). Complete installer configuration and rerun." }
+    if ($ExplicitPath -and $result.state -eq 'incompatible' -and $result.canUpgrade) {
+        $alternative = Find-SystemTool $Name
+        if ($alternative.state -in @('compatible','npm-recovery')) {
+            Write-Host "$ExplicitPath is incompatible. Reusing an existing alternative: $($alternative.path)"
+            $result = $alternative
+        } elseif ($alternative.state -eq 'inconclusive') { $result = $alternative }
     }
-    if ($result.state -ne 'compatible') { throw "$Name discovery: $($result.state). $($result.reason) No installation or upgrade was attempted; repair/select the intended installation explicitly." }
+    if ($result.state -eq 'npm-recovery') { $result = Repair-NodeNpm $result }
+    if ($result.state -ne 'compatible') {
+        $package = $script:ToolDefinitions[$Name].package
+        $upgrade = $result.state -eq 'incompatible' -and $result.canUpgrade
+        if (-not $upgrade -and $result.state -ne 'missing') { throw "$Name discovery: $($result.state). $($result.reason) Repair or select an existing executable." }
+        if ($upgrade) {
+            $detail = "$($result.reason) WinGet will update $package or install it alongside a different distribution, then setup will select a verified executable."
+            if (-not (Confirm-ToolUpgrade $Name $detail)) { throw "$Name upgrade declined. Choose a compatible installation or rerun with -AllowToolUpgrade." }
+        }
+        $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue
+        if (-not $winget) { throw "WinGet is unavailable. Configure $Name manually and rerun." }
+        # install upgrades an existing matching package unless --no-upgrade is set.
+        $arguments = @('install','--id',$package,'--exact','--source','winget','--accept-source-agreements','--accept-package-agreements')
+        if (-not $upgrade) { $arguments += '--no-upgrade' }
+        Write-Host "Configuring $package via WinGet."
+        & $winget.Source @arguments | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "$Name installer returned $LASTEXITCODE. Complete any required elevation/reboot and rerun." }
+        $script:ToolInventory = $null
+        $script:ToolVendorLoaded.Remove($Name)
+        if ($Name -eq 'PostgreSQL') { $script:ToolVendorLoaded.Remove('Services') }
+        $script:UninstallRecordsLoaded = $false
+        $script:ToolSearchErrors[$Name].Clear()
+        $script:ToolSearchErrors.Shared.Clear()
+        $script:ToolRecords[$Name].Clear()
+        # The original path can still refer to the older, now side-by-side version.
+        $result = Find-SystemTool $Name
+        if ($result.state -eq 'npm-recovery') { $result = Repair-NodeNpm $result }
+        if ($result.state -ne 'compatible') { throw "$Name failed post-install validation ($($result.state)): $($result.reason)." }
+    }
     Write-Host "Reusing $Name $($result.version): $($result.path)"
     return $result
 }
@@ -365,16 +650,19 @@ function Use-ToolEnvironment([hashtable]$Tools) {
         $entries.Add($directory)
         switch ($name) {
             Java { $homes.JAVA_HOME = Split-Path $directory -Parent }
-            Node { $homes.NODE_HOME = $directory }
+            Node { $homes.NODE_HOME = $directory; $entries.Add((Split-Path $Tools.Node.npm -Parent)) }
             PostgreSQL { $homes.PGHOME = Split-Path $directory -Parent }
         }
     }
     foreach ($name in $homes.Keys) { [Environment]::SetEnvironmentVariable($name, $homes[$name], 'Process') }
     $env:PATH = Add-UniqueToolPath @($entries) $env:PATH
     if ($SessionOnlyEnvironment) { Write-Host 'Tool environment configured for this process and its children only.'; return }
-    foreach ($name in $homes.Keys) { [Environment]::SetEnvironmentVariable($name, $homes[$name], 'User') }
+    foreach ($name in $homes.Keys) {
+        if ([Environment]::GetEnvironmentVariable($name, 'User') -cne $homes[$name]) { [Environment]::SetEnvironmentVariable($name, $homes[$name], 'User') }
+    }
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    [Environment]::SetEnvironmentVariable('Path', (Add-UniqueToolPath @($entries) $userPath), 'User')
+    $updatedPath = Add-UniqueToolPath @($entries) $userPath
+    if ($updatedPath -cne $userPath) { [Environment]::SetEnvironmentVariable('Path', $updatedPath, 'User') }
     Write-Host 'Tool homes and PATH configured for this process and saved in the user environment. Use -SessionOnlyEnvironment to keep changes session-only. Database credentials are not persisted.'
 }
 function Assert-CodeEngine([string]$CodeExecutable, [string]$LangiumRoot) {
@@ -674,14 +962,57 @@ function Ensure-Docker {
     if ($type -ne 'linux') { throw 'Docker is not ready in Linux-container mode. Check Docker Desktop and rerun.' }
 }
 # The explicit Docker path owns a persistent Linux toolchain, not Windows tools.
-function Get-DockerObject([string]$Kind, [string]$Name) {
-    $names = switch ($Kind) {
-        'container' { @(Run { docker.exe container ls -a --format '{{.Names}}' }) }
-        'volume' { @(Run { docker.exe volume ls --format '{{.Name}}' }) }
-        default { throw "Unsupported Docker object type: $Kind" }
-    }
-    if ($Name -notin $names) { return $null }
+function Get-DockerObject([string]$Kind, [string]$Name, [string[]]$Names) {
+    if ($Name -cnotin $Names) { return $null }
     return @(Run { docker.exe $Kind inspect $Name } | ConvertFrom-Json)[0]
+}
+function Get-OtherPostgresEvidence($Containers) {
+    foreach ($item in $Containers) {
+        $official = $item.Image -match '(?:^|/)(?:postgres|postgis)(?:[:@/]|$)'
+        if (-not $official -and $item.Ports -match '->5432/tcp') {
+            $container = @(Run { docker.exe container inspect $item.Names } | ConvertFrom-Json)[0]
+            $official = @($container.Config.Env | Where-Object { $_ -cmatch '^(PGDATA|POSTGRES_DB|POSTGRES_USER)=' }).Count -gt 0
+        }
+        if ($official) { "Docker container '$($item.Names)' ($($item.Status), ports: $($item.Ports))" }
+    }
+    # A portable PostgreSQL server can run without a registered Windows service.
+    $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.PathName -match '(?i)(?:^|[\\/])(?:pg_ctl|postgres)\.exe(?:["\s]|$)' })
+    foreach ($service in $services) { "Windows service '$($service.Name)' ($($service.State))" }
+    if (-not $services.Count -and @(Get-Process -Name postgres -ErrorAction SilentlyContinue).Count) { 'Windows postgres.exe process' }
+}
+function Protect-BootstrapState([string]$Path) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    Run { icacls.exe $Path '/inheritance:r' '/grant:r' "${identity}:(OI)(CI)F" 'SYSTEM:(OI)(CI)F' } | Out-Null
+}
+function Save-DockerCredentials($Path, $Secrets) {
+    if (Test-Path -LiteralPath $Path) {
+        $saved = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        if ($saved.password -ceq $Secrets.password -and [int]$saved.port -eq $Port) { return }
+    }
+    $tempPath = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        Save-Json $tempPath @{ password = $Secrets.password; port = $Port }
+        if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($tempPath, $Path, [Management.Automation.Language.NullString]::Value) }
+        else { [IO.File]::Move($tempPath, $Path) }
+    } finally { if ([IO.File]::Exists($tempPath)) { [IO.File]::Delete($tempPath) } }
+}
+function Copy-DockerWorker([string]$Source, [string]$StateDirectory) {
+    $temporary = Join-Path $StateDirectory ("worker-" + [guid]::NewGuid().ToString('N') + '.sh')
+    try {
+        if (Test-Path -LiteralPath $Source -PathType Leaf) {
+            $body = [IO.File]::ReadAllText($Source)
+        } else {
+            $branch = (($ScalaBranch -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/')
+            Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/bogdanparvu18/scala-testing-lab/$branch/scripts/bootstrap-unix.sh" -OutFile $temporary
+            $body = [IO.File]::ReadAllText($temporary)
+        }
+        if ([string]::IsNullOrWhiteSpace($body)) { throw 'The Linux bootstrap is empty.' }
+        [IO.File]::WriteAllText($temporary, $body.Replace("`r`n", "`n").Replace("`r", "`n"), $Utf8)
+        # Give concurrent callers independent source and destination files.
+        $remote = '/tmp/' + [IO.Path]::GetFileName($temporary)
+        Run { docker.exe cp $temporary "${RuntimeContainerName}:$remote" } | Out-Host
+        return $remote
+    } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
 }
 function Ensure-DockerImage([string]$Name) {
     $ids = @(Run { docker.exe image ls --quiet --filter "reference=$Name" } | Where-Object { $_ })
@@ -695,6 +1026,36 @@ function Ensure-DockerImage([string]$Name) {
     }
     return $image
 }
+function Select-DockerDatabaseImage {
+    # PostgreSQL 18 changed the declared volume. Inspect image metadata before
+    # choosing a mount, including for a locally retagged major/minor release.
+    $refs = @(Run { docker.exe image ls --format '{{.Repository}}:{{.Tag}}' } | Where-Object {
+        $_ -cmatch '^(?:(?:docker\.io/)?library/|docker\.io/)?postgres:(?!<none>$).+$'
+    } | Sort-Object -Unique)
+    $best = $null
+    foreach ($ref in $refs) {
+        $metadata = @(Run { docker.exe image inspect $ref } | ConvertFrom-Json)[0]
+        $majorEnv = @($metadata.Config.Env | Where-Object { $_ -cmatch '^PG_MAJOR=[0-9]+$' })
+        $dataEnv = @($metadata.Config.Env | Where-Object { $_ -clike 'PGDATA=/*' })
+        if ($majorEnv.Count -ne 1 -or $dataEnv.Count -ne 1) { throw "Cannot establish PostgreSQL version/data location for cached image '$ref'. Inspect and reconcile that image explicitly." }
+        $major = [int]$majorEnv[0].Substring(9)
+        if ($metadata.Os -ne 'linux' -or $metadata.Architecture -notin @('amd64','arm64') -or $major -lt 15) { continue }
+        $dataDir = $dataEnv[0].Substring(7).TrimEnd('/')
+        $mounts = @($metadata.Config.Volumes.PSObject.Properties.Name | Where-Object {
+            $_ -cin @('/var/lib/postgresql','/var/lib/postgresql/data') -and ($dataDir -ceq $_ -or $dataDir.StartsWith(($_ + '/'), [StringComparison]::Ordinal))
+        })
+        if ($mounts.Count -ne 1) { throw "Cannot safely place PGDATA '$dataDir' on a declared volume in '$ref'." }
+        $choice = @{ name = $ref; major = $major; mount = $mounts[0] }
+        if ($ref -ceq 'postgres:16') { return $choice }
+        if (-not $best -or $major -gt $best.major) { $best = $choice }
+    }
+    if ($best) { return $best }
+    if ($refs.Count -and -not (Confirm-ToolUpgrade 'PostgreSQL container image' ("Cached: " + ($refs -join ', ') + ". Pull postgres:16 for a new, separate database?"))) {
+        throw 'Compatible PostgreSQL image required. Pull a supported official image or approve the image change.'
+    }
+    $null = Ensure-DockerImage 'postgres:16'
+    return @{ name = 'postgres:16'; major = 16; mount = '/var/lib/postgresql/data' }
+}
 function Invoke-DockerRuntime {
     foreach ($name in @($ContainerName, $VolumeName, $RuntimeContainerName, $RuntimeVolumeName, $RuntimeCacheVolumeName)) {
         if ($name -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$') { throw "Unsupported Docker object name '$name'." }
@@ -703,6 +1064,12 @@ function Invoke-DockerRuntime {
         throw 'Database/runtime container names and database/workspace/cache volume names must be distinct.'
     }
     if ($RuntimeImage -match '[\s\x00]' -or -not $RuntimeImage) { throw 'Invalid runtime image name.' }
+    $workerEnvironment = @('-e', 'PGPASSWORD')
+    if (-not $DockerToolSearchPath -and $env:AURORA_DOCKER_TOOL_SEARCH_PATH) { $DockerToolSearchPath = @($env:AURORA_DOCKER_TOOL_SEARCH_PATH -split ':') }
+    foreach ($directory in $DockerToolSearchPath) {
+        if (-not $directory.StartsWith('/') -or $directory -match '[:\r\n\x00]') { throw '-DockerToolSearchPath requires absolute Linux directories without colon or newline.' }
+    }
+    if ($DockerToolSearchPath) { $workerEnvironment += @('-e', ('AURORA_TOOL_SEARCH_PATH=' + ($DockerToolSearchPath -join ':'))) }
     $Root = [IO.Path]::GetFullPath($Root)
     if (-not (Test-Path -LiteralPath $Root)) { New-Item -ItemType Directory -Path $Root | Out-Null }
     # --Docker explicitly selects the Linux workspace. Report any native copies
@@ -727,91 +1094,124 @@ function Invoke-DockerRuntime {
             if ($entry.Name -notin @('.git', 'node_modules', 'target', '.metals', '.bloop', '.bsp', 'data', 'downloads', 'backups')) { $pending.Push($entry.FullName) }
         }
     }
-    $databaseContainer = Get-DockerObject 'container' $ContainerName
+    # One snapshot per kind for this decision; newly created objects are inspected directly.
+    $containers = @(Run { docker.exe container ls -a --format '{{json .}}' } | ForEach-Object { $_ | ConvertFrom-Json })
+    $containerNames = @($containers | ForEach-Object { $_.Names })
+    $volumeNames = @(Run { docker.exe volume ls --format '{{.Name}}' })
+    $databaseContainer = $null
+    if (-not $DockerUseHostPostgres) {
+        $databaseContainer = Get-DockerObject 'container' $ContainerName $containerNames
+        if (-not $databaseContainer -and $VolumeName -cin $volumeNames) { throw "Database volume '$VolumeName' exists without its matching container. Recover its original container/credentials." }
+        if (-not $databaseContainer -and -not $DockerUseManagedPostgres) {
+            try { $otherServers = @(Get-OtherPostgresEvidence $containers) }
+            catch { throw "Windows PostgreSQL service discovery was inconclusive. Select -DockerUseHostPostgres or -DockerUseManagedPostgres explicitly. $($_.Exception.Message)" }
+            if ($otherServers.Count) {
+                throw ("Existing PostgreSQL detected: " + ($otherServers -join ', ') + ". Start the selected server and make its port available on loopback, then use -DockerUseHostPostgres with its port/database/user, or -DockerUseManagedPostgres to create a separate server.")
+            }
+        }
+    }
     $databaseWasStopped = ($null -ne $databaseContainer -and -not $databaseContainer.State.Running)
-    $databaseVolume = Get-DockerObject 'volume' $VolumeName
-    $runtimeContainer = Get-DockerObject 'container' $RuntimeContainerName
-    $workspaceVolume = Get-DockerObject 'volume' $RuntimeVolumeName
-    $cacheVolume = Get-DockerObject 'volume' $RuntimeCacheVolumeName
-    if (-not $databaseContainer -and $databaseVolume) { throw "Database volume '$VolumeName' exists without its matching container. Recover its original container/credentials; no database was initialized." }
-    if (-not $runtimeContainer -and ($workspaceVolume -or $cacheVolume)) { throw 'The persistent runtime workspace/cache exists without its matching container. Recover that container explicitly; existing workspace data was preserved.' }
+    $runtimeContainer = Get-DockerObject 'container' $RuntimeContainerName $containerNames
+    if (-not $runtimeContainer -and ($RuntimeVolumeName -cin $volumeNames -or $RuntimeCacheVolumeName -cin $volumeNames)) {
+        throw 'The workspace/cache exists without its runtime. Recover the matching container explicitly.'
+    }
+    if ($runtimeContainer -and -not $RuntimeImageSpecified) { $RuntimeImage = $runtimeContainer.Config.Image }
     $dockerState = Join-Path $Root 'docker-runtime\state'
     New-Item -ItemType Directory -Path $dockerState -Force | Out-Null
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    Run { icacls.exe $dockerState '/inheritance:r' '/grant:r' "${identity}:(OI)(CI)F" 'SYSTEM:(OI)(CI)F' } | Out-Null
-    $secretPath = Join-Path $dockerState 'secrets.json'
-    $secrets = $null
-    if (Test-Path -LiteralPath $secretPath) { $secrets = Get-Content -LiteralPath $secretPath -Raw | ConvertFrom-Json }
-    if (-not $secrets) {
-        $legacyPaths = @((Join-Path $Root 'medication-lab-setup\automatic\state\secrets.json'))
-        if ($SetupPath) { $legacyPaths = @((Join-Path $SetupPath 'state\secrets.json')) + $legacyPaths }
-        foreach ($candidate in $legacyPaths) {
-            if (Test-Path -LiteralPath $candidate) { $secrets = Get-Content -LiteralPath $candidate -Raw | ConvertFrom-Json; break }
+    Protect-BootstrapState $dockerState
+    $runtimeHost = if ($DockerUseHostPostgres -and $PgHost -eq '::1') { '::1' } else { '127.0.0.1' }
+    $runtimePort = if ($DockerUseHostPostgres) { $Port } else { 5432 }
+    if ($DockerUseHostPostgres) {
+        if (-not $env:PGPASSWORD) {
+            if (-not (Test-BootstrapInteractive)) { throw 'Supply the existing database password via PGPASSWORD for a noninteractive run.' }
+            $secure = Read-Host "Existing PostgreSQL password for $DbUser" -AsSecureString
+            $env:PGPASSWORD = [Net.NetworkCredential]::new('', $secure).Password
         }
-    }
-    if (-not $secrets -and $databaseContainer) {
-        $existingPasswords = @($databaseContainer.Config.Env | Where-Object { $_ -like 'POSTGRES_PASSWORD=*' })
-        if ($existingPasswords.Count -ne 1 -or -not $existingPasswords[0].Substring(18)) {
-            throw 'Existing database container has no recoverable password. Supply its original setup credentials; no password was generated or reset.'
+        if (-not $env:PGPASSWORD) { throw 'An existing database password is required.' }
+    } else {
+        $secretPath = Join-Path $dockerState 'secrets.json'
+        $secrets = $null
+        if (Test-Path -LiteralPath $secretPath) { $secrets = Get-Content -LiteralPath $secretPath -Raw | ConvertFrom-Json }
+        if (-not $secrets) {
+            $legacyPaths = @((Join-Path $Root 'medication-lab-setup\automatic\state\secrets.json'))
+            if ($SetupPath) { $legacyPaths = @((Join-Path $SetupPath 'state\secrets.json')) + $legacyPaths }
+            foreach ($candidate in $legacyPaths) {
+                if (Test-Path -LiteralPath $candidate) { $secrets = Get-Content -LiteralPath $candidate -Raw | ConvertFrom-Json; break }
+            }
         }
-        $secrets = @{ password = $existingPasswords[0].Substring(18); port = $Port }
-    }
-    if (-not $secrets) { $secrets = @{ password = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'); port = $Port } }
-    if (-not $secrets.password -or ($secrets.port -and [int]$secrets.port -ne $Port)) { throw 'Stored Docker credentials/port do not match the selected configuration.' }
-    if ($databaseContainer) {
-        $bindings = @($databaseContainer.HostConfig.PortBindings.'5432/tcp')
-        $mounts = @($databaseContainer.Mounts | Where-Object { $_.Destination -eq '/var/lib/postgresql/data' })
-        if ($databaseContainer.Config.Image -ne 'postgres:16' -or $bindings.Count -ne 1 -or
-            $bindings[0].HostIp -ne '127.0.0.1' -or $bindings[0].HostPort -ne [string]$Port -or
-            $mounts.Count -ne 1 -or $mounts[0].Type -ne 'volume' -or $mounts[0].Name -ne $VolumeName -or -not $mounts[0].RW -or
-            'POSTGRES_USER=rxnorm_lab' -notin $databaseContainer.Config.Env -or 'POSTGRES_DB=rxnorm_public' -notin $databaseContainer.Config.Env -or
-            "POSTGRES_PASSWORD=$($secrets.password)" -notin $databaseContainer.Config.Env -or
-            $databaseContainer.HostConfig.NetworkMode -notin @('default', 'bridge')) {
-            throw 'Existing PostgreSQL container has incompatible image, mounts, network, port, or credentials. No container/volume was replaced.'
+        if (-not $secrets -and $databaseContainer) {
+            $existingPasswords = @($databaseContainer.Config.Env | Where-Object { $_ -like 'POSTGRES_PASSWORD=*' })
+            if ($existingPasswords.Count -ne 1 -or -not $existingPasswords[0].Substring(18)) {
+                throw 'Existing database container has no recoverable password. Supply its original setup credentials; no password was generated or reset.'
+            }
+            $secrets = @{ password = $existingPasswords[0].Substring(18); port = $Port }
+        }
+        if (-not $secrets) { $secrets = @{ password = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'); port = $Port } }
+        if (-not $secrets.password -or ($secrets.port -and [int]$secrets.port -ne $Port)) { throw 'Stored Docker credentials/port do not match the selected configuration.' }
+        if ($databaseContainer) {
+            $bindings = @($databaseContainer.HostConfig.PortBindings.'5432/tcp')
+            $mounts = @($databaseContainer.Mounts | Where-Object { $_.Destination -in @('/var/lib/postgresql/data', '/var/lib/postgresql') })
+            $pgData = @($databaseContainer.Config.Env | Where-Object { $_ -clike 'PGDATA=*' } | ForEach-Object { $_.Substring(7).TrimEnd('/') })
+            if ($databaseContainer.Config.Image -notmatch '^(?:(?:docker\.io/)?library/|docker\.io/)?postgres(?:[:@]|$)' -or
+                $pgData.Count -ne 1 -or $mounts.Count -ne 1 -or ($pgData[0] -cne $mounts[0].Destination -and -not $pgData[0].StartsWith($mounts[0].Destination + '/', [StringComparison]::Ordinal)) -or $bindings.Count -ne 1 -or
+                $bindings[0].HostIp -ne '127.0.0.1' -or $bindings[0].HostPort -ne [string]$Port -or
+                $mounts[0].Type -ne 'volume' -or $mounts[0].Name -ne $VolumeName -or -not $mounts[0].RW -or
+                'POSTGRES_USER=rxnorm_lab' -notin $databaseContainer.Config.Env -or 'POSTGRES_DB=rxnorm_public' -notin $databaseContainer.Config.Env -or
+                "POSTGRES_PASSWORD=$($secrets.password)" -notin $databaseContainer.Config.Env -or
+                $databaseContainer.HostConfig.NetworkMode -notin @('default', 'bridge')) {
+                throw 'Existing PostgreSQL container has incompatible image, mounts, network, port, or credentials. No container/volume was replaced.'
+            }
         }
     }
     # Validate the runtime before starting or creating any service.
     if ($runtimeContainer) {
         $workMount = @($runtimeContainer.Mounts | Where-Object { $_.Destination -eq '/workspace' })
         $cacheMount = @($runtimeContainer.Mounts | Where-Object { $_.Destination -eq '/root' })
-        $expectedNetwork = if ($databaseContainer) { 'container:' + $databaseContainer.Id } else { '' }
-        if (-not $databaseContainer -or $runtimeContainer.Config.Image -ne $RuntimeImage -or
+        $expectedNetwork = if ($DockerUseHostPostgres) { 'host' } elseif ($databaseContainer) { 'container:' + $databaseContainer.Id } else { '' }
+        if (-not $expectedNetwork -or $runtimeContainer.Config.Image -cne $RuntimeImage -or
             $runtimeContainer.Config.Labels.'aurora.runtime.schema' -ne '1' -or $runtimeContainer.Config.Labels.'aurora.host.root' -ne $Root -or
             $workMount.Count -ne 1 -or $workMount[0].Type -ne 'volume' -or $workMount[0].Name -ne $RuntimeVolumeName -or -not $workMount[0].RW -or
             $cacheMount.Count -ne 1 -or $cacheMount[0].Type -ne 'volume' -or $cacheMount[0].Name -ne $RuntimeCacheVolumeName -or -not $cacheMount[0].RW -or
             $runtimeContainer.HostConfig.NetworkMode -ne $expectedNetwork -or
-            'PGHOST=127.0.0.1' -notin $runtimeContainer.Config.Env -or 'PGPORT=5432' -notin $runtimeContainer.Config.Env -or
-            'PGDATABASE=rxnorm_public' -notin $runtimeContainer.Config.Env -or 'PGUSER=rxnorm_lab' -notin $runtimeContainer.Config.Env -or
-            "PGPASSWORD=$($secrets.password)" -notin $runtimeContainer.Config.Env) {
+            "PGHOST=$runtimeHost" -cnotin $runtimeContainer.Config.Env -or "PGPORT=$runtimePort" -cnotin $runtimeContainer.Config.Env -or
+            "PGDATABASE=$Database" -cnotin $runtimeContainer.Config.Env -or "PGUSER=$DbUser" -cnotin $runtimeContainer.Config.Env -or
+            (-not $DockerUseHostPostgres -and "PGPASSWORD=$($secrets.password)" -cnotin $runtimeContainer.Config.Env)) {
             throw 'Existing Linux runtime does not match its image, workspace/cache mounts, database namespace, host Root, or credentials. Recover/select the original configuration; no runtime was replaced.'
         }
     }
-    Save-Json $secretPath @{ password = $secrets.password; port = $Port }
-    $env:POSTGRES_PASSWORD = [string]$secrets.password
-    $env:PGPASSWORD = [string]$secrets.password
-    if (-not $databaseContainer) {
-        $null = Ensure-DockerImage 'postgres:16'
-        Run { docker.exe run -d --restart unless-stopped --name $ContainerName -e POSTGRES_USER=rxnorm_lab -e POSTGRES_DB=rxnorm_public -e POSTGRES_PASSWORD -p "127.0.0.1:${Port}:5432" -v "${VolumeName}:/var/lib/postgresql/data" postgres:16 } | Out-Host
-        $databaseContainer = Get-DockerObject 'container' $ContainerName
-    } elseif (-not $databaseContainer.State.Running) { Run { docker.exe start $ContainerName } | Out-Host }
-    $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
-    do {
-        $probePreference = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        & docker.exe exec $ContainerName pg_isready -h 127.0.0.1 -p 5432 -U rxnorm_lab -d rxnorm_public -t 3 *> $null
-        $databaseReady = ($LASTEXITCODE -eq 0)
-        $ErrorActionPreference = $probePreference
-        if (-not $databaseReady) { Start-Sleep -Seconds 1 }
-    } until ($databaseReady -or (Get-Date) -ge $deadline)
-    if (-not $databaseReady) { throw 'PostgreSQL container did not become ready; no runtime tools were installed.' }
-    $authenticated = Run { docker.exe exec -e PGPASSWORD $ContainerName psql -X -w -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SELECT 1;' }
-    if ($authenticated -ne '1') { throw 'Existing PostgreSQL credentials failed authentication; no password was reset.' }
-    $serverVersion = Run { docker.exe exec -e PGPASSWORD $ContainerName psql -X -w -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;' }
-    if ($serverVersion -notmatch '^16[0-9]{4}$') { throw 'The existing database server is incompatible with postgres:16; no database was upgraded.' }
+    if (-not $DockerUseHostPostgres) {
+        if (-not $databaseContainer) { $seed = Select-DockerDatabaseImage }
+        Save-DockerCredentials $secretPath $secrets
+        $env:POSTGRES_PASSWORD = [string]$secrets.password
+        $env:PGPASSWORD = [string]$secrets.password
+        if (-not $databaseContainer) {
+            Write-Host "Using PostgreSQL image $($seed.name); mounting $VolumeName at $($seed.mount)."
+            Run { docker.exe run -d --restart unless-stopped --name $ContainerName -e POSTGRES_USER=rxnorm_lab -e POSTGRES_DB=rxnorm_public -e POSTGRES_PASSWORD -p "127.0.0.1:${Port}:5432" -v "${VolumeName}:$($seed.mount)" $seed.name } | Out-Host
+            $databaseContainer = @(Run { docker.exe container inspect $ContainerName } | ConvertFrom-Json)[0]
+        } elseif (-not $databaseContainer.State.Running) { Run { docker.exe start $ContainerName } | Out-Host }
+        $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
+        do {
+            $probePreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & docker.exe exec $ContainerName pg_isready -h 127.0.0.1 -p 5432 -U rxnorm_lab -d rxnorm_public -t 3 *> $null
+            $databaseReady = ($LASTEXITCODE -eq 0)
+            $ErrorActionPreference = $probePreference
+            if (-not $databaseReady) { Start-Sleep -Seconds 1 }
+        } until ($databaseReady -or (Get-Date) -ge $deadline)
+        if (-not $databaseReady) { throw 'PostgreSQL container did not become ready; no runtime tools were installed.' }
+        $serverVersion = Run { docker.exe exec -e PGPASSWORD $ContainerName psql -X -w -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;' }
+        Assert-ServerVersion $serverVersion
+    }
     if (-not $runtimeContainer) {
         $null = Ensure-DockerImage $RuntimeImage
-        $network = 'container:' + $databaseContainer.Id
-        Run { docker.exe run -d --restart unless-stopped --name $RuntimeContainerName --network $network --label 'aurora.runtime.schema=1' --label "aurora.host.root=$Root" -v "${RuntimeVolumeName}:/workspace" -v "${RuntimeCacheVolumeName}:/root" -e PGHOST=127.0.0.1 -e PGPORT=5432 -e PGDATABASE=rxnorm_public -e PGUSER=rxnorm_lab -e PGPASSWORD $RuntimeImage sleep infinity } | Out-Host
+        $network = if ($DockerUseHostPostgres) { 'host' } else { 'container:' + $databaseContainer.Id }
+        $passwordOption = @()
+        if ($DockerUseHostPostgres) {
+            # Probe the same loopback path Scala permits before creating persistent volumes.
+            try { Run { docker.exe run --rm --network host --entrypoint timeout $RuntimeImage 5 bash -c 'true > /dev/tcp/$1/$2' _ $runtimeHost $Port } | Out-Null }
+            catch { throw "Cannot reach the selected Windows database on port $Port from Linux. Enable host networking under Docker Desktop > Settings > Resources > Network (4.34+), check PostgreSQL, then retry." }
+        } else { $passwordOption = @('-e', 'PGPASSWORD') }
+        Run { docker.exe run -d --restart unless-stopped --name $RuntimeContainerName --network $network --label 'aurora.runtime.schema=1' --label "aurora.host.root=$Root" -v "${RuntimeVolumeName}:/workspace" -v "${RuntimeCacheVolumeName}:/root" -e "PGHOST=$runtimeHost" -e "PGPORT=$runtimePort" -e "PGDATABASE=$Database" -e "PGUSER=$DbUser" @passwordOption $RuntimeImage sleep infinity } | Out-Host
     } elseif (-not $runtimeContainer.State.Running) { Run { docker.exe start $RuntimeContainerName } | Out-Host }
     elseif ($databaseWasStopped) {
         # A running sibling retains the old namespace when the database restarts.
@@ -820,17 +1220,17 @@ function Invoke-DockerRuntime {
         Run { docker.exe restart $RuntimeContainerName } | Out-Host
     }
     Write-Host "Linux workspace: Docker volume '$RuntimeVolumeName', mounted at /workspace in '$RuntimeContainerName'. Native repositories are not copied."
-    Write-Host "Persistent caches: '$RuntimeCacheVolumeName'; database volume: '$VolumeName'."
-    $unixScript = Join-Path $PSScriptRoot 'bootstrap-unix.sh'
-    $temporaryScript = $null
-    if (-not (Test-Path -LiteralPath $unixScript -PathType Leaf)) {
-        $temporaryScript = Join-Path $dockerState 'bootstrap-unix.sh'
-        $branchPath = (($ScalaBranch -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/')
-        Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/bogdanparvu18/scala-testing-lab/$branchPath/scripts/bootstrap-unix.sh" -OutFile $temporaryScript
-        $unixScript = $temporaryScript
-    }
-    Run { docker.exe cp $unixScript "${RuntimeContainerName}:/tmp/aurora-bootstrap-unix.sh" } | Out-Host
-    Run { docker.exe exec $RuntimeContainerName bash /tmp/aurora-bootstrap-unix.sh --container-runtime --root /workspace --scala-branch $ScalaBranch --langium-branch $LangiumBranch --startup-timeout $StartupTimeoutSeconds } | Out-Host
+    Write-Host "Persistent caches: '$RuntimeCacheVolumeName'. Database: $Database at ${runtimeHost}:$runtimePort inside the runtime."
+    $remoteWorker = Copy-DockerWorker (Join-Path $PSScriptRoot 'bootstrap-unix.sh') $dockerState
+    try {
+        $workerOptions = @('--container-runtime', '--root', '/workspace', '--scala-branch', $ScalaBranch, '--langium-branch', $LangiumBranch, '--startup-timeout', [string]$StartupTimeoutSeconds)
+        $terminal = @()
+        if ($AllowToolUpgrade) { $workerOptions += '--allow-tool-upgrade' }
+        if ((Test-BootstrapInteractive) -and -not [Console]::IsOutputRedirected) {
+            $terminal = @('-i', '-t')
+        } else { $workerOptions += '--non-interactive' }
+        Run { docker.exe exec @terminal @workerEnvironment $RuntimeContainerName bash $remoteWorker @workerOptions }
+    } finally { & docker.exe exec $RuntimeContainerName rm -f $remoteWorker | Out-Null }
     # The Linux worker has already checked builds, SQL/RxNorm and the language server.
     if (-not $NoEditor) {
         $codeVersion = @(Run { code.cmd --version })[0]
@@ -869,14 +1269,13 @@ function Wait-Postgres {
 }
 function Ensure-LocalPostgres {
     if (Test-PostgresReady) { return }
-    if ($PgServiceName) {
-        $services = @(Get-Service | Where-Object { $_.Name -eq $PgServiceName })
-    } else {
-        $services = @(Get-Service -Name '*postgres*' -ErrorAction SilentlyContinue)
+    $names = @(if ($PgServiceName) { $PgServiceName } else { Get-PostgresServiceCandidates $PsqlPath })
+    if ($names.Count -ne 1) {
+        throw "No responding PostgreSQL at ${PgHost}:$Port. Found $($names.Count) services for the selected installation. Start the intended service or pass its exact -PgServiceName."
     }
-    if ($services.Count -ne 1) {
-        throw "No responding PostgreSQL at ${PgHost}:$Port. Start the intended Windows PostgreSQL service, or specify its exact -PgServiceName (found $($services.Count) candidates)."
-    }
+    # Match the literal service name. Get-Service -Name treats its argument as a wildcard.
+    $services = @(Get-Service | Where-Object { $_.Name -eq $names[0] })
+    if ($services.Count -ne 1) { throw "PostgreSQL service '$names' was not found. Check -PgServiceName." }
     $service = $services[0]
     if ($service.Status -ne 'Running') {
         Write-Host "Starting PostgreSQL Windows service: $($service.Name)"
@@ -889,21 +1288,113 @@ function Ensure-LocalPostgres {
     }
     Wait-Postgres
 }
-function Invoke-DatabaseSql([string]$Sql) {
-    # Ignore psqlrc, disallow additional password prompts, and stop on SQL errors.
-    # Passwords are inherited via the environment, never command-line arguments.
-    Run { & $PsqlPath -X -w -h $PgHost -p $Port -U $DbUser -d $Database -v ON_ERROR_STOP=1 -Atc $Sql }
+function Invoke-DatabaseSql([string]$Sql, [string]$Login = $DbUser, [string]$DbName = $Database) {
+    Run { & $PsqlPath -X -w -h $PgHost -p $Port -U $Login -d $DbName -v ON_ERROR_STOP=1 -Atc $Sql }
 }
-function Assert-Postgres {
-    if (-not (Test-PostgresReady)) { throw "PostgreSQL is not accepting connections at ${PgHost}:$Port." }
-    try { $answer = Invoke-DatabaseSql 'SELECT 1;' }
-    catch { throw "PostgreSQL login failed at ${PgHost}:$Port for database '$Database', user '$DbUser'. Check the existing database, role and password. $($_.Exception.Message)" }
-    if ($answer -ne '1') { throw 'Authenticated PostgreSQL query failed.' }
-    $serverVersion = Invoke-DatabaseSql 'SHOW server_version_num;'
-    $serverNumber = 0
-    if (-not [int]::TryParse(([string]$serverVersion).Trim(), [ref]$serverNumber) -or $serverNumber -lt 160000) {
-        throw "The selected PostgreSQL server version '$serverVersion' is outside this bootstrap's supported baseline (16+). No server upgrade was attempted."
+function Initialize-LabDatabase {
+    # This opt-in recovery is only called after an application login failed.
+    # Use the catalog to prove absence; a password error alone is never evidence.
+    if ($DbUser -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw '-ProvisionDatabase requires a simple lab role identifier.' }
+    if (-not (Test-BootstrapInteractive)) { throw 'Run -ProvisionDatabase in an interactive terminal to enter the administrator and new role passwords.' }
+    $labPassword = $env:PGPASSWORD
+    $secure = Read-Host "Administrator password for $PgAdminUser on ${PgHost}:$Port" -AsSecureString
+    try {
+        $adminPassword = [System.Net.NetworkCredential]::new('', $secure).Password
+        $env:PGPASSWORD = $adminPassword
+        $serverNumber = Invoke-DatabaseSql 'SHOW server_version_num;' $PgAdminUser 'postgres'
+        Assert-ServerVersion $serverNumber
+        $hasRole = Invoke-DatabaseSql "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname='$DbUser';" $PgAdminUser 'postgres'
+        $hasDb = Invoke-DatabaseSql "SELECT count(*) FROM pg_catalog.pg_database WHERE datname='$Database';" $PgAdminUser 'postgres'
+        if ($hasRole -notin @('0', '1') -or $hasDb -notin @('0', '1')) { throw 'Unexpected PostgreSQL catalog response. Stopping provisioning.' }
+        if ($hasDb -eq '1') { throw "Database '$Database' exists; verify its login, password, and permissions. No existing role, password or database was altered." }
+        if ($hasRole -eq '0') {
+            $createUser = Join-Path (Split-Path -Parent $PsqlPath) 'createuser.exe'
+            if (-not (Test-Path -LiteralPath $createUser -PathType Leaf)) { throw "Missing $createUser. Create the lab login using the PostgreSQL administration tools." }
+            Write-Host "Creating login '$DbUser'. At the two createuser prompts, enter the lab password supplied to bootstrap."
+            # createuser encrypts the password client-side and sends the verifier.
+            # Passwords never appear in the command line, SQL text or setup files.
+            Run { & $createUser -w -h $PgHost -p $Port -U $PgAdminUser --pwprompt --no-superuser --no-createrole --no-createdb -- $DbUser } | Out-Host
+        }
+        # Verify the application's existing/new password before creating its DB.
+        $env:PGPASSWORD = $labPassword
+        if ((Invoke-DatabaseSql 'SELECT 1;' $DbUser 'postgres') -ne '1') { throw "Cannot verify lab role '$DbUser' against the maintenance database." }
+        $env:PGPASSWORD = $adminPassword
+        # Both identifiers were validated before use. Preserve case with quotes.
+        Invoke-DatabaseSql "CREATE DATABASE `"$Database`" OWNER `"$DbUser`";" $PgAdminUser 'postgres' | Out-Host
+    } finally {
+        $env:PGPASSWORD = $labPassword
+        $secure.Dispose()
+        Remove-Variable adminPassword -ErrorAction SilentlyContinue
     }
+}
+function Assert-ServerVersion($Number) {
+    $serverNumber = 0
+    if (-not [int]::TryParse(([string]$Number).Trim(), [ref]$serverNumber)) { throw "Cannot determine the version of the authenticated PostgreSQL server: '$Number'." }
+    if ($serverNumber -lt 150000) {
+        if (Confirm-ToolUpgrade 'PostgreSQL server' "Selected server $Number at ${PgHost}:$Port. The lab supports PostgreSQL 15+. Prepare a manual upgrade with the database administrator?") {
+            Write-Host 'Back up and verify the existing cluster. The administrator can run the target PostgreSQL pg_upgrade --check with the old/new bin and data directories, and schedule migration after review. See https://www.postgresql.org/docs/current/pgupgrade.html.'
+        }
+        throw "Select an existing PostgreSQL 15+ cluster or finish an operator-managed upgrade, then rerun. Database files and roles were preserved."
+    }
+}
+function Open-LabDatabase {
+    Ensure-LocalPostgres
+    try { $version = Invoke-DatabaseSql 'SHOW server_version_num;' }
+    catch {
+        if (-not $ProvisionDatabase) { throw "PostgreSQL login failed for '$DbUser' on ${PgHost}:$Port/$Database. Check the credentials. For a new installation, rerun with -ProvisionDatabase to create missing lab objects." }
+        Initialize-LabDatabase
+        $version = Invoke-DatabaseSql 'SHOW server_version_num;'
+    }
+    Assert-ServerVersion $version
+}
+
+function Test-ArtifactHash([string]$Path, [string]$Sha256) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Expected a regular cached file at '$Path'." }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $Sha256
+}
+function Publish-VerifiedArtifact([string]$Temporary, [string]$Path, [string]$Sha256) {
+    if (-not (Test-ArtifactHash $Temporary $Sha256)) { throw "SHA-256 verification failed for '$Path'." }
+    try {
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($Temporary, $Path, [NullString]::Value) }
+        else { [IO.File]::Move($Temporary, $Path) }
+    } catch [IO.IOException] {
+        # Another run may already have published the same verified bytes.
+        if (-not (Test-ArtifactHash $Path $Sha256)) { throw }
+    }
+}
+function Get-VerifiedDownload([string]$Uri, [string]$Path, [string]$Sha256) {
+    if (Test-ArtifactHash $Path $Sha256) { return }
+    $part = "$Path.$([guid]::NewGuid().ToString('N')).part"
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $part
+        Publish-VerifiedArtifact $part $Path $Sha256
+    } finally { if ([IO.File]::Exists($part)) { [IO.File]::Delete($part) } }
+}
+function Get-RxNormFiles([string]$RrfDirectory, [string]$Archive) {
+    $hashes = @{
+        'RXNCONSO.RRF' = '555730c3ff2a981796dc5d649acc482e4685f7a31f7b0442941393ae50dd5209'
+        'RXNREL.RRF' = 'cca47f32a2c32ef60d65c6789851385ff5dcf287750ca01a53f800a5cf5ef694'
+        'RXNSAT.RRF' = 'b5a476f2bfbef9082144fd2bf00eb0de46f7b0b63da822d856067b9935914dda'
+    }
+    $needed = @($hashes.Keys | Where-Object { -not (Test-ArtifactHash (Join-Path $RrfDirectory $_) $hashes[$_]) })
+    if ($needed.Count -eq 0) { return }
+    Get-VerifiedDownload -Uri 'https://download.nlm.nih.gov/rxnorm/RxNorm_full_prescribe_10052026.zip' -Path $Archive -Sha256 '8ed351c29f3cb56bedeb8e2bcb8fa56931f8d7eb88e2280dc9772d7d3eb16977'
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        foreach ($name in $needed) {
+            $entry = $zip.GetEntry("rrf/$name")
+            if (-not $entry) { throw "Missing rrf/$name in the verified RxNorm archive." }
+            $path = Join-Path $RrfDirectory $name
+            $part = "$path.$([guid]::NewGuid().ToString('N')).part"
+            try {
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $part)
+                Publish-VerifiedArtifact $part $path $hashes[$name]
+            } finally { if ([IO.File]::Exists($part)) { [IO.File]::Delete($part) } }
+        }
+    } finally { $zip.Dispose() }
 }
 
 function ConvertTo-SbtPath([string]$Path) {
@@ -919,6 +1410,140 @@ function ConvertTo-WindowsArgument([string]$Value) {
     $escaped = $escaped -replace '(\\+)$', '$1$1'
     return '"' + $escaped + '"'
 }
+# Existing launchers can boot the project's pinned sbt even if their distribution
+# version differs. Only a downloaded launcher must match our published digest.
+function Get-SbtRootCandidates([string]$Required, [string]$Managed) {
+    $Managed
+    foreach ($homePath in @($env:SBT_HOME, $env:SBTHOME)) {
+        if ($homePath) { Join-Path $homePath 'bin\sbt-launch.jar'; Join-Path $homePath 'lib\sbt-launch.jar' }
+    }
+    foreach ($runner in @('sbt.bat','sbt.cmd','sbt.exe')) {
+        foreach ($exe in @(Get-PathToolCandidates $runner)) {
+            if (Test-Path -LiteralPath $exe -PathType Leaf) { $exe }
+        }
+    }
+    foreach ($path in @("$env:USERPROFILE\.sbt\launchers\$Required\sbt-launch.jar",
+        "$env:USERPROFILE\.ivy2\cache\org.scala-sbt\sbt-launch\jars\sbt-launch-$Required.jar",
+        "$env:USERPROFILE\.m2\repository\org\scala-sbt\sbt-launch\$Required\sbt-launch-$Required.jar",
+        "$env:USERPROFILE\.cache\coursier\v1", "$env:LOCALAPPDATA\Coursier\Cache\v1", $env:COURSIER_CACHE)) {
+        if (-not $path) { continue }
+        if ($path.EndsWith('.jar')) { $path; continue }
+        foreach ($hostPath in @('repo.maven.apache.org','repo1.maven.org')) {
+            Join-Path $path "https\$hostPath\maven2\org\scala-sbt\sbt-launch\$Required\sbt-launch-$Required.jar"
+        }
+    }
+}
+function Test-SbtArchive([string]$Path) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try {
+        $archive = [IO.Compression.ZipFile]::OpenRead($Path)
+        try { return ($null -ne $archive.GetEntry('xsbt/boot/Boot.class') -and $null -ne $archive.GetEntry('sbt/sbt.boot.properties')) }
+        finally { $archive.Dispose() }
+    } catch [IO.InvalidDataException] { return $false }
+}
+function Test-ProjectLauncher([string]$Jar, [string]$Required, [bool]$Compile) {
+    $commands = @('show sbtVersion')
+    if ($Compile) { $commands += 'compile' }
+    Push-Location -LiteralPath $Scala
+    try {
+        $probe = Invoke-ToolVersion $Java (@('-Xmx2G','-Dsbt.supershell=false','-Dsbt.log.noformat=true','-Dsbt.server.autostart=false','-jar',$Jar) + $commands)
+    } finally { Pop-Location }
+    if (-not $probe.ok) {
+        if ($probe.text -match '(?i)UnsupportedClassVersionError|Unsupported class file major version|class file has wrong version|does not support running the compiler on this version of the JDK') {
+            return 'jdk-incompatible'
+        }
+        # A failed network resolution, compilation error, or unreadable repository
+        # says nothing about the installed runner/JDK. Never install on this basis.
+        throw "Cannot verify the existing sbt launcher with the project. $($probe.text)"
+    }
+    if ($probe.text -notmatch ('(?m)^\[info\]\s*' + [regex]::Escape($Required) + '\s*$')) { return 'sbt-incompatible' }
+    return 'compatible'
+}
+function Resolve-SbtLauncher([string]$Managed) {
+    $required = '1.10.2'
+    $sha = 'cdd6963b622f42690cb2e3154bde3f3257a03839f216e1b5d7420000d6a71817'
+    $pin = (Get-Content -LiteralPath (Join-Path $Scala 'project\build.properties') | Where-Object { $_ -match '^\s*sbt\.version\s*=' })
+    if (@($pin).Count -ne 1 -or (($pin -split '=',2)[1]).Trim() -ne $required) { throw 'The checkout changed the sbt pin. Use a bootstrap matched to this project revision.' }
+    $seen = @{}; $evidence = New-Object 'System.Collections.Generic.List[string]'
+    $uncertain = New-Object 'System.Collections.Generic.List[string]'
+    if ($SbtLauncherPath -and -not (Test-Path -LiteralPath $SbtLauncherPath -PathType Leaf)) { throw "Explicit sbt launcher is inaccessible: $SbtLauncherPath" }
+    foreach ($phase in @('quick','inventory','managed')) {
+        if ($SbtLauncherPath -and $phase -eq 'inventory') { continue }
+        if ($phase -eq 'quick') {
+            if ($SbtLauncherPath) { $paths = @([IO.Path]::GetFullPath($SbtLauncherPath)) }
+            else { $paths = @(Get-SbtRootCandidates $required $Managed) }
+        } elseif ($phase -eq 'inventory') {
+            Read-ToolRegistrations 'Sbt'
+            $paths = @((Get-ToolInventory).Sbt.ToArray())
+            foreach ($record in $script:ToolRecords.Sbt) {
+                $evidence.Add($record.description)
+                if ($record.location) { $paths += Join-Path $record.location 'bin\sbt-launch.jar' }
+            }
+            foreach ($mask in @("$env:USERPROFILE\.sbt\launchers\*\sbt-launch.jar", "$env:USERPROFILE\.ivy2\cache\org.scala-sbt\sbt-launch\jars\sbt-launch-*.jar", "$env:USERPROFILE\.m2\repository\org\scala-sbt\sbt-launch\*\sbt-launch-*.jar")) {
+                $paths += @(Get-Item -Path $mask -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+            }
+        } else {
+            $portable = Get-PortableToolMessage 'Sbt'
+            if ($portable) { throw $portable }
+            if ($uncertain.Count) { throw ($uncertain -join [Environment]::NewLine) }
+            if ($script:ToolSearchErrors.Shared.Count) { throw "Cannot determine whether an sbt launcher is installed: $($script:ToolSearchErrors.Shared -join '; ')" }
+            if ($evidence.Count -and -not (Confirm-ToolUpgrade 'sbt' "Found $($evidence -join ', '). Fetch the verified $required launcher for this workspace?")) {
+                throw 'sbt launcher change declined. Select an installed JAR with -SbtLauncherPath.'
+            }
+            Get-VerifiedDownload -Uri "https://repo.maven.apache.org/maven2/org/scala-sbt/sbt-launch/$required/sbt-launch-$required.jar" -Path $Managed -Sha256 $sha
+            $seen.Remove($Managed)
+            $paths = @($Managed)
+        }
+        foreach ($candidate in $paths) {
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            $jar = $candidate
+            if ($candidate -notlike '*.jar') {
+                $evidence.Add($candidate)
+                $jar = Join-Path (Split-Path $candidate -Parent) 'sbt-launch.jar'
+                if (-not (Test-Path -LiteralPath $jar -PathType Leaf)) { continue }
+            }
+            if ($seen.ContainsKey($jar)) { continue }
+            $seen[$jar] = $true
+            $digest = (Get-FileHash -LiteralPath $jar -Algorithm SHA256).Hash
+            if ($digest -ne $sha -and -not (Test-SbtArchive $jar)) {
+                if ($jar -ne $Managed) { $evidence.Add($jar) }
+                continue
+            }
+            if ($digest -ne $sha -or $selectedTools.Java.probeBuild) {
+                try { $verdict = Test-ProjectLauncher $jar $required ([bool]$selectedTools.Java.probeBuild) }
+                catch { $uncertain.Add($_.Exception.Message); continue }
+                while ($verdict -eq 'jdk-incompatible' -and $selectedTools.Java.probeBuild) {
+                    # Search for another working JDK before offering an installation.
+                    $script:RejectedJava[$Java] = $true
+                    $selectedTools.Java = Resolve-SystemTool 'Java'
+                    Use-ToolEnvironment @{ Java=$selectedTools.Java }
+                    $script:Java = $selectedTools.Java.path
+                    $script:JavaHome = $selectedTools.Java.javaHome
+                    $verdict = Test-ProjectLauncher $jar $required $true
+                }
+                if ($verdict -eq 'jdk-incompatible') { $evidence.Add("$jar (incompatible with the selected JDK)"); continue }
+                if ($verdict -ne 'compatible') { $evidence.Add($jar); continue }
+            }
+            # The editor reads <sbtHome>/bin/sbt-launch.jar. Use the original
+            # distribution if it has this layout, otherwise alias the verified cache.
+            $bin = Split-Path $jar -Parent
+            if ((Split-Path $bin -Leaf) -eq 'bin' -and (Split-Path $jar -Leaf) -eq 'sbt-launch.jar') {
+                Write-Host "Reusing sbt launcher: $jar"
+                return $jar
+            }
+            $temporary = "$Managed.$([guid]::NewGuid().ToString('N')).part"
+            try {
+                try { New-Item -ItemType HardLink -Path $temporary -Target $jar -ErrorAction Stop | Out-Null }
+                catch { Copy-Item -LiteralPath $jar -Destination $temporary -ErrorAction Stop }
+                Publish-VerifiedArtifact $temporary $Managed $digest
+            } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+            Write-Host "Reusing cached sbt launcher $jar in the editor layout."
+            return $Managed
+        }
+    }
+    throw "No launcher could start sbt $required."
+}
+
 function Invoke-Sbt([string[]]$Commands) {
     $arguments = @('-Xmx2G', '-Dsbt.supershell=false', '-Dsbt.log.noformat=true', '-Dsbt.server.autostart=false', '-jar', $Launcher) + $Commands
     $start = New-Object System.Diagnostics.ProcessStartInfo
@@ -941,28 +1566,39 @@ if ($Help) {
     Write-Host 'Discovery excludes setup/backups, tools, dependencies, build outputs, linked directories and the inside of Git checkouts. An incomplete, divergent or non-Git copy requires explicit reconciliation; it is never replaced.'
     Write-Host 'Reuse the unique existing medication-lab-setup\automatic directory below Root; otherwise create it directly below Root. Multiple setup directories require -SetupPath. Local source and personal files remain in place; upstream conflicts stop setup. Run one bootstrap at a time.'
     Write-Host 'Default: existing local PostgreSQL, no Docker checks or commands. Connection defaults: PGHOST/PGPORT/PGDATABASE/PGUSER, then 127.0.0.1:5432 / scala_testing_lab / scala_lab. Explicit arguments override those defaults.'
-    Write-Host 'Local mode uses PGPASSWORD or asks securely for the existing password. The database and login must already exist; no local role/password/database is created or replaced.'
+    Write-Host 'Local mode uses PGPASSWORD or asks for the lab password. On a fresh installation use -ProvisionDatabase [-PgAdminUser postgres]. If the application login fails, the administrator verifies the catalog and creates only missing objects. Existing credentials and database ownership are preserved.'
     Write-Host 'A ready local RxNorm import with compatible manifests is reused. Empty databases receive the verified prescribable archive; incomplete/incompatible existing releases are not replaced.'
-    Write-Host 'psql.exe is found on PATH or under Program Files\PostgreSQL; -PsqlPath supports custom installations. A single stopped PostgreSQL Windows service can be started; use -PgServiceName when several exist.'
+    Write-Host 'A stopped service can be started only when its executable belongs to the selected PostgreSQL installation. Use -PgServiceName to select another service or resolve ambiguity.'
     Write-Host 'Existing tools are discovered and version-checked outside PATH, including Program Files, registry/services and user installs. Only genuinely missing tools may use WinGet --no-upgrade.'
-    Write-Host 'Options: -JavaPath/-NodePath/-GitPath/-CodePath/-DockerPath select executables; -AdditionalSearchPath adds search roots; -SessionOnlyEnvironment avoids saving tool homes/PATH to the user environment.'
-    Write-Host 'Incompatible/incomplete tools or inaccessible discovery locations require explicit repair; they never trigger an automatic reinstall.'
+    Write-Host 'Optional -LocateToolsOnFixedDrives lists portable tool paths on fixed drives and exits before executing discovered files. Use -Verbose to see unreadable directories.'
+    Write-Host 'Options: -JavaPath/-NodePath/-NpmPath/-GitPath/-CodePath/-DockerPath select executables; -AdditionalSearchPath adds search roots; -SessionOnlyEnvironment avoids saving tool homes/PATH to the user environment.'
+    Write-Host 'For incompatible versions, setup describes the change and asks before upgrading. Default: No. -AllowToolUpgrade grants explicit unattended consent. Incomplete/inaccessible discovery needs repair. -SbtLauncherPath selects an existing launcher JAR.'
     Write-Host '--Docker selects the complete toolchain in a persistent Linux workspace; existing native repository locations are reported and their files are preserved.'
+    Write-Host 'Docker can reuse Windows PostgreSQL or a published container: --Docker -DockerUseHostPostgres -Port 5432 -Database scala_testing_lab -DbUser scala_lab. Enable host networking in Docker Desktop 4.34+. PGPASSWORD is forwarded to the worker only; set the extension password in VS Code SecretStorage.'
+    Write-Host 'If a separate server is wanted while another PostgreSQL is detected, choose -DockerUseManagedPostgres. Imported data and existing servers are never migrated automatically.'
+    Write-Host 'Docker: -DockerToolSearchPath accepts additional Linux directories mounted in the runtime; use -AdditionalSearchPath for Windows executables.'
     Write-Host 'Docker selection: -RuntimeContainerName, -RuntimeVolumeName, -RuntimeCacheVolumeName and -RuntimeImage (default ubuntu:24.04). Existing volumes/credentials are reused, never reset.'
     return
 }
+if ($LocateToolsOnFixedDrives) { Show-FixedDriveToolLocations; return }
 try {
 # The two backends are explicit, never selected by probing Docker installation.
 $DatabaseMode = 'local'
-if ($UseDocker) {
-    $DatabaseMode = 'docker'
-    if (($PgHost -and $PgHost -ne '127.0.0.1') -or ($Database -and $Database -ne 'rxnorm_public') -or
-        ($DbUser -and $DbUser -ne 'rxnorm_lab') -or $PsqlPath -or $PgServiceName) {
-        throw '-UseDocker uses its managed rxnorm_public / rxnorm_lab database on 127.0.0.1. Local-only connection/tool/service options cannot be combined with it.'
+if ($UseDocker -and ($ProvisionDatabase -or $PSBoundParameters.ContainsKey('PgAdminUser'))) { throw '-ProvisionDatabase and -PgAdminUser apply only to native Windows installations.' }
+if ($PSBoundParameters.ContainsKey('PgAdminUser') -and -not $ProvisionDatabase) { throw '-PgAdminUser requires -ProvisionDatabase.' }
+$RuntimeImageSpecified = $PSBoundParameters.ContainsKey('RuntimeImage')
+if (($DockerUseHostPostgres -or $DockerUseManagedPostgres -or $DockerToolSearchPath) -and -not $UseDocker) { throw 'The selected Docker options require --Docker.' }
+if ($DockerUseHostPostgres -and $DockerUseManagedPostgres) { throw 'Select one Docker database mode.' }
+if ($UseDocker -and ($PsqlPath -or $PgServiceName)) { throw 'Select the database by port, database and user in Docker mode. Windows psql/service overrides apply only to native runs.' }
+if ($UseDocker -and -not $DockerUseHostPostgres) {
+    $DatabaseMode = 'docker-managed'
+    if (($PgHost -and $PgHost -ne '127.0.0.1') -or ($Database -and $Database -ne 'rxnorm_public') -or ($DbUser -and $DbUser -ne 'rxnorm_lab')) {
+        throw 'Use -DockerUseHostPostgres to select an existing database with your own connection settings.'
     }
     if (-not $PSBoundParameters.ContainsKey('Port')) { $Port = 55433 }
     $PgHost = '127.0.0.1'; $Database = 'rxnorm_public'; $DbUser = 'rxnorm_lab'
 } else {
+    if ($DockerUseHostPostgres) { $DatabaseMode = 'docker-host-postgres' }
     if (-not $PSBoundParameters.ContainsKey('PgHost')) { $PgHost = if ($env:PGHOST) { $env:PGHOST } else { '127.0.0.1' } }
     if (-not $PSBoundParameters.ContainsKey('Database')) { $Database = if ($env:PGDATABASE) { $env:PGDATABASE } else { 'scala_testing_lab' } }
     if (-not $PSBoundParameters.ContainsKey('DbUser')) { $DbUser = if ($env:PGUSER) { $env:PGUSER } else { 'scala_lab' } }
@@ -987,7 +1623,7 @@ $Root = $rootItem.FullName
 Write-Host "Search root: $Root"
 Initialize-ToolDiscovery
 if ($UseDocker) {
-    if ($JavaPath -or $NodePath -or $GitPath -or $ScalaRepoPath -or $LangiumRepoPath) {
+    if ($JavaPath -or $NodePath -or $NpmPath -or $SbtLauncherPath -or $GitPath -or $ScalaRepoPath -or $LangiumRepoPath) {
         throw 'Docker uses a persistent Linux workspace and tools. Native tool/repository overrides cannot be combined with -UseDocker.'
     }
     $selectedTools = @{ Docker = (Resolve-SystemTool 'Docker' $DockerPath) }
@@ -1000,6 +1636,9 @@ if ($UseDocker) {
 }
 $selectedTools = @{}
 $selectedTools.Git = Resolve-SystemTool 'Git' $GitPath
+$env:PATH = Add-UniqueToolPath @((Split-Path $selectedTools.Git.path -Parent)) $env:PATH
+$layout = Find-InstallLayout
+$Tools = Join-Path $layout.automatic 'tools'
 $selectedTools.Java = Resolve-SystemTool 'Java' $JavaPath
 $selectedTools.Node = Resolve-SystemTool 'Node' $NodePath
 $selectedTools.PostgreSQL = Resolve-SystemTool 'PostgreSQL' $PsqlPath
@@ -1009,10 +1648,8 @@ $Java = $selectedTools.Java.path
 $JavaHome = $env:JAVA_HOME
 $NodeHome = $env:NODE_HOME
 $PsqlPath = $selectedTools.PostgreSQL.path
-$PgIsReady = Join-Path (Split-Path -Parent $PsqlPath) 'pg_isready.exe'
+$PgIsReady = $selectedTools.PostgreSQL.ready
 
-# Resolve both paths before modifying either checkout or requesting credentials.
-$layout = Find-InstallLayout
 $RepoDirectories = $layout.repositories
 $Automatic = $layout.automatic
 $Scala = $RepoDirectories['scala-testing-lab']
@@ -1022,7 +1659,6 @@ Write-Host "Langium repository: $($RepoDirectories['langium_dsl_lab'])"
 Write-Host "Setup directory: $Automatic"
 # Keep state/data separate from the discovered repositories.
 $State = Join-Path $Automatic 'state'
-$Tools = Join-Path $Automatic 'tools'
 $Downloads = Join-Path $Automatic 'downloads'
 $Data = Join-Path $Automatic 'data\2026-10-05'
 $Profile = Join-Path $Automatic 'editor-profile'
@@ -1032,10 +1668,10 @@ foreach ($directory in @($Root, $State, "$Tools\sbt\bin", $Downloads, "$Data\rrf
 $HealthFile = Join-Path $State 'health.json'
 Save-Json $HealthFile @{ status = 'running'; startedAt = (Get-Date).ToUniversalTime().ToString('o') }
 # Protect local setup state; existing database credentials are never persisted here.
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-Run { icacls.exe $State '/inheritance:r' '/grant:r' "${identity}:(OI)(CI)F" 'SYSTEM:(OI)(CI)F' } | Out-Null
+Protect-BootstrapState $State
 if (-not $env:PGPASSWORD) {
-    $securePassword = Read-Host "Existing PostgreSQL password for $DbUser" -AsSecureString
+    if (-not (Test-BootstrapInteractive)) { throw 'Supply the lab password via PGPASSWORD for a noninteractive run.' }
+    $securePassword = Read-Host "PostgreSQL lab password for $DbUser" -AsSecureString
     try { $env:PGPASSWORD = [System.Net.NetworkCredential]::new('', $securePassword).Password }
     finally { $securePassword.Dispose(); Remove-Variable securePassword }
     if (-not $env:PGPASSWORD) { throw 'A PostgreSQL password is required by the Scala application.' }
@@ -1049,6 +1685,9 @@ $env:PGCONNECT_TIMEOUT = '10'
 # redirect only psql to another server. The original values are restored on exit.
 $env:PGSSLMODE = 'disable'
 Remove-Item Env:PGHOSTADDR, Env:PGSERVICE -ErrorAction SilentlyContinue
+
+# Verify the selected database before network synchronization or builds.
+Open-LabDatabase
 
 # Work from Root so a managed checkout is not the current directory while moved.
 Set-Location -LiteralPath $Root
@@ -1065,119 +1704,76 @@ if ((Get-FileHash -LiteralPath $UpdatedScript -Algorithm SHA256).Hash -ne $Entry
     $next = @{ Root = $Root; Port = $Port; ContainerName = $ContainerName; VolumeName = $VolumeName; ScalaBranch = $ScalaBranch; LangiumBranch = $LangiumBranch; NoEditor = [bool]$NoEditor; StartupTimeoutSeconds = $StartupTimeoutSeconds; RelaunchCount = ($RelaunchCount + 1) }
     $next.ScalaRepoPath = $Scala; $next.LangiumRepoPath = $RepoDirectories['langium_dsl_lab']; $next.SetupPath = $Automatic
     $next.UseDocker = [bool]$UseDocker
-    foreach ($option in @('JavaPath', 'NodePath', 'GitPath', 'CodePath', 'AdditionalSearchPath', 'SessionOnlyEnvironment')) {
+    foreach ($option in @('JavaPath', 'NodePath', 'NpmPath', 'SbtLauncherPath', 'AllowToolUpgrade', 'GitPath', 'CodePath', 'AdditionalSearchPath', 'SessionOnlyEnvironment')) {
         if ($PSBoundParameters.ContainsKey($option)) { $next[$option] = $PSBoundParameters[$option] }
     }
     if (-not $UseDocker) {
         $next.PgHost = $PgHost; $next.Database = $Database; $next.DbUser = $DbUser
-        $next.PsqlPath = $PsqlPath; $next.PgServiceName = $PgServiceName
+        if ($PSBoundParameters.ContainsKey('PsqlPath')) { $next.PsqlPath = $PsqlPath }; $next.PgServiceName = $PgServiceName
+        if ($ProvisionDatabase) { $next.ProvisionDatabase = $true; $next.PgAdminUser = $PgAdminUser }
     }
     & $UpdatedScript @next
     return
 }
-# get the scala launcher
-$Launcher = Join-Path $Tools 'sbt\bin\sbt-launch.jar'
-if (-not (Test-Path $Launcher)) { Invoke-WebRequest -UseBasicParsing 'https://repo.maven.apache.org/maven2/org/scala-sbt/sbt-launch/1.10.2/sbt-launch-1.10.2.jar' -OutFile $Launcher }
-if ((Get-FileHash $Launcher).Hash -ne 'cdd6963b622f42690cb2e3154bde3f3257a03839f216e1b5d7420000d6a71817') { throw 'sbt launcher checksum failed.' }
-Save-Json "$Tools\layout.json" @{ javaHome = $JavaHome; nodeHome = $NodeHome; sbtHome = "$Tools\sbt" }
-# Verify actual packages; lockfile timestamps are not installation evidence.
-$DependencyCheck = @'
-// Exit 0 = verified, 10 = genuinely missing packages, 20 = incompatible/incomplete.
-const fs = require('node:fs');
-const path = require('node:path');
-const root = process.cwd();
-const missing = [], errors = [];
-function json(file) { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-function safe(relative) {
-    const absolute = path.resolve(root, relative);
-    if (!absolute.startsWith(root + path.sep)) throw Error(`Lock path escapes workspace: ${relative}`);
-    return absolute;
+# Inspect the project's exact Scala compiler before a launcher probe can resolve it.
+$compilerCheck = Join-Path $Scala 'scripts\check-scala.cjs'
+& $selectedTools.Node.path $compilerCheck $Scala --fast
+$compilerStatus = $LASTEXITCODE
+if ($compilerStatus -eq 12) {
+    $scalaCandidates = @((Get-ToolInventory).Scala)
+    if ($script:ToolSearchErrors.Shared.Count) { throw "Scala installation discovery was incomplete: $($script:ToolSearchErrors.Shared -join '; ')" }
+    # Windows limits command-line length; the inventory may contain thousands of paths.
+    $inventoryFile = Join-Path $State ('scala-inventory-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        [IO.File]::WriteAllText($inventoryFile, (ConvertTo-Json -Compress -InputObject @($scalaCandidates)), $Utf8)
+        & $selectedTools.Node.path $compilerCheck $Scala --inventory-file $inventoryFile
+        $compilerStatus = $LASTEXITCODE
+    } finally {
+        if (Test-Path -LiteralPath $inventoryFile) { Remove-Item -LiteralPath $inventoryFile -Force }
+    }
 }
-function eligible(entry) {
-    for (const [field, actual] of [['os', process.platform], ['cpu', process.arch]]) {
-        if (!entry[field]) continue;
-        const list = Array.isArray(entry[field]) ? entry[field] : [entry[field]];
-        if (list.includes('!' + actual) || (list.some(x => !x.startsWith('!')) && !list.includes(actual) && !list.includes('any'))) return false;
+if ($compilerStatus -eq 11) {
+    if (-not (Confirm-ToolUpgrade 'Scala project compiler' 'Allow sbt to obtain the compiler pinned in build.sbt for this workspace, preserving the installed Scala?')) {
+        throw 'Scala project compiler change declined.'
     }
-    if (entry.libc && process.platform === 'linux') {
-        const libc = process.report.getReport().header.glibcVersionRuntime ? 'glibc' : 'musl';
-        const list = Array.isArray(entry.libc) ? entry.libc : [entry.libc];
-        if (list.includes('!' + libc) || (list.some(x => !x.startsWith('!')) && !list.includes(libc) && !list.includes('any'))) return false;
-    }
-    return true;
-}
-try {
-    const lock = json('package-lock.json');
-    if (![2, 3].includes(lock.lockfileVersion) || !lock.packages) throw Error('A v2/v3 package-lock.json is required.');
-    for (const [relative, entry] of Object.entries(lock.packages)) {
-        if (entry.optional && !eligible(entry)) continue;
-        if (!relative || !relative.split('/').includes('node_modules')) {
-            const manifest = json(relative ? path.join(safe(relative), 'package.json') : 'package.json');
-            if (entry.version && manifest.version !== entry.version) errors.push(`${relative || '.'}: workspace version disagrees with lock`);
-            for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
-                const normalized = object => JSON.stringify(Object.entries(object || {}).sort(([a], [b]) => a.localeCompare(b)));
-                if (normalized(manifest[field]) !== normalized(entry[field])) errors.push(`${relative || '.'}: ${field} disagrees with lock`);
-            }
-            continue;
-        }
-        const location = safe(relative);
-        let stat;
-        try { stat = fs.lstatSync(location); }
-        catch (error) { if (error.code === 'ENOENT') { missing.push(relative); continue; } throw error; }
-        if (entry.link) {
-            const target = safe(entry.resolved);
-            if (!stat.isSymbolicLink() || fs.realpathSync(location) !== fs.realpathSync(target)) errors.push(`${relative}: wrong workspace link`);
-            continue;
-        }
-        if (!stat.isDirectory() || stat.isSymbolicLink()) { errors.push(`${relative}: unexpected installation path`); continue; }
-        let manifest;
-        try { manifest = json(path.join(location, 'package.json')); }
-        catch (error) { errors.push(`${relative}: installed directory is incomplete (${error.code || error.message})`); continue; }
-        if (manifest.version !== entry.version) errors.push(`${relative}: installed ${manifest.version}, locked ${entry.version}`);
-        const bins = typeof manifest.bin === 'string' ? {[manifest.name.split('/').pop()]: manifest.bin} : manifest.bin || {};
-        for (const [name, executable] of Object.entries(bins)) {
-            if (!fs.existsSync(path.resolve(location, executable))) errors.push(`${relative}: missing executable ${executable}`);
-            const modules = location.slice(0, location.lastIndexOf(path.sep + 'node_modules' + path.sep)) + path.sep + 'node_modules';
-            const shim = path.join(modules, '.bin', name + (process.platform === 'win32' ? '.cmd' : ''));
-            if (!fs.existsSync(shim)) missing.push(path.relative(root, shim));
-        }
-    }
-    if (errors.length) {
-        console.error('Dependencies are incompatible/incomplete; explicitly reconcile them before retrying. No installation attempted.\n' + errors.slice(0, 30).join('\n'));
-        process.exitCode = 20;
-    } else if (missing.length) {
-        console.log(`Missing dependency entries (${missing.length}): ${missing.slice(0, 20).join(', ')}`);
-        process.exitCode = 10;
-    } else console.log('All locked dependency versions and workspace links are installed; skipping npm installation.');
-} catch (error) { console.error(`Dependency discovery inconclusive: ${error.message}`); process.exitCode = 20; }
-
-'@
+} elseif ($compilerStatus -ne 0) { throw 'Scala compiler discovery was inconclusive.' }
+# Select the launcher once; both the build and the editor use this verified path.
+$Launcher = Resolve-SbtLauncher (Join-Path $Tools 'sbt\bin\sbt-launch.jar')
+$SbtHome = Split-Path (Split-Path $Launcher -Parent) -Parent
+[Environment]::SetEnvironmentVariable('SBT_HOME', $SbtHome, 'Process')
+if (-not $SessionOnlyEnvironment -and [Environment]::GetEnvironmentVariable('SBT_HOME','User') -ne $SbtHome) { [Environment]::SetEnvironmentVariable('SBT_HOME', $SbtHome, 'User') }
+Save-Json "$Tools\layout.json" ([ordered]@{ javaHome = $JavaHome; nodeHome = $NodeHome; sbtHome = $SbtHome })
+# The verifier and the project are from the same synced Scala checkout.
+$workspaceCheck = Join-Path $Scala 'scripts\check-workspace.cjs'
 Push-Location $Langium
 try {
-    $DependencyCheck | node.exe -
+    & $selectedTools.Node.path $workspaceCheck check
     $dependencyStatus = $LASTEXITCODE
-    if ($dependencyStatus -eq 10) {
-        $manifestFiles = @('package.json', 'package-lock.json') + @(Get-ChildItem -LiteralPath 'packages' -Directory | ForEach-Object { Join-Path $_.FullName 'package.json' } | Where-Object { Test-Path -LiteralPath $_ })
-        $manifestHashes = @{}
-        foreach ($file in $manifestFiles) { $manifestHashes[$file] = (Get-FileHash -LiteralPath $file).Hash }
-        # npm install preserves a healthy tree; --no-save keeps source manifests
-        # fixed. Lifecycle scripts are disabled; build/runtime checks follow.
-        Run { npm.cmd install --no-save --ignore-scripts --include=dev --no-audit --no-fund } | Out-Host
-        foreach ($file in $manifestFiles) {
-            if ((Get-FileHash -LiteralPath $file).Hash -ne $manifestHashes[$file]) { throw "npm changed source manifest '$file'; inspect it before proceeding." }
+    if ($dependencyStatus -in @(10, 11)) {
+        $globalRoot = & $selectedTools.Node.npm root --global
+        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the selected npm global prefix.' }
+        & $selectedTools.Node.path $workspaceCheck inspect-globals $globalRoot
+        $globalStatus = $LASTEXITCODE
+        if ($globalStatus -notin @(0, 11)) { throw 'Global Langium discovery was inconclusive.' }
+        if (($dependencyStatus -eq 11 -or $globalStatus -eq 11) -and
+            -not (Confirm-ToolUpgrade 'Langium workspace' 'Install the versions in package-lock.json in this workspace? Global packages will be preserved.')) {
+            throw 'Workspace dependency version change declined.'
         }
-        Run { $DependencyCheck | node.exe - } | Out-Host
-    } elseif ($dependencyStatus -ne 0) { throw 'Dependency verification failed; no automatic reconciliation is permitted.' }
-    Run { npm.cmd run langium:generate } | Out-Host
-    Run { npm.cmd run build } | Out-Host
+        $before = Run { & $selectedTools.Node.path $workspaceCheck snapshot }
+        Run { & $selectedTools.Node.path $workspaceCheck prepare-install $globalRoot $selectedTools.Node.npm } | Out-Host
+        Run { & $selectedTools.Node.npm install --prefer-offline --no-save --ignore-scripts --include=dev --no-audit --no-fund } | Out-Host
+        $after = Run { & $selectedTools.Node.path $workspaceCheck snapshot }
+        if ($after -ne $before) { throw 'npm changed a source manifest; inspect the changes before proceeding.' }
+        Run { & $selectedTools.Node.path $workspaceCheck check } | Out-Host
+    } elseif ($dependencyStatus -ne 0) { throw 'Workspace discovery was inconclusive. Inspect the reported entries.' }
+    Run { & $selectedTools.Node.npm run langium:generate } | Out-Host
+    Run { & $selectedTools.Node.npm run build } | Out-Host
 } finally { Pop-Location }
 foreach ($artifact in @('packages\language\out\index.js', 'packages\extension\out\extension\main.cjs', 'packages\extension\out\language\main.cjs', 'packages\extension\syntaxes\clinical-dsl.tmLanguage.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $Langium $artifact))) { throw "Missing build artifact: $artifact" }
 }
 
 if (-not $NoEditor) { Assert-CodeEngine $selectedTools.Code.path $Langium }
-Ensure-LocalPostgres
-Assert-Postgres
 # skip the import if this data is ready
 # Reuse a ready Full or prescribable archive only when release, policies and
 # recorded base/product provenance agree. Authentication failures remain fatal.
@@ -1193,30 +1789,19 @@ AND p.sha256_json::jsonb->>'RXNREL.RRF'=r.sha256_json::jsonb->>'RXNREL.RRF';
 "@
 # Missing schema is a normal first-install state. Authentication/SQL failures
 # must not be swallowed and mistaken for an absent import.
-$hasManifest = Invoke-DatabaseSql "SELECT CASE WHEN to_regclass('rxnorm_lab.release') IS NOT NULL AND to_regclass('rxnorm_lab.product_release') IS NOT NULL THEN 1 ELSE 0 END;"
-$ready = ''
-if ($hasManifest -eq '1') { $ready = Invoke-DatabaseSql $query }
-if ($ready -ne '1') {
-    $hasBase = Invoke-DatabaseSql "SELECT CASE WHEN to_regclass('rxnorm_lab.release') IS NOT NULL THEN 1 ELSE 0 END;"
-    if ($hasBase -eq '1') {
-        $existingRelease = Invoke-DatabaseSql "SELECT count(*) FROM rxnorm_lab.release WHERE release='2026-10-05';"
-        if ($existingRelease -ne '0') {
-            throw 'The local 2026-10-05 import is incomplete or incompatible. Complete it using its original matching RxNorm archive (README section 7), or select a separate empty database. No existing release was replaced.'
-        }
+$manifest = Invoke-DatabaseSql "SELECT CASE WHEN to_regclass('rxnorm_lab.release') IS NULL THEN 'empty' WHEN to_regclass('rxnorm_lab.product_release') IS NULL THEN 'base' ELSE 'both' END;"
+$ready = $false
+if ($manifest -eq 'both') { $ready = (Invoke-DatabaseSql $query) -eq '1' }
+$ImportCommands = @()
+if (-not $ready) {
+    if ($manifest -ne 'empty' -and (Invoke-DatabaseSql "SELECT count(*) FROM rxnorm_lab.release WHERE release='2026-10-05';") -ne '0') {
+        throw 'The local 2026-10-05 import is incomplete or incompatible. Complete it using its original matching RxNorm archive (README section 7), or select a separate empty database. No existing release was replaced.'
     }
-}
-if ($ready -ne '1') {
-    # download and import the rxnorm files
-    $Zip = Join-Path $Downloads 'RxNorm_full_prescribe_10052026.zip'
-    if (-not (Test-Path $Zip)) { Invoke-WebRequest -UseBasicParsing 'https://download.nlm.nih.gov/rxnorm/RxNorm_full_prescribe_10052026.zip' -OutFile $Zip }
-    if ((Get-FileHash $Zip).Hash -ne '8ed351c29f3cb56bedeb8e2bcb8fa56931f8d7eb88e2280dc9772d7d3eb16977') { throw 'RxNorm download checksum failed.' }
-    Expand-Archive -LiteralPath $Zip -DestinationPath $Data -Force
-    $rrf = ConvertTo-SbtPath (Join-Path $Data 'rrf')
-    Invoke-Sbt @('compile', "run import-rxnorm $rrf 2026-10-05", "run import-product-attributes $rrf 2026-10-05")
-    Invoke-DatabaseSql 'ANALYZE;' | Out-Host
-} else { Write-Host 'RxNorm is already imported.' }
-$verified = Invoke-DatabaseSql $query
-if ($verified -ne '1') { throw 'RxNorm release/product index verification failed after import.' }
+    $rrfDirectory = Join-Path $Data 'rrf'
+    Get-RxNormFiles $rrfDirectory (Join-Path $Downloads 'RxNorm_full_prescribe_10052026.zip')
+    $rrf = ConvertTo-SbtPath $rrfDirectory
+    $ImportCommands = @("run import-rxnorm $rrf 2026-10-05", "run import-product-attributes $rrf 2026-10-05")
+} else { Write-Host 'Verified RxNorm import reused.' }
 
 # leave an existing demo file alone
 $Demo = Join-Path $Automatic 'aspirin-demo.clinical'
@@ -1226,7 +1811,7 @@ $SmokeName = 'smoke-' + [guid]::NewGuid().ToString('N')
 $Smoke = Join-Path $State $SmokeName
 New-Item -ItemType Directory -Path $Smoke | Out-Null
 $fixture = "Patient P9999: age 30, condition Fever`nMedication aspirin: 100 mg, strength 325 mg, doseForm Oral Tablet, route PO, frequency PRN`nPlan DemoPlan: for P9999, prescribe aspirin`nshow DemoPlan`n"
-$SmokeCommands = @('compile', 'test')
+$SmokeCommands = @('test') + $ImportCommands
 foreach ($case in @('valid', 'invalid')) {
     $text = $fixture
     if ($case -eq 'invalid') { $text = $text.Replace('strength 325 mg', 'strength 32500 mg') }
@@ -1240,7 +1825,12 @@ foreach ($case in @('valid', 'invalid')) {
     $resultArg = ConvertTo-SbtPath $resultFile
     $SmokeCommands += "run resolve $astArg $resultArg"
 }
+# test compiles the project. The same sbt process runs both imports before resolution.
 Invoke-Sbt $SmokeCommands
+if ($ImportCommands.Count) {
+    Invoke-DatabaseSql 'ANALYZE;' | Out-Host
+    if ((Invoke-DatabaseSql $query) -ne '1') { throw 'RxNorm release/product index verification failed after import.' }
+}
 foreach ($case in @('valid', 'invalid')) {
     $resultFile = Join-Path $Smoke "$case.result.json"
     $report = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
@@ -1256,125 +1846,10 @@ foreach ($case in @('valid', 'invalid')) {
     }
     Write-Host "PASS: $case .clinical -> Langium -> Scala -> PostgreSQL/RxNorm"
 }
-# Keep the real language-server readiness check inside this bootstrap. Pipe its
-# code to Node over stdin; do not create or depend on a separate test/helper file.
-$LspCheck = @'
-// Inline readiness probe: no separate helper or test file is required.
-import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-
-async function probeLanguageServer({ serverPath, documentPath, timeoutMs = 30000 }) {
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('Invalid probe timeout.');
-    const absoluteDocument = path.resolve(documentPath);
-    const text = await readFile(absoluteDocument, 'utf8');
-    const uri = pathToFileURL(absoluteDocument).href;
-    const normalize = value => process.platform === 'win32' ? value.toLowerCase() : value;
-    const sameDocument = value => {
-        try { return normalize(path.resolve(fileURLToPath(value))) === normalize(absoluteDocument); }
-        catch { return false; }
-    };
-    return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [path.resolve(serverPath), '--stdio'], {
-            cwd: path.dirname(absoluteDocument), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true
-        });
-        let buffer = Buffer.alloc(0);
-        let stderr = '';
-        let initialized = false;
-        let validated = false;
-        let shutdown = false;
-        let failure;
-        const fail = error => {
-            failure ??= error instanceof Error ? error : new Error(String(error));
-            child.kill('SIGKILL');
-        };
-        const timer = setTimeout(() => fail(new Error(`Language server timed out after ${timeoutMs} ms.`)), timeoutMs);
-        function send(message) {
-            const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...message }), 'utf8');
-            child.stdin.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]));
-        }
-        function receive(message) {
-            if (message.method && message.id !== undefined) {
-                if (message.method === 'workspace/configuration') {
-                    send({ id: message.id, result: (message.params?.items ?? []).map(() => null) });
-                } else if (['client/registerCapability', 'window/workDoneProgress/create', 'workspace/workspaceFolders'].includes(message.method)) {
-                    send({ id: message.id, result: null });
-                } else {
-                    send({ id: message.id, error: { code: -32601, message: 'Not implemented by bootstrap probe' } });
-                }
-            } else if (message.id === 1) {
-                if (message.error || !message.result?.capabilities) throw new Error(`Language-server initialize failed: ${JSON.stringify(message.error ?? message.result)}`);
-                initialized = true;
-                send({ method: 'initialized', params: {} });
-                send({ method: 'textDocument/didOpen', params: { textDocument: { uri, languageId: 'clinical-dsl', version: 1, text } } });
-            } else if (message.method === 'textDocument/publishDiagnostics' && sameDocument(message.params?.uri) && initialized && !validated) {
-                if (message.params.version !== undefined && message.params.version !== 1) return;
-                if (!Array.isArray(message.params.diagnostics)) throw new Error('Malformed document diagnostics.');
-                const errors = message.params.diagnostics.filter(d => d.severity === 1);
-                if (errors.length) throw new Error(`Clinical document validation failed: ${errors.map(e => e.message).join('; ')}`);
-                validated = true;
-                send({ id: 2, method: 'shutdown', params: null });
-            } else if (message.id === 2) {
-                if (!validated || message.error || message.result !== null) throw new Error('Language-server shutdown failed.');
-                shutdown = true;
-                send({ method: 'exit' });
-                child.stdin.end();
-            }
-        }
-        child.stdout.on('data', chunk => {
-            if (failure) return;
-            try {
-                buffer = Buffer.concat([buffer, chunk]);
-                if (buffer.length > 8 * 1024 * 1024) throw new Error('Language-server frame exceeds 8 MiB.');
-                while (true) {
-                    const boundary = buffer.indexOf('\r\n\r\n');
-                    if (boundary < 0) break;
-                    const header = buffer.subarray(0, boundary).toString('ascii');
-                    const match = /^Content-Length:\s*(\d+)\s*$/im.exec(header);
-                    if (!match) throw new Error('Invalid language-server Content-Length header.');
-                    const length = Number(match[1]);
-                    if (!Number.isSafeInteger(length) || length > 8 * 1024 * 1024) throw new Error('Invalid language-server frame size.');
-                    const end = boundary + 4 + length;
-                    if (buffer.length < end) break;
-                    const message = JSON.parse(buffer.subarray(boundary + 4, end).toString('utf8'));
-                    buffer = buffer.subarray(end);
-                    receive(message);
-                }
-            } catch (error) { fail(error); }
-        });
-        child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8000); });
-        child.stdin.on('error', fail);
-        child.on('error', fail);
-        child.on('close', (code, signal) => {
-            clearTimeout(timer);
-            if (failure) return reject(failure);
-            if (code !== 0 || !initialized || !validated || !shutdown) {
-                return reject(new Error(`Language server exited before readiness (code=${code}, signal=${signal}). ${stderr}`));
-            }
-            resolve({ initialized: true, validated: true, shutdown: true });
-        });
-        send({ id: 1, method: 'initialize', params: {
-            processId: process.pid, rootUri: null, workspaceFolders: null,
-            capabilities: { workspace: { configuration: false, workspaceFolders: false } }
-        } });
-    });
-}
-
-const [serverPath, documentPath] = process.argv.slice(2);
-if (!serverPath || !documentPath) {
-    console.error('Bootstrap language-server check requires server and document paths.');
-    process.exitCode = 1;
-} else {
-    probeLanguageServer({ serverPath, documentPath }).then(() => {
-        console.log('PASS: Node language server initialize -> .clinical diagnostics -> clean shutdown');
-    }).catch(error => { console.error(error.message); process.exitCode = 1; });
-}
-'@
-Run { $LspCheck | node.exe --input-type=module - "$Langium\packages\extension\out\language\main.cjs" "$Smoke\valid.clinical" } | Out-Host
-Assert-Postgres
+Run { node.exe "$Scala\scripts\probe-editor.mjs" lsp "$Langium\packages\extension\out\language\main.cjs" "$Smoke\valid.clinical" } | Out-Host
+if ((Invoke-DatabaseSql 'SELECT 1;') -ne '1') { throw 'Final authenticated PostgreSQL health check failed.' }
 # turn on auto-save and database checks
-$settings = @{}
+$settings = [ordered]@{}
 $settingsFile = Join-Path $Profile 'User\settings.json'
 if (Test-Path $settingsFile) { (Get-Content $settingsFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $settings[$_.Name] = $_.Value } }
 $requiredSettings = @{
@@ -1387,6 +1862,7 @@ $requiredSettings = @{
 }
 foreach ($key in $requiredSettings.Keys) { $settings[$key] = $requiredSettings[$key] }
 Save-Json $settingsFile $settings
+$autocomplete = Run { node.exe "$Scala\scripts\probe-editor.mjs" autocomplete $settingsFile }
 # open the demo in the editor
 if (-not $NoEditor) { Run { code.cmd --new-window --user-data-dir $Profile "--extensionDevelopmentPath=$Langium\packages\extension" $Langium $Demo } }
 Save-Json $HealthFile @{
@@ -1396,8 +1872,10 @@ Save-Json $HealthFile @{
     databaseMode = $DatabaseMode; pgHost = $PgHost; pgPort = $Port; pgDatabase = $Database; pgUser = $DbUser
     scala = 'incremental-compile-test-pass'; langium = 'incremental-generate-build-pass'
     clinicalValid = 'pass'; clinicalInvalid = 'pass'; languageServer = 'initialize-diagnostics-pass'
-    smokeDirectory = $Smoke; editorLaunchRequested = (-not $NoEditor)
+    autocomplete = $autocomplete; smokeDirectory = $Smoke; editorLaunchRequested = (-not $NoEditor)
 }
+& node.exe "$Scala\scripts\finish-smoke.mjs" $Smoke
+Write-Host "RxNorm autocomplete: $autocomplete. See $Scala\PRODUCT-AUTOCOMPLETE.md for the editor service."
 Write-Host "READY: repository updates, builds, PostgreSQL, RxNorm and runtime smoke tests passed."
 Write-Host "Demo: $Demo"
 Write-Host "Health report: $HealthFile"

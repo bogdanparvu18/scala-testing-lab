@@ -363,6 +363,8 @@ object PostgresStore:
       require(config.port > 0 && config.port <= 65535,"Invalid PGPORT")
       require(config.database.matches("[A-Za-z_][A-Za-z0-9_]*"),"PGDATABASE must be a simple database identifier")
       require(config.user.nonEmpty && config.password.nonEmpty,"PostgreSQL credentials must be nonempty")
+      // sbt may load each run in a new class loader after JDBC has discovered providers.
+      Class.forName("org.postgresql.Driver")
     }
     store = new PostgresStore(config)
     _ <- store.ensureSchema
