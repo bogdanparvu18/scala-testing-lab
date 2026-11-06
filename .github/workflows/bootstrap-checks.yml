@@ -1,0 +1,89 @@
+name: Bootstrap recovery checks
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'src/main/scala/lab/PostgresStore.scala'
+      - '.github/workflows/bootstrap-checks.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Check the Windows entry point and recovery paths
+        shell: pwsh
+        env:
+          CHECK_SHELL: ${{ matrix.shell }}
+        run: |
+          $engine = "$env:CHECK_SHELL.exe"
+          & $engine -NoProfile -NonInteractive -File scripts/bootstrap-windows.ps1 -Help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($test in Get-ChildItem scripts/tests/*.ps1) {
+            & $engine -NoProfile -NonInteractive -File $test.FullName
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Check recovery of project dependencies on Windows
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          $tests = @(Get-ChildItem scripts/tests/*.test.* | ForEach-Object FullName)
+          node --test @tests
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Check project-local recovery and the Linux container probes
+        run: |
+          node --test scripts/tests/*.test.*
+          bash -n scripts/bootstrap-unix.sh
+          shellcheck -S warning scripts/bootstrap-unix.sh
+          node_bin=$(node -p 'process.execPath')
+          docker run --rm -v "$PWD:/src:ro" -v "$node_bin:/usr/bin/node:ro" -w /src \
+            ubuntu:24.04 bash scripts/tests/runtime-tools.sh
+  grouped-postgres:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: scala_lab_ci
+          POSTGRES_USER: scala_lab
+          POSTGRES_PASSWORD: fixture_password
+        ports:
+          - 5432/tcp
+        options: --health-cmd="pg_isready -U scala_lab -d scala_lab_ci" --health-interval=5s --health-timeout=5s --health-retries=12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+      - name: Run both database fixtures in one sbt process
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: ${{ job.services.postgres.ports['5432'] }}
+          PGDATABASE: scala_lab_ci
+          PGUSER: scala_lab
+          PGPASSWORD: fixture_password
+        run: |
+          launcher="$RUNNER_TEMP/sbt-launch-1.10.2.jar"
+          curl --fail --location --retry 2 --silent --show-error \
+            https://repo.maven.apache.org/maven2/org/scala-sbt/sbt-launch/1.10.2/sbt-launch-1.10.2.jar -o "$launcher"
+          printf '%s  %s\n' cdd6963b622f42690cb2e3154bde3f3257a03839f216e1b5d7420000d6a71817 "$launcher" | sha256sum -c -
+          java -Dsbt.supershell=false -jar "$launcher" clean test \
+            'Test / runMain lab.ProductIntegrationCheck' \
+            'Test / runMain lab.ProductSearchIntegrationCheck'

@@ -7,6 +7,10 @@ The project connects a human-readable clinical language to explicit terminology 
 This is a personal integration laboratory for work that can later be adapted to Aurora's Scala/ZIO ecosystem. It keeps language tooling, terminology data access, and resolution policy separate.
 
 
+## Windows bootstrap
+
+From the repository root, run `.\scripts\bootstrap-windows.ps1` to prepare the native lab in `scripts\AuroraMedicationLab`, or `.\scripts\bootstrap-windows.ps1 --Docker` for the persistent Linux lab. Both modes look for usable installations and configure them before installing missing tools. When an installed version requires replacement, setup describes the change and asks for consent. Run with `-Help` for path overrides and PostgreSQL options. See the [Romanian guide to installation, recovery and upgrades](docs/bootstrap-windows.ro.md).
+
 ## Contents
 
 1. [Purpose and architecture](#1-purpose-and-architecture)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # aurora-container-runtime-v1
-# Linux half of bootstrap-windows.ps1 --Docker. The two scripts are self-contained.
+# Linux half of bootstrap-windows.ps1 --Docker.
 set -euo pipefail
 umask 077
 ROOT=/workspace
@@ -9,9 +9,13 @@ LANGIUM_BRANCH=main
 STARTUP_TIMEOUT=180
 CONTAINER_RUNTIME=0
 RELAUNCH_COUNT=0
+ALLOW_TOOL_UPGRADE=0
+NON_INTERACTIVE=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --container-runtime) CONTAINER_RUNTIME=1; shift ;;
+        --allow-tool-upgrade) ALLOW_TOOL_UPGRADE=1; shift ;;
+        --non-interactive) NON_INTERACTIVE=1; shift ;;
         --root|--scala-branch|--langium-branch|--startup-timeout|--relaunch-count)
             [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 1; }
             case "$1" in
@@ -22,7 +26,7 @@ while [ "$#" -gt 0 ]; do
                 --relaunch-count) RELAUNCH_COUNT=$2 ;;
             esac
             shift 2 ;;
-        --help) echo 'Linux runtime worker: bootstrap-unix.sh --container-runtime --root /workspace [--scala-branch NAME] [--langium-branch NAME] [--startup-timeout SECONDS]. Start with bootstrap-windows.ps1 --Docker; tools and repositories remain in the persistent Linux runtime.'; exit 0 ;;
+        --help) echo 'Linux runtime worker: bootstrap-unix.sh --container-runtime --root /workspace [--scala-branch NAME] [--langium-branch NAME] [--startup-timeout SECONDS] [--allow-tool-upgrade] [--non-interactive]. Start with bootstrap-windows.ps1 --Docker; tools and repositories remain in the persistent Linux runtime.'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -31,7 +35,10 @@ done
 [[ "$RELAUNCH_COUNT" =~ ^[012]$ ]] || { echo 'Invalid relaunch count.' >&2; exit 1; }
 # Package names below are reviewed for this seed; do not guess at a different OS.
 . /etc/os-release
-[ "$ID" = ubuntu ] && [ "$VERSION_ID" = 24.04 ] || { echo 'The existing runtime image is incompatible: Ubuntu 24.04 is required. No packages were changed.' >&2; exit 1; }
+case "$ID" in
+    ubuntu|debian) ;;
+    *) echo 'Ubuntu or Debian is required for reliable package inventory. Ubuntu 24.04 is the supported APT installation environment.' >&2; exit 1 ;;
+esac
 [ "$ROOT" = /workspace ] || { echo 'The persistent runtime mount must be /workspace.' >&2; exit 1; }
 [ ! -L "$ROOT" ] && [ -d "$ROOT" ] || { echo 'Persistent workspace is missing or linked.' >&2; exit 1; }
 RUNTIME="$ROOT/medication-lab-setup/automatic"
@@ -52,13 +59,31 @@ finish_runtime() {
 }
 trap finish_runtime EXIT
 printf '{"status":"running"}\n' > "$HEALTH"
-[ "${PGHOST:-}" = 127.0.0.1 ] && [ "${PGPORT:-}" = 5432 ] && [ "${PGDATABASE:-}" = rxnorm_public ] && [ "${PGUSER:-}" = rxnorm_lab ] && [ -n "${PGPASSWORD:-}" ] || { echo 'Runtime PostgreSQL configuration is missing/incompatible. Recover the matching container and credentials.' >&2; exit 1; }
+# Both managed and host-network runtimes use the application's loopback-only contract.
+if [[ ${PGHOST:-} != 127.0.0.1 && ${PGHOST:-} != ::1 ]] ||
+   ! [[ ${PGPORT:-} =~ ^[1-9][0-9]{0,4}$ ]] || ((PGPORT > 65535)) ||
+   ! [[ ${PGDATABASE:-} =~ ^[A-Za-z_][A-Za-z_0-9]{0,62}$ ]] ||
+   [[ -z ${PGUSER:-} || -z ${PGPASSWORD:-} ]]; then
+    echo 'Select a loopback PostgreSQL endpoint, valid port/database and the existing credentials.' >&2
+    exit 1
+fi
 export PGCONNECT_TIMEOUT=10 PGSSLMODE=disable
 unset PGHOSTADDR PGSERVICE
 
-# Runtime tooling lives in the persistent container. Host binaries are never used.
-tool_fail() { printf '%s\n' "Tool discovery: $*" >&2; return 1; }
+# Selection is scoped to this Linux runtime. A stale PATH does not imply absence.
+tool_fail() { printf 'Tool discovery: %s\n' "$*" >&2; return 1; }
 version_at_least() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]; }
+confirm_tool_upgrade() {
+    local action=$1 answer
+    if [ "${ALLOW_TOOL_UPGRADE:-0}" = 1 ]; then printf 'Approved by --allow-tool-upgrade: %s\n' "$action" >&2; return 0; fi
+    if [ "${NON_INTERACTIVE:-0}" = 1 ] || [ ! -t 0 ]; then
+        tool_fail "$action requires consent. Rerun interactively or pass --allow-tool-upgrade."
+        return 1
+    fi
+    printf '%s? [y/N] ' "$action" >&2
+    IFS= read -r answer || return 1
+    [[ "$answer" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
+}
 prepend_tool_path() {
     local directory=$1 entry rebuilt=$1
     local -a entries
@@ -69,182 +94,214 @@ prepend_tool_path() {
     export PATH="$rebuilt"
 }
 
-# One shared inventory is reused by all probes; only a successful installation
-# invalidates it. find does not follow directory symlinks into unrelated trees.
 TOOL_INVENTORY_READY=0
 TOOL_DISCOVERY_ERRORS=''
 declare -a TOOL_INVENTORY=()
 build_tool_inventory() {
     [ "$TOOL_INVENTORY_READY" = 0 ] || return 0
-    TOOL_INVENTORY=()
-    TOOL_DISCOVERY_ERRORS=''
     local directory results errors entry
+    local -A explicit=()
+    local -a additional=() roots=("$TOOLS" /opt /usr/local /usr/lib/jvm /usr/lib/postgresql /usr/share/sbt /usr/share/java
+        "$HOME/.local/bin" "${SDKMAN_CANDIDATES_DIR:-$HOME/.sdkman/candidates}" "${NVM_DIR:-$HOME/.nvm}/versions/node"
+        "${VOLTA_HOME:-$HOME/.volta}/tools/image" "${FNM_DIR:-$HOME/.local/share/fnm}/node-versions"
+        "${ASDF_DATA_DIR:-$HOME/.asdf}/installs" "${MISE_DATA_DIR:-$HOME/.local/share/mise}/installs"
+        /home/linuxbrew/.linuxbrew/opt)
+    IFS=: read -r -a additional <<< "${AURORA_TOOL_SEARCH_PATH:-}"
+    for directory in "${additional[@]}"; do [ -z "$directory" ] || explicit[$directory]=1; done
+    TOOL_INVENTORY=(); TOOL_DISCOVERY_ERRORS=''
     results=$(mktemp); errors=$(mktemp)
-    for directory in "$TOOLS" /opt /usr/local /usr/lib/jvm /usr/lib/postgresql /usr/share/sbt /usr/share/java /root/.local /root/.sdkman/candidates /root/.sbt/launchers; do
-        if [ -L "$directory" ]; then
-            TOOL_DISCOVERY_ERRORS="$TOOL_DISCOVERY_ERRORS Skipped linked search root: $directory."
+    for directory in "${roots[@]}" "${additional[@]}"; do
+        [ -n "$directory" ] || continue
+        if [ -L "$directory" ] && [ ! -d "$directory" ]; then
+            TOOL_DISCOVERY_ERRORS+=" Unresolved search root: $directory."; continue
+        fi
+        if [ ! -d "$directory" ]; then
+            if [ -n "${explicit[$directory]:-}" ]; then TOOL_DISCOVERY_ERRORS+=" Configured search directory is unavailable: $directory."; fi
             continue
         fi
-        [ ! -e "$directory" ] || {
-            if ! find -P "$directory" \( -type f -o -type l \) \( -name java -o -name node -o -name npm -o -name git -o -name psql -o -name pg_isready -o -name sbt -o -name 'sbt-launch*.jar' -o -name curl -o -name unzip -o -name xz \) -print >> "$results" 2>> "$errors"; then
-                TOOL_DISCOVERY_ERRORS="$TOOL_DISCOVERY_ERRORS Search incomplete under $directory."
-            fi
-        }
+        # -H resolves an explicitly named root. Never recursively chase symlink cycles.
+        find -H "$directory" \( -type f -o -type l \) \( -name java -o -name node -o -name npm -o -name npm-cli.js -o -name git -o -name psql -o -name pg_isready -o -name sbt -o -name 'sbt-launch*.jar' -o -name curl -o -name unzip -o -name xz \) -print0 >> "$results" 2>> "$errors" || TOOL_DISCOVERY_ERRORS+=" Search incomplete under $directory."
     done
-    if [ -s "$errors" ]; then TOOL_DISCOVERY_ERRORS="$TOOL_DISCOVERY_ERRORS $(cat "$errors")"; fi
-    while IFS= read -r entry; do TOOL_INVENTORY+=("$entry"); done < "$results"
+    [ ! -s "$errors" ] || TOOL_DISCOVERY_ERRORS+=" $(cat "$errors")"
+    while IFS= read -r -d '' entry; do TOOL_INVENTORY+=("$entry"); done < "$results"
     rm -f "$results" "$errors"
     TOOL_INVENTORY_READY=1
 }
-
 PACKAGE_DATABASE_READY=0
 check_package_database() {
     [ "$PACKAGE_DATABASE_READY" = 0 ] || return 0
     if [ ! -r /var/lib/dpkg/status ] || ! dpkg-query -W -f='${binary:Package}\n' >/dev/null 2>&1; then
-        tool_fail 'Package database cannot be read reliably. Discovery is inconclusive; no installation is allowed.'
+        tool_fail 'Package database cannot be read reliably. Discovery is inconclusive.'
         return 4
     fi
     PACKAGE_DATABASE_READY=1
 }
-
 installed_package_evidence() {
-    # Query exit 1 means a requested package is absent; a database error does not.
     local output status
     if output=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' "$@" 2>/dev/null); then :; else
-        status=$?
-        [ "$status" = 1 ] || return 4
+        status=$?; [ "$status" = 1 ] || return 4
     fi
-    # Config files left after an uninstall are not an installed executable.
-    printf '%s\n' "$output" | awk 'NF >= 2 && $2 != "not-installed" && $2 != "config-files" { print $1 " (" $2 ")" }'
+    printf '%s\n' "$output" | awk 'NF >= 2 && $2 != "not-installed" && $2 != "config-files" { print $1 }'
 }
 
 probe_runtime_tool() {
-    local tool=$1 executable=$2 output version
-    [ -x "$executable" ] || return 1
+    local tool=$1 executable=$2 output version major home minimum npm_node_dir="${NODE_HOME:-}/bin"
+    [ -f "$executable" ] && [ -x "$executable" ] || return 1
     case "$tool" in
         java)
-            output=$(timeout 20 "$executable" -version 2>&1) || return 1
-            version=$(printf '%s\n' "$output" | sed -n 's/.*version "\([0-9][0-9.]*\).*/\1/p' | head -n 1)
-            [ "${version%%.*}" = 21 ] || return 1 ;;
+            output=$(timeout 20 "$executable" -XshowSettings:properties -version 2>&1) || return 1
+            version=$(sed -n 's/^ *java.version = //p' <<< "$output")
+            home=$(sed -n 's/^ *java.home = //p' <<< "$output")
+            major=${version%%[.-]*}
+            [ -x "$home/bin/java" ] && [[ "$major" =~ ^[0-9]+$ ]] && [ "$major" -ge 11 ] || { printf '%s' "${version:-incomplete JVM}"; return 1; }
+            if [ "${KNOWN_JDK_ONLY:-0}" = 1 ] && [ "$major" != 11 ] && [ "$major" != 17 ] && [ "$major" != 21 ]; then printf '%s' "$version"; return 1; fi
+            printf '%s\t%s\n' "$version" "$home"; return 0 ;;
         node)
-            output=$(timeout 20 "$executable" --version 2>&1) || return 1
-            version=${output#v}
-            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_at_least "$version" 22.12.0 || return 1 ;;
+            output=$(timeout 20 "$executable" -p 'process.versions.node + "\t" + process.execPath') || return 1
+            IFS=$'\t' read -r version home <<< "$output"; major=${version%%.*}
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && { [ "$major" -ge 24 ] || { [ "$major" = 22 ] && version_at_least "$version" 22.12.0; }; } || { printf '%s' "$version"; return 1; }
+            [ -f "$home" ] && [ -x "$home" ] || return 1
+            printf '%s\t%s\n' "$version" "$home"; return 0 ;;
         npm)
-            version=$(timeout 20 "$executable" --version 2>/dev/null) || return 1
-            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_at_least "$version" 10.2.3 || return 1 ;;
-        git)
+            version=$(PATH="$npm_node_dir:$PATH" timeout 20 "$executable" --version 2>/dev/null) || return 1
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_at_least "$version" 10.2.3 || { printf '%s' "$version"; return 1; } ;;
+        git|psql|pg_isready)
             output=$(timeout 20 "$executable" --version 2>&1) || return 1
-            version=$(printf '%s\n' "$output" | sed -n 's/^git version \([0-9][0-9.]*\).*/\1/p')
-            [ -n "$version" ] && version_at_least "$version" 2.25.0 || return 1 ;;
-        psql|pg_isready)
-            output=$(timeout 20 "$executable" --version 2>&1) || return 1
-            version=$(printf '%s\n' "$output" | sed -n 's/.*PostgreSQL) \([0-9][0-9.]*\).*/\1/p')
-            [ -n "$version" ] && version_at_least "$version" 16 || return 1 ;;
-        sbt)
-            output=$(timeout 30 "$executable" --script-version 2>&1) || return 1
-            version=$(printf '%s\n' "$output" | sed -n 's/^\(1\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' | tail -n 1)
-            [ "$version" = 1.10.2 ] || return 1 ;;
+            if [ "$tool" = git ]; then
+                version=$(sed -n 's/^git version \([0-9][0-9.]*\).*/\1/p' <<< "$output"); minimum=2.25.0
+            else
+                version=$(sed -n 's/.*PostgreSQL) \([0-9][0-9.]*\).*/\1/p' <<< "$output"); minimum=15
+            fi
+            [ -n "$version" ] && version_at_least "$version" "$minimum" || { printf '%s' "$version"; return 1; } ;;
         curl|unzip|xz)
             if [ "$tool" = unzip ]; then output=$(timeout 20 "$executable" -v 2>&1) || return 1
             else output=$(timeout 20 "$executable" --version 2>&1) || return 1; fi
-            version=$(printf '%s\n' "$output" | head -n 1) ;;
-        *) tool_fail "Unknown tool: $tool"; return 1 ;;
+            version=${output%%$'\n'*} ;;
+        *) return 1 ;;
     esac
     printf '%s\n' "$version"
 }
 
-# Return 0 compatible, 3 absent, 2 incompatible/incomplete, 4 inconclusive.
-# Keep diagnostics separate from output: TOOL_SELECTED is the selected executable.
-discover_runtime_tool() {
-    local tool=$1 hint=${2:-} candidate version directory package_evidence evidence=''
-    local -a candidates=() packages=()
-    local -A seen=()
-    TOOL_SELECTED=''
-    check_package_database || return 4
-    if [ -n "$hint" ]; then candidates+=("$hint"); fi
-    while IFS= read -r candidate; do [ -z "$candidate" ] || candidates+=("$candidate"); done < <(type -a -p "$tool" 2>/dev/null || true)
-    for candidate in /usr/bin/"$tool" /bin/"$tool"; do
-        if [ -e "$candidate" ] || [ -L "$candidate" ]; then candidates+=("$candidate"); fi
-    done
-    # Recognizable manual installation roots count as installation evidence even
-    # when their executable was removed by a failed/partial installation.
-    case "$tool" in
-        java)
-            for directory in /usr/lib/jvm/* /opt/jdk* /opt/jre* /opt/java-* /usr/local/jdk*; do
-                [ ! -d "$directory" ] || candidates+=("$directory/bin/java")
-            done ;;
-        node)
-            for directory in "$TOOLS"/node-v* /opt/node-v* /opt/nodejs /usr/local/node-v* /usr/local/nodejs; do
-                [ ! -d "$directory" ] || candidates+=("$directory/bin/node")
-            done ;;
-        psql|pg_isready)
-            for directory in /usr/lib/postgresql/[0-9]*; do
-                [ ! -d "$directory" ] || candidates+=("$directory/bin/$tool")
-            done ;;
-    esac
-    build_tool_inventory
-    for candidate in "${TOOL_INVENTORY[@]}"; do [ "${candidate##*/}" != "$tool" ] || candidates+=("$candidate"); done
-    for candidate in "${candidates[@]}"; do
-        [ -n "$candidate" ] || continue
-        [ -z "${seen[$candidate]:-}" ] || continue
+# Globals contain the tested path, version and (for Java) the JVM's own home.
+# seen and evidence are local to the caller, shared across fast and fallback passes.
+try_tool_candidates() {
+    local tool=$1 candidate probe version
+    shift
+    for candidate in "$@"; do
+        [ -n "$candidate" ] && [ -z "${seen[$candidate]:-}" ] || continue
         seen[$candidate]=1
-        if version=$(probe_runtime_tool "$tool" "$candidate"); then
-            TOOL_SELECTED="$candidate"
-            printf 'Reuse %s: %s (%s)\n' "$tool" "$TOOL_SELECTED" "$version"
+        if probe=$(probe_runtime_tool "$tool" "$candidate"); then
+            IFS=$'\t' read -r version TOOL_REPORTED_HOME <<< "$probe"
+            if [ "$tool" = java ]; then
+                case "${version%%[.-]*}" in
+                    11|17|21) ;;
+                    *) if [ -z "${trial_seen[$TOOL_REPORTED_HOME]:-}" ]; then
+                           trial_seen[$TOOL_REPORTED_HOME]=1
+                           trial_paths+=("$candidate"); trial_homes+=("$TOOL_REPORTED_HOME"); trial_versions+=("$version")
+                       fi
+                       continue ;;
+                esac
+            fi
+            TOOL_SELECTED="$candidate"; TOOL_VERSION="$version"
+            printf 'Reuse %s %s at %s\n' "$tool" "$version" "$candidate"
             return 0
         fi
-        evidence="$evidence $candidate"
+        evidence+=" $candidate (${probe:-incomplete})"
     done
+    return 1
+}
+discover_runtime_tool() {
+    local -a trial_paths=() trial_homes=() trial_versions=()
+    local -A trial_seen=()
+    local tool=$1 hint=${2:-} candidate directory package_evidence pkg files evidence=''
+    local -a candidates=() packages=()
+    local -A seen=()
+    TOOL_SELECTED=''; TOOL_VERSION=''; TOOL_REPORTED_HOME=''
+    if [ "$tool" = java ]; then JAVA_ALTERNATE_HOMES=(); JAVA_ALTERNATE_VERSIONS=(); fi
+    [ -z "$hint" ] || candidates+=("$hint")
+    while IFS= read -r candidate; do candidates+=("$candidate"); done < <(type -a -p "$tool" 2>/dev/null || :)
+    if command -v update-alternatives >/dev/null; then
+        while IFS= read -r candidate; do candidates+=("$candidate"); done < <(update-alternatives --list "$tool" 2>/dev/null || :)
+    fi
     case "$tool" in
-        java) packages=('openjdk-*-jdk*' 'openjdk-*-jre*' 'temurin-*-jdk*') ;;
-        node) packages=(nodejs) ;;
-        psql|pg_isready) packages=('postgresql-client-[0-9]*') ;;
+        java) packages=('openjdk-*-jdk*' 'openjdk-*-jre*' 'temurin-*-jdk*')
+            for directory in /usr/lib/jvm/* /opt/jdk* "${SDKMAN_CANDIDATES_DIR:-$HOME/.sdkman/candidates}"/java/*; do
+                [ ! -d "$directory" ] || candidates+=("$directory/bin/java")
+            done ;;
+        node|npm) packages=("$tool"); [ "$tool" != node ] || packages=(nodejs)
+            for directory in "$TOOLS"/node-v* /opt/node* "${NVM_DIR:-$HOME/.nvm}"/versions/node/* "${FNM_DIR:-$HOME/.local/share/fnm}"/node-versions/*/installation "${VOLTA_HOME:-$HOME/.volta}"/tools/image/node/*; do
+                [ -d "$directory" ] || continue
+                # Node can be distributed without npm. Only count actual npm files
+                # (or a package record) as evidence that npm is already installed.
+                if [ "$tool" = node ] || [ -e "$directory/bin/npm" ] || [ -L "$directory/bin/npm" ]; then
+                    candidates+=("$directory/bin/$tool")
+                fi
+            done ;;
+        psql|pg_isready) packages=('postgresql-client-[0-9]*')
+            for directory in /usr/lib/postgresql/[0-9]*; do [ ! -d "$directory" ] || candidates+=("$directory/bin/$tool"); done ;;
+        xz) packages=(xz-utils) ;;
         *) packages=("$tool") ;;
     esac
-    package_evidence=$(installed_package_evidence "${packages[@]}") || {
-        tool_fail "Package evidence for $tool could not be read. Discovery is inconclusive."
-        return 4
-    }
-    evidence="$evidence $package_evidence"
-    if [ -n "${evidence//[[:space:]]/}" ]; then
-        tool_fail "$tool is installed but incompatible or incomplete:$evidence. Repair explicitly; no installation or upgrade was attempted."
-        return 2
+    try_tool_candidates "$tool" "${candidates[@]}" && return 0
+    candidates=()
+    check_package_database || return 4
+    package_evidence=$(installed_package_evidence "${packages[@]}") || return 4
+    for pkg in $package_evidence; do
+        files=$(dpkg-query -L "$pkg") || { tool_fail "Unable to inspect files installed by $pkg."; return 4; }
+        while IFS= read -r candidate; do
+            if [ "${candidate##*/}" = "$tool" ] || { [ "$tool" = npm ] && [ "${candidate##*/}" = npm-cli.js ]; }; then candidates+=("$candidate"); fi
+        done <<< "$files"
+    done
+    try_tool_candidates "$tool" "${candidates[@]}" && return 0
+    build_tool_inventory; candidates=()
+    for candidate in "${TOOL_INVENTORY[@]}"; do
+        if [ "${candidate##*/}" = "$tool" ] || { [ "$tool" = npm ] && [ "${candidate##*/}" = npm-cli.js ]; }; then candidates+=("$candidate"); fi
+    done
+    try_tool_candidates "$tool" "${candidates[@]}" && return 0
+    if [ "${#trial_paths[@]}" -gt 0 ]; then
+        TOOL_SELECTED=${trial_paths[0]}; TOOL_REPORTED_HOME=${trial_homes[0]}; TOOL_VERSION=${trial_versions[0]}
+        JAVA_ALTERNATE_HOMES=("${trial_homes[@]:1}"); JAVA_ALTERNATE_VERSIONS=("${trial_versions[@]:1}")
+        printf 'Trying Java %s at %s. Project compatibility will be checked before use.\n' "$TOOL_VERSION" "$TOOL_SELECTED"
+        return 0
     fi
-    if [ -n "$TOOL_DISCOVERY_ERRORS" ]; then
-        tool_fail "Cannot establish that $tool is absent.$TOOL_DISCOVERY_ERRORS No installation was attempted."
-        return 4
-    fi
+    if [ -n "$TOOL_DISCOVERY_ERRORS" ]; then tool_fail "Cannot complete $tool discovery.$TOOL_DISCOVERY_ERRORS"; return 4; fi
+    if [ -n "$evidence$package_evidence" ]; then tool_fail "$tool found but incompatible or incomplete:$evidence $package_evidence"; return 2; fi
     return 3
 }
 
 APT_INDEX_READY=0
 install_missing_apt_package() {
-    local package=$1 simulation
+    local package=$1 upgrade=${2:-0} simulation changes
+    local -a apt_flags=(--no-remove --no-upgrade --no-install-recommends)
+    [ "$upgrade" = 0 ] || apt_flags=(--no-remove --no-install-recommends)
     check_package_database || return 4
-    [ "$(id -u)" = 0 ] || { tool_fail "Installing missing $package requires root in the runtime container."; return 1; }
-    if [ "$APT_INDEX_READY" = 0 ]; then
-        apt-get update || return $?
-        APT_INDEX_READY=1
-    fi
-    simulation=$(apt-get -s --no-upgrade --no-install-recommends install "$package") || return 1
-    if printf '%s\n' "$simulation" | grep -Eq '^Inst [^ ]+ \[|^Remv '; then
-        tool_fail "Installing missing $package would upgrade or remove an existing dependency. Reconcile explicitly."
+    [ "$ID:$VERSION_ID" = ubuntu:24.04 ] || { tool_fail "Automatic APT changes require Ubuntu 24.04. Supply a compatible $package in this $ID $VERSION_ID runtime."; return 1; }
+    [ "$(id -u)" = 0 ] || { tool_fail "Installing $package requires root in the runtime."; return 1; }
+    if [ "$APT_INDEX_READY" = 0 ]; then apt-get update || return $?; APT_INDEX_READY=1; fi
+    simulation=$(apt-get -s "${apt_flags[@]}" install "$package") || return 1
+    if grep -Eq '^Remv ' <<< "$simulation"; then
+        tool_fail "APT would remove an existing package while installing $package. Reconcile explicitly."
         return 1
     fi
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-upgrade --no-install-recommends "$package" || return $?
-    TOOL_INVENTORY_READY=0
-    PACKAGE_DATABASE_READY=0
-    hash -r
+    changes=$(awk '$1=="Inst" && $3 ~ /^\[/ {print $2}' <<< "$simulation")
+    if [ -n "$changes" ]; then
+        if [ "$upgrade" != 1 ]; then tool_fail "Installing $package would upgrade existing packages: $changes"; return 1; fi
+        if [ "$changes" != "$package" ]; then confirm_tool_upgrade "Allow these required APT package upgrades: $changes" || return 2; fi
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_flags[@]}" "$package" || return $?
+    # The package database and explicit binary paths are re-read for this tool only.
+    PACKAGE_DATABASE_READY=0; hash -r
 }
-
 ensure_apt_runtime_tool() {
     local tool=$1 package=$2 hint=${3:-} result
     if discover_runtime_tool "$tool" "$hint"; then return 0; else result=$?; fi
-    [ "$result" = 3 ] || return "$result"
-    printf 'Install missing %s using %s.\n' "$tool" "$package"
-    install_missing_apt_package "$package" || return $?
-    discover_runtime_tool "$tool" "$hint" || { tool_fail "$package installation did not produce a compatible $tool."; return 1; }
+    case "$result" in
+        2) confirm_tool_upgrade "Use the supported $package package for incompatible $tool in this container" || return 2 ;;
+        3) printf 'Install missing %s using %s.\n' "$tool" "$package" ;;
+        *) return "$result" ;;
+    esac
+    if [ "$result" = 2 ]; then install_missing_apt_package "$package" 1 || return $?; else install_missing_apt_package "$package" || return $?; fi
+    discover_runtime_tool "$tool" "$hint" || { tool_fail "Installation did not produce a compatible $tool."; return 1; }
 }
 
 install_missing_node() {
@@ -257,341 +314,253 @@ install_missing_node() {
     [ ! -e "$directory" ] || { tool_fail "Incomplete Node installation at $directory."; return 1; }
     mkdir -p "$TOOLS/downloads"
     checksums="$TOOLS/downloads/node-v22.14.0-SHASUMS256.txt"
-    curl --fail --location --proto '=https' --tlsv1.2 "https://nodejs.org/dist/v22.14.0/SHASUMS256.txt" -o "$checksums.part"
-    mv "$checksums.part" "$checksums"
+    curl --fail --location --proto '=https' --tlsv1.2 "https://nodejs.org/dist/v22.14.0/SHASUMS256.txt" -o "$checksums.part" || return 1
+    mv -T "$checksums.part" "$checksums" || return 1
     expected=$(awk -v name="$archive" '$2 == name { print $1 }' "$checksums")
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { tool_fail 'Node checksum metadata is invalid.'; return 1; }
-    if [ ! -e "$TOOLS/downloads/$archive" ]; then
-        curl --fail --location --proto '=https' --tlsv1.2 "https://nodejs.org/dist/v22.14.0/$archive" -o "$TOOLS/downloads/$archive.part"
-        mv "$TOOLS/downloads/$archive.part" "$TOOLS/downloads/$archive"
+    if ! printf '%s  %s\n' "$expected" "$TOOLS/downloads/$archive" | sha256sum --status -c - 2>/dev/null; then
+        curl --fail --location --proto '=https' --tlsv1.2 "https://nodejs.org/dist/v22.14.0/$archive" -o "$TOOLS/downloads/$archive.part" || return 1
+        printf '%s  %s\n' "$expected" "$TOOLS/downloads/$archive.part" | sha256sum -c - || return 1
+        mv -T "$TOOLS/downloads/$archive.part" "$TOOLS/downloads/$archive" || return 1
     fi
-    printf '%s  %s\n' "$expected" "$TOOLS/downloads/$archive" | sha256sum -c -
-    tar -xJf "$TOOLS/downloads/$archive" -C "$TOOLS"
-    TOOL_INVENTORY_READY=0
+    local stage
+    stage=$(mktemp -d "$TOOLS/node-stage.XXXXXX")
+    tar -xJf "$TOOLS/downloads/$archive" -C "$stage" || return 1
+    mv -T "$stage/node-v22.14.0-linux-$architecture" "$directory" || return 1
+    rmdir "$stage"
     NODE_HOME="$directory"
     export NODE_HOME
     prepend_tool_path "$NODE_HOME/bin"
 }
 
+# Recover npm independently when a compatible Node is already installed.
+install_project_npm() {
+    local version=10.9.2 directory="$TOOLS/npm-10.9.2" metadata archive expected actual stage
+    [ ! -e "$directory" ] || { tool_fail "Existing managed npm at $directory is incomplete. Repair it explicitly."; return 1; }
+    mkdir -p "$TOOLS/downloads"
+    metadata="$TOOLS/downloads/npm-$version.json"; archive="$TOOLS/downloads/npm-$version.tgz"
+    curl --fail --location --proto '=https' --tlsv1.2 "https://registry.npmjs.org/npm/$version" -o "$metadata.part" || return 1
+    mv -T "$metadata.part" "$metadata" || return 1
+    expected=$(node -e 'const m=require(process.argv[1]); if(m.name!=="npm"||m.version!==process.argv[2]||!/^sha512-[A-Za-z0-9+/=]+$/.test(m.dist.integrity))process.exit(1); console.log(m.dist.integrity)' "$metadata" "$version") || return 1
+    curl --fail --location --proto '=https' --tlsv1.2 "https://registry.npmjs.org/npm/-/npm-$version.tgz" -o "$archive.part" || return 1
+    actual=$(node -e 'const fs=require("node:fs");console.log("sha512-"+require("node:crypto").createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$archive.part") || return 1
+    [ "$actual" = "$expected" ] || { tool_fail 'Downloaded npm failed its published integrity check.'; return 1; }
+    mv -T "$archive.part" "$archive" || return 1
+    stage=$(mktemp -d "$TOOLS/npm-stage.XXXXXX")
+    tar -xzf "$archive" --strip-components=1 -C "$stage" || return 1
+    mv -T "$stage" "$directory" || return 1
+    TOOL_SELECTED="$directory/bin/npm-cli.js"
+    probe_runtime_tool npm "$TOOL_SELECTED" >/dev/null || return 1
+}
+select_tool_link() {
+    local source=$1 target=$2
+    if [ -L "$target" ]; then [ "$(readlink "$target")" != "$source" ] || return 0
+    elif [ -e "$target" ]; then tool_fail "Unmanaged file occupies $target."; return 1; fi
+    ln -sfnT "$source" "$target"
+}
+select_java() {
+    JAVA_HOME=$TOOL_REPORTED_HOME; JAVA_VERSION=$TOOL_VERSION
+    export JAVA_HOME
+    prepend_tool_path "$JAVA_HOME/bin"
+}
 ensure_runtime_tools() {
     local result certificates hint=''
     check_package_database || return 4
     certificates=$(installed_package_evidence ca-certificates) || return 4
-    if [ -z "$certificates" ]; then
-        install_missing_apt_package ca-certificates
-    fi
+    [ -n "$certificates" ] || install_missing_apt_package ca-certificates || return 1
     [ -s /etc/ssl/certs/ca-certificates.crt ] || { tool_fail 'Installed CA certificates are incomplete.'; return 1; }
-    ensure_apt_runtime_tool curl curl
-    prepend_tool_path "$(dirname "$TOOL_SELECTED")"
-    ensure_apt_runtime_tool xz xz-utils
-    prepend_tool_path "$(dirname "$TOOL_SELECTED")"
-    ensure_apt_runtime_tool unzip unzip
-    prepend_tool_path "$(dirname "$TOOL_SELECTED")"
-    ensure_apt_runtime_tool git git
-    prepend_tool_path "$(dirname "$TOOL_SELECTED")"
+    ensure_apt_runtime_tool curl curl; prepend_tool_path "$(dirname "$TOOL_SELECTED")"
+    ensure_apt_runtime_tool xz xz-utils; prepend_tool_path "$(dirname "$TOOL_SELECTED")"
+    ensure_apt_runtime_tool unzip unzip; prepend_tool_path "$(dirname "$TOOL_SELECTED")"
+    ensure_apt_runtime_tool git git; prepend_tool_path "$(dirname "$TOOL_SELECTED")"
     [ -z "${JAVA_HOME:-}" ] || hint="$JAVA_HOME/bin/java"
     ensure_apt_runtime_tool java openjdk-21-jdk-headless "$hint"
-    JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$TOOL_SELECTED")")")
-    export JAVA_HOME
-    prepend_tool_path "$JAVA_HOME/bin"
-
+    select_java
     hint=''; [ -z "${NODE_HOME:-}" ] || hint="$NODE_HOME/bin/node"
     if discover_runtime_tool node "$hint"; then :; else
         result=$?
-        [ "$result" = 3 ] || return "$result"
-        install_missing_node
+        if [ "$result" = 2 ]; then confirm_tool_upgrade 'Install project Node 22.14.0 alongside the incompatible installation' || return 2
+        elif [ "$result" != 3 ]; then return "$result"; fi
+        install_missing_node || return 1
         discover_runtime_tool node "$NODE_HOME/bin/node" || return 1
     fi
-    NODE_HOME=$(dirname "$(dirname "$(readlink -f "$TOOL_SELECTED")")")
-    export NODE_HOME
+    local selected_node selected_bin="$TOOLS/selected-bin" npm_hint
+    selected_node=$(readlink -f "$TOOL_REPORTED_HOME") || return 1
+    NODE_HOME=$(dirname "$(dirname "$selected_node")"); export NODE_HOME
     prepend_tool_path "$NODE_HOME/bin"
-    if ! discover_runtime_tool npm "$NODE_HOME/bin/npm"; then
-        tool_fail "Existing Node installation has no compatible npm >=10.2.3. Repair npm explicitly."
-        return 1
+    npm_hint=''; [ ! -e "$NODE_HOME/bin/npm" ] || npm_hint="$NODE_HOME/bin/npm"
+    if [ -x "$TOOLS/npm-10.9.2/bin/npm-cli.js" ] && [ -z "$npm_hint" ]; then npm_hint="$TOOLS/npm-10.9.2/bin/npm-cli.js"; fi
+    if discover_runtime_tool npm "$npm_hint"; then :; else
+        result=$?
+        if [ "$result" = 2 ]; then confirm_tool_upgrade 'Install project-local npm 10.9.2 for the selected Node' || return 2
+        elif [ "$result" != 3 ]; then return "$result"; fi
+        install_project_npm || return 1
     fi
-    prepend_tool_path "$(dirname "$TOOL_SELECTED")"
-
+    NPM=$(readlink -f "$TOOL_SELECTED") || return 1
+    export NPM
+    mkdir -p "$selected_bin"
+    select_tool_link "$JAVA_HOME/bin/java" "$selected_bin/java"
+    select_tool_link "$selected_node" "$selected_bin/node"
+    select_tool_link "$NPM" "$selected_bin/npm"
+    prepend_tool_path "$selected_bin"
     hint=''; [ -z "${PGHOME:-}" ] || hint="$PGHOME/bin/psql"
     ensure_apt_runtime_tool psql postgresql-client-16 "$hint"
-    PSQL="$TOOL_SELECTED"
-    PGHOME=$(dirname "$(dirname "$PSQL")")
-    export PGHOME PSQL
+    PSQL="$TOOL_SELECTED"; PGHOME=$(dirname "$(dirname "$PSQL")"); export PGHOME PSQL
     prepend_tool_path "$(dirname "$PSQL")"
-    if ! discover_runtime_tool pg_isready "$(dirname "$PSQL")/pg_isready"; then
-        tool_fail 'Existing PostgreSQL client installation is incomplete; pg_isready >=16 is required.'
-        return 1
-    fi
-    PG_ISREADY="$TOOL_SELECTED"
-    export PG_ISREADY
-
+    ensure_apt_runtime_tool pg_isready postgresql-client-16 "$(dirname "$PSQL")/pg_isready"
+    PG_ISREADY=$TOOL_SELECTED; export PG_ISREADY
+    # Selecting /usr/bin for PostgreSQL must not shadow the recovered Node/npm.
+    prepend_tool_path "$selected_bin"
     ensure_sbt_launcher
 }
 
+# Only downloads require this pinned checksum. Locally installed launchers also
+# qualify if their manifest/boot configuration and the actual project probe pass.
 verify_sbt_launcher() {
     local launcher=$1
-    [ -f "$launcher" ] && [ -r "$launcher" ] || return 1
-    printf '%s  %s\n' cdd6963b622f42690cb2e3154bde3f3257a03839f216e1b5d7420000d6a71817 "$launcher" | sha256sum -c - >/dev/null 2>&1
+    [ -f "$launcher" ] && [ -r "$launcher" ] &&
+        printf '%s  %s\n' cdd6963b622f42690cb2e3154bde3f3257a03839f216e1b5d7420000d6a71817 "$launcher" | sha256sum -c - >/dev/null 2>&1
 }
-
-ensure_sbt_launcher() {
-    local candidate directory result evidence=''
-    local -a candidates=()
-    local -A seen=()
-    SBT="$TOOLS/sbt/bin/sbt-launch.jar"
-    if [ -e "$SBT" ] || [ -L "$SBT" ]; then
-        verify_sbt_launcher "$SBT" || { tool_fail "Existing sbt launcher is incomplete or incompatible: $SBT. Repair explicitly."; return 1; }
-        printf 'Reuse verified sbt 1.10.2 launcher: %s\n' "$SBT"
-        export SBT
-        return 0
+download_project_launcher() {
+    local path="$TOOLS/sbt-launch-1.10.2.jar"
+    if ! verify_sbt_launcher "$path"; then
+        curl --fail --location --proto '=https' --tlsv1.2 'https://repo.maven.apache.org/maven2/org/scala-sbt/sbt-launch/1.10.2/sbt-launch-1.10.2.jar' -o "$path.part" || return 1
+        verify_sbt_launcher "$path.part" || { tool_fail 'Downloaded sbt launcher checksum failed.'; return 1; }
+        mv -T "$path.part" "$path" || return 1
     fi
+    SBT=$path; SBT_NEEDS_PROBE=0
+}
+ensure_sbt_launcher() {
+    local candidate wrapper prefix directory canonical manifest boot evidence='' packages files c
+    local -a candidates=() wrappers=() jars=()
+    local -A seen=()
+    SBT_NEEDS_PROBE=0; SBT_ALTERNATIVES=()
+    [ -z "${SBT_LAUNCH_JAR:-}" ] || candidates+=("$SBT_LAUNCH_JAR")
+    candidates+=("$TOOLS/sbt/bin/sbt-launch.jar" "$TOOLS/sbt-launch-1.10.2.jar")
+    while IFS= read -r wrapper; do wrappers+=("$wrapper"); done < <(type -a -p sbt 2>/dev/null || :)
+    for wrapper in "${wrappers[@]}"; do
+        canonical=$(readlink -f "$wrapper") || continue
+        prefix=$(dirname "$(dirname "$canonical")")
+        candidates+=("$prefix/bin/sbt-launch.jar" "$prefix/share/sbt/bin/sbt-launch.jar")
+        evidence+=" $wrapper"
+    done
+    for directory in "${SBT_HOME:-}" /usr/share/sbt /opt/sbt* /usr/local/sbt* "${SDKMAN_CANDIDATES_DIR:-$HOME/.sdkman/candidates}"/sbt/*; do
+        [ -d "$directory" ] || continue
+        candidates+=("$directory/bin/sbt-launch.jar" "$directory"/lib/sbt-launch*.jar)
+    done
+    for candidate in "$HOME"/.sbt/launchers/*/sbt-launch.jar "$HOME"/.sbt/boot/sbt-launch/*/sbt-launch*.jar \
+        "${SBT_IVY_HOME:-$HOME/.ivy2}"/cache/org.scala-sbt/sbt-launch/jars/sbt-launch*.jar \
+        "${MAVEN_REPO_LOCAL:-$HOME/.m2/repository}"/org/scala-sbt/sbt-launch/*/sbt-launch*.jar; do
+        [ ! -f "$candidate" ] || candidates+=("$candidate")
+    done
+    for directory in "${COURSIER_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/coursier/v1}" "$HOME/.coursier/cache/v1"; do
+        for candidate in "$directory"/https/*/*/org/scala-sbt/sbt-launch/*/sbt-launch*.jar "$directory"/https/*/org/scala-sbt/sbt-launch/*/sbt-launch*.jar; do
+            [ ! -f "$candidate" ] || candidates+=("$candidate")
+        done
+    done
+    # The common launcher avoids any broad inventory.
+    for candidate in "${candidates[@]}"; do
+        if verify_sbt_launcher "$candidate"; then SBT=$candidate; printf 'Reuse verified sbt launcher %s\n' "$SBT"; return 0; fi
+    done
+    check_package_database || return 4
+    packages=$(installed_package_evidence sbt sbt-launcher) || return 4
+    for c in $packages; do
+        files=$(dpkg-query -L "$c") || return 4
+        while IFS= read -r candidate; do
+            case "${candidate##*/}" in sbt-launch*.jar) candidates+=("$candidate");; esac
+        done <<< "$files"
+    done
     build_tool_inventory
     for candidate in "${TOOL_INVENTORY[@]}"; do
-        case "${candidate##*/}" in sbt-launch*.jar) candidates+=("$candidate") ;; esac
-    done
-    # SDKMAN's current directory is a link, so include these known launcher
-    # locations explicitly without recursively following arbitrary directory links.
-    for directory in /usr/share/sbt /opt/sbt* /usr/local/sbt* /root/.sdkman/candidates/sbt/*; do
-        [ ! -d "$directory" ] || candidates+=("$directory/bin/sbt-launch.jar")
-    done
-    for candidate in /root/.sbt/launchers/*/sbt-launch.jar; do
-        if [ -e "$candidate" ] || [ -L "$candidate" ]; then candidates+=("$candidate"); fi
+        case "${candidate##*/}" in sbt-launch*.jar) candidates+=("$candidate");; sbt) evidence+=" $candidate";; esac
     done
     for candidate in "${candidates[@]}"; do
-        [ -z "${seen[$candidate]:-}" ] || continue
-        seen[$candidate]=1
-        if verify_sbt_launcher "$candidate"; then
-            mkdir -p "$(dirname "$SBT")"
-            ln -s "$(readlink -f "$candidate")" "$SBT" || return 1
-            printf 'Reuse verified sbt 1.10.2 launcher: %s (linked at %s)\n' "$candidate" "$SBT"
-            export SBT
-            return 0
+        [ -f "$candidate" ] || { [ ! -L "$candidate" ] || evidence+=" $candidate"; continue; }
+        canonical=$(readlink -f "$candidate") || return 4
+        [ -z "${seen[$canonical]:-}" ] || continue; seen[$canonical]=1
+        if verify_sbt_launcher "$canonical"; then SBT=$canonical; printf 'Reuse verified sbt launcher %s\n' "$SBT"; return 0; fi
+        manifest=$(unzip -p "$canonical" META-INF/MANIFEST.MF 2>/dev/null | tr -d '\r') || manifest=''
+        boot=$(unzip -p "$canonical" sbt/sbt.boot.properties 2>/dev/null) || boot=''
+        if grep -Eq '^Main-Class: xsbt\.boot\.Boot$' <<< "$manifest" && grep -Fq 'read(sbt.version)' <<< "$boot"; then
+            jars+=("$canonical")
         fi
-        evidence="$evidence $candidate"
+        evidence+=" $candidate"
     done
-    if [ -n "$evidence" ]; then
-        tool_fail "Installed sbt launcher candidates are incompatible or incomplete:$evidence. No replacement was downloaded."
-        return 2
+    if [ "${#jars[@]}" -gt 0 ]; then
+        SBT=${jars[0]}; SBT_ALTERNATIVES=("${jars[@]:1}"); SBT_NEEDS_PROBE=1
+        printf 'Trying existing sbt launcher with project/build.properties: %s\n' "$SBT"
+        return 0
     fi
-    if discover_runtime_tool sbt; then
-        tool_fail "Existing sbt at $TOOL_SELECTED has no discoverable verified 1.10.2 launcher JAR. Restore its launcher explicitly; no second installation was added."
-        return 2
-    else
-        result=$?
-        [ "$result" = 3 ] || return "$result"
+    [ -z "$TOOL_DISCOVERY_ERRORS" ] || { tool_fail "sbt search incomplete.$TOOL_DISCOVERY_ERRORS"; return 4; }
+    if [ -n "$evidence$packages${SBT_LAUNCH_JAR:-}${SBT_HOME:-}" ]; then
+        printf 'Existing sbt evidence:%s %s\n' "$evidence" "$packages" >&2
+        confirm_tool_upgrade 'Install the verified project sbt launcher (extension requires a launcher JAR)' || return 2
     fi
-    mkdir -p "$(dirname "$SBT")"
-    curl --fail --location --proto '=https' --tlsv1.2 'https://repo.maven.apache.org/maven2/org/scala-sbt/sbt-launch/1.10.2/sbt-launch-1.10.2.jar' -o "$SBT.part" || return 1
-    verify_sbt_launcher "$SBT.part" || { tool_fail 'Downloaded sbt launcher checksum failed.'; return 1; }
-    mv "$SBT.part" "$SBT"
-    export SBT
+    download_project_launcher
 }
-
 run_sbt() {
     "$JAVA_HOME/bin/java" -Xmx2G -Dsbt.supershell=false -Dsbt.log.noformat=true -Dsbt.server.autostart=false -jar "$SBT" "$@"
 }
-
-verify_node_modules() {
-    node - <<'JS'
-// Exit 0 = verified, 10 = genuinely missing packages, 20 = incompatible/incomplete.
-const fs = require('node:fs');
-const path = require('node:path');
-const root = process.cwd();
-const missing = [], errors = [];
-function json(file) { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-function safe(relative) {
-    const absolute = path.resolve(root, relative);
-    if (!absolute.startsWith(root + path.sep)) throw Error(`Lock path escapes workspace: ${relative}`);
-    return absolute;
-}
-function eligible(entry) {
-    for (const [field, actual] of [['os', process.platform], ['cpu', process.arch]]) {
-        if (!entry[field]) continue;
-        const list = Array.isArray(entry[field]) ? entry[field] : [entry[field]];
-        if (list.includes('!' + actual) || (list.some(x => !x.startsWith('!')) && !list.includes(actual) && !list.includes('any'))) return false;
-    }
-    if (entry.libc && process.platform === 'linux') {
-        const libc = process.report.getReport().header.glibcVersionRuntime ? 'glibc' : 'musl';
-        const list = Array.isArray(entry.libc) ? entry.libc : [entry.libc];
-        if (list.includes('!' + libc) || (list.some(x => !x.startsWith('!')) && !list.includes(libc) && !list.includes('any'))) return false;
-    }
-    return true;
-}
-try {
-    const lock = json('package-lock.json');
-    if (![2, 3].includes(lock.lockfileVersion) || !lock.packages) throw Error('A v2/v3 package-lock.json is required.');
-    for (const [relative, entry] of Object.entries(lock.packages)) {
-        if (entry.optional && !eligible(entry)) continue;
-        if (!relative || !relative.split('/').includes('node_modules')) {
-            const manifest = json(relative ? path.join(safe(relative), 'package.json') : 'package.json');
-            if (entry.version && manifest.version !== entry.version) errors.push(`${relative || '.'}: workspace version disagrees with lock`);
-            for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
-                const normalized = object => JSON.stringify(Object.entries(object || {}).sort(([a], [b]) => a.localeCompare(b)));
-                if (normalized(manifest[field]) !== normalized(entry[field])) errors.push(`${relative || '.'}: ${field} disagrees with lock`);
-            }
-            continue;
-        }
-        const location = safe(relative);
-        let stat;
-        try { stat = fs.lstatSync(location); }
-        catch (error) { if (error.code === 'ENOENT') { missing.push(relative); continue; } throw error; }
-        if (entry.link) {
-            const target = safe(entry.resolved);
-            if (!stat.isSymbolicLink() || fs.realpathSync(location) !== fs.realpathSync(target)) errors.push(`${relative}: wrong workspace link`);
-            continue;
-        }
-        if (!stat.isDirectory() || stat.isSymbolicLink()) { errors.push(`${relative}: unexpected installation path`); continue; }
-        let manifest;
-        try { manifest = json(path.join(location, 'package.json')); }
-        catch (error) { errors.push(`${relative}: installed directory is incomplete (${error.code || error.message})`); continue; }
-        if (manifest.version !== entry.version) errors.push(`${relative}: installed ${manifest.version}, locked ${entry.version}`);
-        const bins = typeof manifest.bin === 'string' ? {[manifest.name.split('/').pop()]: manifest.bin} : manifest.bin || {};
-        for (const [name, executable] of Object.entries(bins)) {
-            if (!fs.existsSync(path.resolve(location, executable))) errors.push(`${relative}: missing executable ${executable}`);
-            const modules = location.slice(0, location.lastIndexOf(path.sep + 'node_modules' + path.sep)) + path.sep + 'node_modules';
-            const shim = path.join(modules, '.bin', name + (process.platform === 'win32' ? '.cmd' : ''));
-            if (!fs.existsSync(shim)) missing.push(path.relative(root, shim));
-        }
-    }
-    if (errors.length) {
-        console.error('Dependencies are incompatible/incomplete; explicitly reconcile them before retrying. No installation attempted.\n' + errors.slice(0, 30).join('\n'));
-        process.exitCode = 20;
-    } else if (missing.length) {
-        console.log(`Missing dependency entries (${missing.length}): ${missing.slice(0, 20).join(', ')}`);
-        process.exitCode = 10;
-    } else console.log('All locked dependency versions and workspace links are installed; skipping npm installation.');
-} catch (error) { console.error(`Dependency discovery inconclusive: ${error.message}`); process.exitCode = 20; }
-
-JS
-}
-
-
-check_language_server() {
-    node --input-type=module - "$LANGIUM/packages/extension/out/language/main.cjs" "$SMOKE/valid.clinical" <<'JS'
-// Inline readiness probe: no separate helper or test file is required.
-import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-
-async function probeLanguageServer({ serverPath, documentPath, timeoutMs = 30000 }) {
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('Invalid probe timeout.');
-    const absoluteDocument = path.resolve(documentPath);
-    const text = await readFile(absoluteDocument, 'utf8');
-    const uri = pathToFileURL(absoluteDocument).href;
-    const normalize = value => process.platform === 'win32' ? value.toLowerCase() : value;
-    const sameDocument = value => {
-        try { return normalize(path.resolve(fileURLToPath(value))) === normalize(absoluteDocument); }
-        catch { return false; }
-    };
-    return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [path.resolve(serverPath), '--stdio'], {
-            cwd: path.dirname(absoluteDocument), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true
-        });
-        let buffer = Buffer.alloc(0);
-        let stderr = '';
-        let initialized = false;
-        let validated = false;
-        let shutdown = false;
-        let failure;
-        const fail = error => {
-            failure ??= error instanceof Error ? error : new Error(String(error));
-            child.kill('SIGKILL');
-        };
-        const timer = setTimeout(() => fail(new Error(`Language server timed out after ${timeoutMs} ms.`)), timeoutMs);
-        function send(message) {
-            const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...message }), 'utf8');
-            child.stdin.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]));
-        }
-        function receive(message) {
-            if (message.method && message.id !== undefined) {
-                if (message.method === 'workspace/configuration') {
-                    send({ id: message.id, result: (message.params?.items ?? []).map(() => null) });
-                } else if (['client/registerCapability', 'window/workDoneProgress/create', 'workspace/workspaceFolders'].includes(message.method)) {
-                    send({ id: message.id, result: null });
-                } else {
-                    send({ id: message.id, error: { code: -32601, message: 'Not implemented by bootstrap probe' } });
-                }
-            } else if (message.id === 1) {
-                if (message.error || !message.result?.capabilities) throw new Error(`Language-server initialize failed: ${JSON.stringify(message.error ?? message.result)}`);
-                initialized = true;
-                send({ method: 'initialized', params: {} });
-                send({ method: 'textDocument/didOpen', params: { textDocument: { uri, languageId: 'clinical-dsl', version: 1, text } } });
-            } else if (message.method === 'textDocument/publishDiagnostics' && sameDocument(message.params?.uri) && initialized && !validated) {
-                if (message.params.version !== undefined && message.params.version !== 1) return;
-                if (!Array.isArray(message.params.diagnostics)) throw new Error('Malformed document diagnostics.');
-                const errors = message.params.diagnostics.filter(d => d.severity === 1);
-                if (errors.length) throw new Error(`Clinical document validation failed: ${errors.map(e => e.message).join('; ')}`);
-                validated = true;
-                send({ id: 2, method: 'shutdown', params: null });
-            } else if (message.id === 2) {
-                if (!validated || message.error || message.result !== null) throw new Error('Language-server shutdown failed.');
-                shutdown = true;
-                send({ method: 'exit' });
-                child.stdin.end();
-            }
-        }
-        child.stdout.on('data', chunk => {
-            if (failure) return;
-            try {
-                buffer = Buffer.concat([buffer, chunk]);
-                if (buffer.length > 8 * 1024 * 1024) throw new Error('Language-server frame exceeds 8 MiB.');
-                while (true) {
-                    const boundary = buffer.indexOf('\r\n\r\n');
-                    if (boundary < 0) break;
-                    const header = buffer.subarray(0, boundary).toString('ascii');
-                    const match = /^Content-Length:\s*(\d+)\s*$/im.exec(header);
-                    if (!match) throw new Error('Invalid language-server Content-Length header.');
-                    const length = Number(match[1]);
-                    if (!Number.isSafeInteger(length) || length > 8 * 1024 * 1024) throw new Error('Invalid language-server frame size.');
-                    const end = boundary + 4 + length;
-                    if (buffer.length < end) break;
-                    const message = JSON.parse(buffer.subarray(boundary + 4, end).toString('utf8'));
-                    buffer = buffer.subarray(end);
-                    receive(message);
-                }
-            } catch (error) { fail(error); }
-        });
-        child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8000); });
-        child.stdin.on('error', fail);
-        child.on('error', fail);
-        child.on('close', (code, signal) => {
-            clearTimeout(timer);
-            if (failure) return reject(failure);
-            if (code !== 0 || !initialized || !validated || !shutdown) {
-                return reject(new Error(`Language server exited before readiness (code=${code}, signal=${signal}). ${stderr}`));
-            }
-            resolve({ initialized: true, validated: true, shutdown: true });
-        });
-        send({ id: 1, method: 'initialize', params: {
-            processId: process.pid, rootUri: null, workspaceFolders: null,
-            capabilities: { workspace: { configuration: false, workspaceFolders: false } }
-        } });
-    });
-}
-
-const [serverPath, documentPath] = process.argv.slice(2);
-if (!serverPath || !documentPath) {
-    console.error('Bootstrap language-server check requires server and document paths.');
-    process.exitCode = 1;
-} else {
-    probeLanguageServer({ serverPath, documentPath }).then(() => {
-        console.log('PASS: Node language server initialize -> .clinical diagnostics -> clean shutdown');
-    }).catch(error => { console.error(error.message); process.exitCode = 1; });
-}
-
-JS
+verify_project_runtime() {
+    local expected_sbt expected_scala log status major candidate
+    expected_sbt=$(sed -n 's/^sbt.version=//p' "$SCALA/project/build.properties" | tr -d '\r')
+    expected_scala=$(sed -n 's/^ThisBuild \/ scalaVersion := "\([^"]*\)".*/\1/p' "$SCALA/build.sbt")
+    [ -n "$expected_sbt" ] && [ -n "$expected_scala" ] || { tool_fail 'Could not determine pinned sbt/Scala versions.'; return 1; }
+    local -a scala_roots=()
+    IFS=: read -r -a scala_roots <<< "${AURORA_TOOL_SEARCH_PATH:-}"
+    if node "$SCALA/scripts/check-scala.cjs" "$SCALA" "${scala_roots[@]}"; then :; else
+        status=$?
+        [ "$status" = 11 ] || return "$status"
+        confirm_tool_upgrade "Allow sbt to obtain Scala $expected_scala for this project alongside the installed Scala" || return 2
+    fi
+    major=${JAVA_VERSION%%[.-]*}
+    if [ "$SBT_NEEDS_PROBE" = 1 ] || { [ "$major" != 11 ] && [ "$major" != 17 ] && [ "$major" != 21 ]; }; then
+        log="$STATE/project-toolchain-check.log"
+        while :; do
+            if (cd "$SCALA" && run_sbt 'show sbtVersion' 'show scalaVersion' compile) 2>&1 | tee "$log"; then
+                if grep -Fxq "[info] $expected_sbt" "$log" && grep -Fxq "[info] $expected_scala" "$log"; then break; fi
+                [ "$SBT_NEEDS_PROBE" = 1 ] || { tool_fail "Unexpected project tool versions; see $log."; return 1; }
+            else
+                status=${PIPESTATUS[0]}
+                if [ "$major" != 11 ] && [ "$major" != 17 ] && [ "$major" != 21 ] && grep -Eiq 'UnsupportedClassVersionError|Unsupported class file major version|Unsupported major.minor version|Unrecognized VM option|not compatible with (this version of )?Java' "$log"; then
+                    if [ "${#JAVA_ALTERNATE_HOMES[@]}" -gt 0 ]; then
+                        TOOL_REPORTED_HOME=${JAVA_ALTERNATE_HOMES[0]}; TOOL_VERSION=${JAVA_ALTERNATE_VERSIONS[0]}
+                        JAVA_ALTERNATE_HOMES=("${JAVA_ALTERNATE_HOMES[@]:1}"); JAVA_ALTERNATE_VERSIONS=("${JAVA_ALTERNATE_VERSIONS[@]:1}")
+                        printf 'Trying another installed Java %s at %s.\n' "$TOOL_VERSION" "$TOOL_REPORTED_HOME"
+                    else
+                        KNOWN_JDK_ONLY=1
+                        ensure_apt_runtime_tool java openjdk-21-jdk-headless || return $?
+                    fi
+                    select_java; select_tool_link "$JAVA_HOME/bin/java" "$TOOLS/selected-bin/java" || return 1; major=${JAVA_VERSION%%[.-]*}; continue
+                fi
+                if [ "$SBT_NEEDS_PROBE" != 1 ] || ! grep -Eiq 'Invalid or corrupt jarfile|Could not find or load main class xsbt.boot.Boot|no main manifest attribute' "$log"; then
+                    tool_fail "Project compatibility probe failed (exit $status); see $log. No upgrade is inferred from this error."; return 1
+                fi
+            fi
+            if [ "${#SBT_ALTERNATIVES[@]}" -gt 0 ]; then
+                candidate=${SBT_ALTERNATIVES[0]}; SBT_ALTERNATIVES=("${SBT_ALTERNATIVES[@]:1}"); SBT=$candidate
+            else
+                confirm_tool_upgrade "Use the verified project sbt launcher after $SBT failed the project compatibility check" || return 2
+                download_project_launcher || return 1
+            fi
+        done
+    fi
+    # Preserve the extension's required layout without replacing user tools or
+    # copying launcher bytes. Only the owned selection link may be retargeted.
+    local resolved target
+    resolved=$(readlink -f "$SBT") || return 1
+    if [[ "$resolved" = */bin/sbt-launch.jar ]]; then
+        SBT_HOME=$(dirname "$(dirname "$resolved")")
+    else
+        SBT_HOME="$TOOLS/selected-sbt"; target="$SBT_HOME/bin/sbt-launch.jar"; mkdir -p "$SBT_HOME/bin"
+        select_tool_link "$resolved" "$target" || return 1
+    fi
+    export SBT_HOME
+    printf 'Selected Java %s (%s), sbt %s (%s), Scala %s (build.sbt).\n' "$JAVA_VERSION" "$JAVA_HOME" "$expected_sbt" "$resolved" "$expected_scala"
 }
 
 
 ensure_runtime_tools
-# Editor processes need the same non-secret environment as the bootstrap.
-# Existing unrelated profile content is not modified; only this owned file is written.
-{
-    printf 'export JAVA_HOME=%q\n' "$JAVA_HOME"
-    printf 'export NODE_HOME=%q\n' "$NODE_HOME"
-    printf 'export PGHOME=%q\n' "$PGHOME"
-    printf 'export PATH=%q\n' "$PATH"
-} > /etc/profile.d/aurora-tools.sh
 printf 'Linux repositories: %s/repos (persistent Docker workspace).\n' "$ROOT"
 
 sql() { "$PSQL" -X -w -v ON_ERROR_STOP=1 -Atc "$1"; }
@@ -600,9 +569,16 @@ until "$PG_ISREADY" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -t 3
     [ "$((SECONDS - start))" -lt "$STARTUP_TIMEOUT" ] || { echo 'PostgreSQL did not become ready.' >&2; exit 1; }
     sleep 1
 done
-[ "$(sql 'SELECT 1;')" = 1 ] || { echo 'Authenticated PostgreSQL readiness failed.' >&2; exit 1; }
+# This authenticated query checks both login and the actual server version.
 server_version=$(sql 'SHOW server_version_num;')
-[[ "$server_version" =~ ^[0-9]+$ ]] && [ "$server_version" -ge 160000 ] && [ "$server_version" -lt 170000 ] || { echo 'Existing PostgreSQL server is incompatible with the selected postgres:16 runtime.' >&2; exit 1; }
+[[ "$server_version" =~ ^[0-9]+$ ]] || { echo 'Cannot determine the authenticated PostgreSQL server version.' >&2; exit 1; }
+if ((server_version < 150000)); then
+    if confirm_tool_upgrade "PostgreSQL $server_version is below the supported 15+ range. Show manual upgrade steps"; then
+        echo 'Verify a backup, then have the database administrator run pg_upgrade --check on the old and new directories. https://www.postgresql.org/docs/current/pgupgrade.html' >&2
+    fi
+    echo 'Select a compatible existing cluster or complete its migration before rerunning.' >&2
+    exit 1
+fi
 
 # Fast-forward only. Personal source/data are never removed, renamed or stashed.
 # Restore/remove only generated files which overlap files the incoming commit changes.
@@ -685,30 +661,50 @@ if ! cmp -s "$0" "$SCALA/scripts/bootstrap-unix.sh"; then
     echo 'Bootstrap changed upstream; restarting the fetched Linux worker.'
     rmdir "$LOCK"
     trap - EXIT
-    exec bash "$SCALA/scripts/bootstrap-unix.sh" --container-runtime --root "$ROOT" --scala-branch "$SCALA_BRANCH" --langium-branch "$LANGIUM_BRANCH" --startup-timeout "$STARTUP_TIMEOUT" --relaunch-count "$((RELAUNCH_COUNT + 1))"
+    relaunch_options=()
+    [ "$ALLOW_TOOL_UPGRADE" = 0 ] || relaunch_options+=(--allow-tool-upgrade)
+    [ "$NON_INTERACTIVE" = 0 ] || relaunch_options+=(--non-interactive)
+    exec bash "$SCALA/scripts/bootstrap-unix.sh" "${relaunch_options[@]}" --container-runtime --root "$ROOT" --scala-branch "$SCALA_BRANCH" --langium-branch "$LANGIUM_BRANCH" --startup-timeout "$STARTUP_TIMEOUT" --relaunch-count "$((RELAUNCH_COUNT + 1))"
+fi
+
+verify_project_runtime
+# Editor processes need the same non-secret environment as the bootstrap.
+profile=/etc/profile.d/aurora-tools.sh
+profile_text=$(
+    printf 'export JAVA_HOME=%q\n' "$JAVA_HOME"
+    printf 'export NODE_HOME=%q\n' "$NODE_HOME"
+    printf 'export SBT_HOME=%q\n' "$SBT_HOME"
+    [ -z "${COURSIER_CACHE:-}" ] || printf 'export COURSIER_CACHE=%q\n' "$COURSIER_CACHE"
+    printf 'export PGHOME=%q\n' "$PGHOME"
+    printf 'export PATH=%q\n' "$PATH"
+)
+if ! cmp -s "$profile" <(printf '%s\n' "$profile_text"); then
+    profile_part=$(mktemp "/etc/profile.d/.aurora-tools.XXXXXX")
+    printf '%s\n' "$profile_text" > "$profile_part"
+    chmod 644 "$profile_part"
+    mv -T "$profile_part" "$profile"
 fi
 
 cd "$LANGIUM"
-# Snapshot source manifest bytes; npm is allowed to fill missing modules only.
-manifest_snapshot() {
-    node - <<'JS'
-const fs = require('node:fs');
-const crypto = require('node:crypto');
-const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
-const files = ['package-lock.json', 'package.json', ...Object.keys(lock.packages).filter(p => p && !p.split('/').includes('node_modules')).map(p => p + '/package.json')];
-process.stdout.write(JSON.stringify(files.map(file => [file, crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')])));
-JS
-}
-manifest_before=$(manifest_snapshot)
-if verify_node_modules; then :; else
+WORKSPACE_CHECK="$SCALA/scripts/check-workspace.cjs"
+if node "$WORKSPACE_CHECK" check; then :; else
     dependency_status=$?
-    [ "$dependency_status" = 10 ] || exit "$dependency_status"
-    npm install --no-save --ignore-scripts --include=dev --no-audit --no-fund
-    [ "$(manifest_snapshot)" = "$manifest_before" ] || { echo 'npm changed source manifests unexpectedly; review those changes before continuing.' >&2; exit 1; }
-    verify_node_modules
+    case "$dependency_status" in 10|11) ;; *) exit "$dependency_status";; esac
+    global_root=$("$NPM" root --global)
+    global_status=0
+    node "$WORKSPACE_CHECK" inspect-globals "$global_root" || global_status=$?
+    case "$global_status" in 0|11) ;; *) exit "$global_status";; esac
+    if [ "$dependency_status" = 11 ] || [ "$global_status" = 11 ]; then
+        confirm_tool_upgrade 'Install the versions in package-lock.json in this Langium workspace? Global packages will be preserved.' || exit 1
+    fi
+    before=$(node "$WORKSPACE_CHECK" snapshot)
+    node "$WORKSPACE_CHECK" prepare-install "$global_root" "$NPM"
+    "$NPM" install --prefer-offline --no-save --ignore-scripts --include=dev --no-audit --no-fund
+    [ "$(node "$WORKSPACE_CHECK" snapshot)" = "$before" ] || { echo 'npm changed a source manifest; inspect the changes before proceeding.' >&2; exit 1; }
+    node "$WORKSPACE_CHECK" check
 fi
-npm run langium:generate
-npm run build
+"$NPM" run langium:generate
+"$NPM" run build
 for artifact in packages/language/out/index.js packages/extension/out/extension/main.cjs packages/extension/out/language/main.cjs packages/extension/syntaxes/clinical-dsl.tmLanguage.json; do
     [ -f "$artifact" ] || { echo "Missing build artifact: $artifact" >&2; exit 1; }
 done
@@ -731,20 +727,42 @@ if [ "$ready" != 1 ]; then
         echo 'The existing 2026-10-05 import is incomplete/incompatible. Complete it explicitly with its original archive; no data was replaced.' >&2
         exit 1
     fi
-    ARCHIVE="$RUNTIME/downloads/RxNorm_full_prescribe_10052026.zip"
-    if [ ! -e "$ARCHIVE" ]; then
-        curl --fail --location --proto '=https' --tlsv1.2 https://download.nlm.nih.gov/rxnorm/RxNorm_full_prescribe_10052026.zip -o "$ARCHIVE.part"
-        mv "$ARCHIVE.part" "$ARCHIVE"
-    fi
-    printf '%s  %s\n' 8ed351c29f3cb56bedeb8e2bcb8fa56931f8d7eb88e2280dc9772d7d3eb16977 "$ARCHIVE" | sha256sum -c -
-    expected_rrf() {
-        printf '%s  %s\n' 555730c3ff2a981796dc5d649acc482e4685f7a31f7b0442941393ae50dd5209 "$DATA/rrf/RXNCONSO.RRF"
-        printf '%s  %s\n' cca47f32a2c32ef60d65c6789851385ff5dcf287750ca01a53f800a5cf5ef694 "$DATA/rrf/RXNREL.RRF"
-        printf '%s  %s\n' b5a476f2bfbef9082144fd2bf00eb0de46f7b0b63da822d856067b9935914dda "$DATA/rrf/RXNSAT.RRF"
-    }
-    if ! expected_rrf | sha256sum -c - >/dev/null 2>&1; then
-        unzip -o -j "$ARCHIVE" 'rrf/RXNCONSO.RRF' 'rrf/RXNREL.RRF' 'rrf/RXNSAT.RRF' -d "$DATA/rrf"
-        expected_rrf | sha256sum -c -
+    declare -A rrf_hash=(
+        [RXNCONSO.RRF]=555730c3ff2a981796dc5d649acc482e4685f7a31f7b0442941393ae50dd5209
+        [RXNREL.RRF]=cca47f32a2c32ef60d65c6789851385ff5dcf287750ca01a53f800a5cf5ef694
+        [RXNSAT.RRF]=b5a476f2bfbef9082144fd2bf00eb0de46f7b0b63da822d856067b9935914dda
+    )
+    needed=()
+    for file in "${!rrf_hash[@]}"; do
+        if ! printf '%s  %s\n' "${rrf_hash[$file]}" "$DATA/rrf/$file" | sha256sum -c --status 2>/dev/null; then
+            needed+=("$file")
+        fi
+    done
+    if ((${#needed[@]})); then
+        ARCHIVE="$RUNTIME/downloads/RxNorm_full_prescribe_10052026.zip"
+        archive_sha=8ed351c29f3cb56bedeb8e2bcb8fa56931f8d7eb88e2280dc9772d7d3eb16977
+        if ! printf '%s  %s\n' "$archive_sha" "$ARCHIVE" | sha256sum -c --status 2>/dev/null; then
+            part=$(mktemp "$RUNTIME/downloads/rxnorm.XXXXXX")
+            if curl --fail --location --proto '=https' --tlsv1.2 https://download.nlm.nih.gov/rxnorm/RxNorm_full_prescribe_10052026.zip -o "$part" &&
+                printf '%s  %s\n' "$archive_sha" "$part" | sha256sum -c --status; then
+                mv -f -- "$part" "$ARCHIVE"
+            else
+                rm -f -- "$part"
+                echo 'RxNorm download failed verification. Retry to download a fresh copy.' >&2
+                exit 1
+            fi
+        fi
+        for file in "${needed[@]}"; do
+            part=$(mktemp "$DATA/rrf/extract.XXXXXX")
+            if unzip -p "$ARCHIVE" "rrf/$file" > "$part" &&
+                printf '%s  %s\n' "${rrf_hash[$file]}" "$part" | sha256sum -c --status; then
+                mv -f -- "$part" "$DATA/rrf/$file"
+            else
+                rm -f -- "$part"
+                echo "Failed to recover $file from the release archive." >&2
+                exit 1
+            fi
+        done
     fi
     IMPORT_COMMANDS=("run import-rxnorm \"$DATA/rrf\" 2026-10-05" "run import-product-attributes \"$DATA/rrf\" 2026-10-05")
 else
@@ -764,8 +782,10 @@ for case_name in valid invalid; do
 done
 cd "$SCALA"
 run_sbt compile test "${IMPORT_COMMANDS[@]}" "run resolve \"$SMOKE/valid.ast.json\" \"$SMOKE/valid.result.json\"" "run resolve \"$SMOKE/invalid.ast.json\" \"$SMOKE/invalid.result.json\""
-if [ "${#IMPORT_COMMANDS[@]}" -gt 0 ]; then sql 'ANALYZE;' >/dev/null; fi
-[ "$(sql "$QUERY")" = 1 ] || { echo 'RxNorm release/product provenance verification failed.' >&2; exit 1; }
+if [ "${#IMPORT_COMMANDS[@]}" -gt 0 ]; then
+    sql 'ANALYZE;' >/dev/null
+    [ "$(sql "$QUERY")" = 1 ] || { echo 'RxNorm release/product provenance verification failed.' >&2; exit 1; }
+fi
 node - "$SMOKE" <<'JS'
 const fs = require('node:fs');
 const root = process.argv[2];
@@ -779,13 +799,22 @@ for (const name of ['valid', 'invalid']) {
     console.log(`PASS: ${name} .clinical -> Langium -> Scala -> PostgreSQL/RxNorm`);
 }
 JS
-check_language_server
+node "$SCALA/scripts/probe-editor.mjs" lsp "$LANGIUM/packages/extension/out/language/main.cjs" "$SMOKE/valid.clinical"
 [ "$(sql 'SELECT 1;')" = 1 ] || { echo 'Final PostgreSQL health check failed.' >&2; exit 1; }
 node - "$RUNTIME" "$SCALA" "$LANGIUM" "$JAVA_HOME" "$NODE_HOME" "$HEALTH" <<'JS'
 const fs = require('node:fs');
 const {execFileSync} = require('node:child_process');
 const [runtime, scala, langium, javaHome, nodeHome, health] = process.argv.slice(2);
-fs.writeFileSync(runtime + '/tools/layout.json', JSON.stringify({javaHome, nodeHome, sbtHome: runtime + '/tools/sbt'}, null, 2));
+function writeSettings(file, value) {
+    const text = JSON.stringify(value, null, 2);
+    if (fs.existsSync(file) && fs.readFileSync(file, 'utf8') === text) return;
+    const part = file + '.aurora-' + process.pid;
+    try {
+        fs.writeFileSync(part, text, {flag:'wx'});
+        fs.renameSync(part, file);
+    } finally { fs.rmSync(part, {force:true}); }
+}
+writeSettings(runtime + '/tools/layout.json', {javaHome, nodeHome, sbtHome: process.env.SBT_HOME});
 // Attached VS Code uses the Linux workspace's settings and paths.
 const settingsFile = '/workspace/.vscode/settings.json';
 fs.mkdirSync('/workspace/.vscode', {recursive:true});
@@ -794,15 +823,19 @@ Object.assign(settings, {
     'clinicalDsl.rxnorm.scalaRoot': scala, 'clinicalDsl.rxnorm.toolsRoot': runtime + '/tools',
     'clinicalDsl.rxnorm.release': '2026-10-05', 'clinicalDsl.rxnorm.onSave': true,
     'files.autoSave': 'afterDelay', 'files.autoSaveDelay': 1000,
-    'clinicalDsl.rxnorm.pgHost': '127.0.0.1', 'clinicalDsl.rxnorm.pgPort': 5432,
-    'clinicalDsl.rxnorm.pgDatabase': 'rxnorm_public', 'clinicalDsl.rxnorm.pgUser': 'rxnorm_lab',
+    'clinicalDsl.rxnorm.pgHost': process.env.PGHOST, 'clinicalDsl.rxnorm.pgPort': Number(process.env.PGPORT),
+    'clinicalDsl.rxnorm.pgDatabase': process.env.PGDATABASE, 'clinicalDsl.rxnorm.pgUser': process.env.PGUSER,
     'clinicalDsl.rxnorm.timeoutSeconds': 300
 });
-fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));
+writeSettings(settingsFile, settings);
+const autocomplete = execFileSync(process.execPath,
+    [scala + '/scripts/probe-editor.mjs', 'autocomplete', settingsFile], {encoding:'utf8'}).trim();
+console.log('RxNorm autocomplete: ' + autocomplete + '. See ' + scala + '/PRODUCT-AUTOCOMPLETE.md for the editor service.');
 const head = cwd => execFileSync('git', ['rev-parse', 'HEAD'], {cwd,encoding:'utf8'}).trim();
 fs.writeFileSync(health, JSON.stringify({status:'runtime-checks-passed', checkedAt:new Date().toISOString(),
     databaseMode:'docker-linux-runtime', scalaHead:head(scala), langiumHead:head(langium),
-    postgres:'authenticated-query-pass', rxnorm:'provenance-pass', scala:'incremental-compile-test-pass',
+    autocomplete, postgres:'authenticated-query-pass', rxnorm:'provenance-pass', scala:'incremental-compile-test-pass',
     langium:'generate-build-pass', clinicalValid:'pass', clinicalInvalid:'pass', languageServer:'initialize-diagnostics-pass'}, null, 2));
 JS
+node "$SCALA/scripts/finish-smoke.mjs" "$SMOKE"
 printf 'Linux runtime checks passed. Demo: %s\nHealth: %s\n' "$DEMO" "$HEALTH"
