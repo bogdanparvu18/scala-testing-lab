@@ -18,6 +18,9 @@ jobs:
         shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - name: Check the Windows entry point and recovery paths
         shell: pwsh
         env:
@@ -30,10 +33,6 @@ jobs:
             & $engine -NoProfile -NonInteractive -File $test.FullName
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
-      - uses: actions/setup-node@v4
-        if: matrix.shell == 'pwsh'
-        with:
-          node-version: '24'
       - name: Check recovery of project dependencies on Windows
         if: matrix.shell == 'pwsh'
         shell: pwsh

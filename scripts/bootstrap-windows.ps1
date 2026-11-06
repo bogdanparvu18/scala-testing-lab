@@ -1,7 +1,7 @@
 # setup options
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [string]$Root = (Join-Path $PSScriptRoot 'AuroraMedicationLab'),
+    [string]$Root,
     [string]$ScalaRepoPath,
     [string]$LangiumRepoPath,
     [string]$SetupPath,
@@ -42,6 +42,11 @@ param(
     [Parameter(DontShow = $true)][ValidateRange(0, 2)][int]$RelaunchCount = 0,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$RemainingArguments
 )
+
+# Windows PowerShell 5.1 initializes PSScriptRoot after binding parameters.
+if (-not $PSBoundParameters.ContainsKey('Root')) {
+    $Root = Join-Path $PSScriptRoot 'AuroraMedicationLab'
+}
 
 # PowerShell treats double-dash switches as literal positional arguments when
 # called from an existing shell. Normalize the documented --Docker spelling;
