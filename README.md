@@ -9,7 +9,7 @@ This is a personal integration laboratory for work that can later be adapted to 
 
 ## Windows bootstrap
 
-From the repository root, run `.\scripts\bootstrap-windows.ps1` to prepare the native lab in `scripts\AuroraMedicationLab`, or `.\scripts\bootstrap-windows.ps1 --Docker` for the persistent Linux lab. Both modes look for usable installations and configure them before installing missing tools. When an installed version requires replacement, setup describes the change and asks for consent. Run with `-Help` for path overrides and PostgreSQL options. See the [Romanian guide to installation, recovery and upgrades](docs/bootstrap-windows.ro.md).
+From the repository root, run `.\scripts\bootstrap-windows.ps1` to prepare the native lab in `scripts\AuroraMedicationLab`, or `.\scripts\bootstrap-windows.ps1 --Docker` for the persistent Linux lab. Both modes look for usable installations and configure them before installing missing tools. When an installed version requires replacement, setup describes the change and asks for consent. Run with `-Help` for path overrides and PostgreSQL options.
 
 The bootstrap defaults to the application login `scala_lab` with password `aurora`, including new managed Docker installations. It authenticates on each run. On an existing PostgreSQL server, an administrator verifies the catalog before setup creates a missing role/database. Existing passwords are never reset on an authentication error. `PGPASSWORD` can supply an existing password; `-PgAdminUser` selects the administrator needed for recovery. Legacy Docker installations retain their original `rxnorm_lab` account and data. The manual CLI instructions below let you choose your own application password.
 
