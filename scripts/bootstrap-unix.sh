@@ -74,6 +74,9 @@ if [[ ${PGHOST:-} != 127.0.0.1 && ${PGHOST:-} != ::1 ]] ||
 fi
 export PGCONNECT_TIMEOUT=10 PGSSLMODE=disable
 unset PGHOSTADDR PGSERVICE
+BOOTSTRAP_ADMIN_PASSWORD=${AURORA_PG_ADMIN_PASSWORD:-}
+export -n BOOTSTRAP_ADMIN_PASSWORD
+unset AURORA_PG_ADMIN_PASSWORD
 
 # Selection is scoped to this Linux runtime. A stale PATH does not imply absence.
 tool_fail() { printf 'Tool discovery: %s\n' "$*" >&2; return 1; }
@@ -572,16 +575,22 @@ sql() { "$PSQL" -X -w -v ON_ERROR_STOP=1 -Atc "$1"; }
 initialize_lab_database() {
     local admin_password server_number has_role has_db verification_db literal
     [[ "$PGUSER" =~ ^[A-Za-z_][A-Za-z_0-9]{0,62}$ ]] || { echo 'Creating a lab role requires a simple PostgreSQL identifier.' >&2; return 1; }
-    if [ "${NON_INTERACTIVE:-0}" = 1 ] || [ ! -t 0 ]; then
-        echo "PostgreSQL authentication/connection failed for '$PGUSER' at $PGHOST:$PGPORT/$PGDATABASE. Run interactively so an administrator can check missing roles/databases. Existing credentials were not changed." >&2
-        return 1
-    fi
     echo "Cannot connect as '$PGUSER' to '$PGDATABASE'. An administrator must check whether the role or database is missing." >&2
-    IFS= read -r -s -p "Administrator password for $PG_ADMIN_USER on $PGHOST:$PGPORT: " admin_password || return 1
-    printf '\n' >&2
-    if ! server_number=$(PGPASSWORD="$admin_password" "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;'); then
-        echo "PostgreSQL administrator authentication/connection failed for '$PG_ADMIN_USER'. No role or database was changed." >&2
-        return 1
+    # The PowerShell launcher may already have authenticated/recovered the
+    # managed-container administrator. Otherwise try the requested default once.
+    admin_password=${BOOTSTRAP_ADMIN_PASSWORD:-postgres}
+    if ! server_number=$(PGPASSWORD="$admin_password" "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;' 2>/dev/null); then
+        if [ "${NON_INTERACTIVE:-0}" = 1 ] || [ ! -t 0 ]; then
+            echo "Default PostgreSQL administrator authentication failed for '$PG_ADMIN_USER'. Run interactively to enter the existing password or recover access. Existing credentials were not changed." >&2
+            return 1
+        fi
+        echo "The default administrator password was rejected for '$PG_ADMIN_USER'." >&2
+        IFS= read -r -s -p "Existing administrator password (Enter for recovery instructions): " admin_password || return 1
+        printf '\n' >&2
+        if [ -z "$admin_password" ] || ! server_number=$(PGPASSWORD="$admin_password" "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;'); then
+            echo "PostgreSQL administrator authentication failed. For a Windows-hosted server, run bootstrap-windows.ps1 -RecoverPostgresPassword -PgAdminUser '$PG_ADMIN_USER' -Port '$PGPORT' in an elevated PowerShell session, then rerun Docker setup. Managed Docker recovery is offered by the PowerShell launcher before this worker starts. No role or database was changed." >&2
+            return 1
+        fi
     fi
     [[ "$server_number" =~ ^[0-9]+$ ]] && ((server_number >= 150000)) || { echo 'PostgreSQL 15+ is required before creating lab objects.' >&2; return 1; }
     has_role=$(PGPASSWORD="$admin_password" "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname='$PGUSER';") || return 1
@@ -628,6 +637,7 @@ until "$PG_ISREADY" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -t 3
 done
 # This authenticated query checks both login and the actual server version.
 server_version=$(open_lab_database)
+unset BOOTSTRAP_ADMIN_PASSWORD
 [[ "$server_version" =~ ^[0-9]+$ ]] || { echo 'Cannot determine the authenticated PostgreSQL server version.' >&2; exit 1; }
 if ((server_version < 150000)); then
     if confirm_tool_upgrade "PostgreSQL $server_version is below the supported 15+ range. Show manual upgrade steps"; then

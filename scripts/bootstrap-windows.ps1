@@ -32,6 +32,7 @@ param(
     [string]$PgServiceName,
     [switch]$ProvisionDatabase,
     [string]$PgAdminUser = 'postgres',
+    [switch]$RecoverPostgresPassword,
     [string]$ContainerName = 'aurora-medication-auto-pg',
     [string]$VolumeName = 'aurora-medication-auto-pgdata',
     [string]$ScalaBranch = 'main',
@@ -63,7 +64,7 @@ $EntryHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $HealthFile = $null
 # Do not leave a prompted password or connection overrides in the caller's shell.
 $PreviousEnvironment = @{}
-foreach ($name in @('PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'POSTGRES_PASSWORD', 'PGCONNECT_TIMEOUT', 'PGSSLMODE', 'PGHOSTADDR', 'PGSERVICE')) {
+foreach ($name in @('PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'POSTGRES_PASSWORD', 'PGCONNECT_TIMEOUT', 'PGSSLMODE', 'PGHOSTADDR', 'PGSERVICE', 'AURORA_PG_ADMIN_PASSWORD')) {
     $PreviousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 $Utf8 = New-Object Text.UTF8Encoding($false)
@@ -105,7 +106,8 @@ function Initialize-ToolDiscovery {
         Docker = @{ executable = 'docker.exe'; hint = 'DOCKER_HOME'; relative = 'resources\bin\docker.exe'; registry = 'Docker Desktop'; package = 'Docker.DockerDesktop' }
     }
     if ($UseDocker) {
-        foreach ($name in @('Java', 'Node', 'Git', 'PostgreSQL','Sbt')) { $script:ToolDefinitions.Remove($name) }
+        foreach ($name in @('Java', 'Node', 'Git', 'Sbt')) { $script:ToolDefinitions.Remove($name) }
+        if (-not $RecoverPostgresPassword) { $script:ToolDefinitions.Remove('PostgreSQL') }
     } else { $script:ToolDefinitions.Remove('Docker') }
     if ($NoEditor) { $script:ToolDefinitions.Remove('Code') }
     foreach ($name in $script:ToolDefinitions.Keys) {
@@ -473,6 +475,12 @@ function Find-SystemTool([string]$Name, [string]$ExplicitPath) {
     }
     $candidates = New-Object 'System.Collections.Generic.List[string]'
     $evidence = New-Object 'System.Collections.Generic.List[string]'
+    if ($Name -eq 'PostgreSQL') {
+        # Managed binaries must remain discoverable in a new terminal even
+        # when the prior run deliberately used -SessionOnlyEnvironment.
+        $managedCandidate = Get-ManagedPostgresToolCandidate
+        if ($managedCandidate) { $candidates.Add($managedCandidate) }
+    }
     foreach ($candidate in @(Get-PathToolCandidates $definition.executable)) { $candidates.Add($candidate) }
     foreach ($scope in @('Process','User','Machine')) {
         $hint = [Environment]::GetEnvironmentVariable($definition.hint, $scope)
@@ -597,6 +605,224 @@ function Repair-NodeNpm($Node) {
     if ($result.state -ne 'compatible') { throw "Managed npm failed under selected Node: $($result.reason)" }
     return $result
 }
+function Assert-PlainPostgresPath([string]$Path) {
+    $cursor = [IO.Path]::GetFullPath($Path)
+    while ($cursor) {
+        if (Test-Path -LiteralPath $cursor -ErrorAction Stop) {
+            $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "PostgreSQL setup refuses linked path '$cursor'. Select an ordinary local directory." }
+        }
+        $parent = Split-Path -Parent $cursor
+        if (-not $parent -or $parent -eq $cursor) { break }
+        $cursor = $parent
+    }
+}
+function Get-ManagedPostgresCluster {
+    $directory = [IO.Path]::GetFullPath((Join-Path $Root 'postgres'))
+    $recordPath = Join-Path $directory 'cluster.json'
+    Assert-PlainPostgresPath $directory
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) { return $null }
+    Assert-PlainPostgresPath $recordPath
+    $record = Get-Content -LiteralPath $recordPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    $expectedData = [IO.Path]::GetFullPath((Join-Path $directory 'data'))
+    if ($record.schema -ne 1 -or $record.state -cne 'ready' -or
+        -not [string]::Equals([string]$record.dataDirectory, $expectedData, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $record.binDirectory -or -not [IO.Path]::IsPathRooted([string]$record.binDirectory) -or
+        [int]$record.port -lt 1 -or [int]$record.port -gt 65535) {
+        throw "Managed PostgreSQL state is incomplete or invalid at '$recordPath'. Recover that existing setup before initializing another cluster."
+    }
+    Assert-PlainPostgresPath $record.dataDirectory
+    Assert-PlainPostgresPath $record.binDirectory
+    if (-not (Test-Path -LiteralPath (Join-Path $record.dataDirectory 'PG_VERSION') -PathType Leaf)) { throw "Managed PostgreSQL data is missing at '$($record.dataDirectory)'. Recover it; no replacement cluster was created." }
+    return $record
+}
+function Get-ManagedPostgresToolCandidate {
+    $cluster = Get-ManagedPostgresCluster
+    if ($cluster) { $bin = [string]$cluster.binDirectory }
+    else {
+        $directory = [IO.Path]::GetFullPath((Join-Path $Root 'postgres'))
+        $recordPath = Join-Path $directory 'distribution.json'
+        if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) { return $null }
+        Assert-PlainPostgresPath $recordPath
+        $record = Get-Content -LiteralPath $recordPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $expected = [IO.Path]::GetFullPath((Join-Path $directory 'distribution'))
+        if ($record.schema -ne 1 -or $record.state -cne 'extracted' -or
+            -not [string]::Equals([string]$record.directory, $expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Managed PostgreSQL extraction is incomplete or invalid at '$recordPath'. Repair the preserved files; no duplicate download was attempted."
+        }
+        $bin = Join-Path $expected 'bin'
+    }
+    foreach ($name in @('psql.exe', 'postgres.exe', 'initdb.exe', 'pg_ctl.exe', 'pg_isready.exe')) {
+        $executable = Join-Path $bin $name
+        Assert-PlainPostgresPath $executable
+        if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw "Managed PostgreSQL tool '$executable' is missing. Repair that installation; no replacement was downloaded." }
+    }
+    return (Join-Path $bin 'psql.exe')
+}
+function Get-LocalPostgresClusterEvidence {
+    # Search independently of the selected psql version: an older stopped server
+    # may still own the user's data even when a newer client is first on PATH.
+    $evidence = New-Object 'Collections.Generic.List[string]'
+    foreach ($service in @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -match 'postgres' -or $_.PathName -match '(?:pg_ctl|postgres)[.]exe' })) {
+        $evidence.Add("Windows service '$($service.Name)' ($($service.State))")
+    }
+    if (@(Get-CimInstance Win32_Process -Filter "Name='postgres.exe'" -ErrorAction Stop).Count) { $evidence.Add('A postgres.exe process is running') }
+    $candidates = New-Object 'Collections.Generic.List[string]'
+    foreach ($scope in @('Process', 'User', 'Machine')) {
+        $configured = [Environment]::GetEnvironmentVariable('PGDATA', $scope)
+        if ($configured) { $evidence.Add("PGDATA configured in $scope environment: $configured") }
+    }
+    foreach ($registryRoot in @('HKLM:\SOFTWARE\PostgreSQL\Installations', 'HKLM:\SOFTWARE\WOW6432Node\PostgreSQL\Installations')) {
+        if (-not (Test-Path -LiteralPath $registryRoot -ErrorAction Stop)) { continue }
+        foreach ($key in @(Get-Item -LiteralPath $registryRoot) + @(Get-ChildItem -LiteralPath $registryRoot -ErrorAction Stop)) {
+            $registration = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+            if ($registration.'Data Directory') { $evidence.Add("Registered data directory '$($registration.'Data Directory')'") }
+            if ($registration.'Base Directory') { $candidates.Add((Join-Path $registration.'Base Directory' 'data')) }
+        }
+    }
+    foreach ($installation in @($env:PGHOME, $(if ($PsqlPath) { Split-Path (Split-Path $PsqlPath -Parent) -Parent }), 'C:\PostgreSQL')) {
+        if ($installation) { $candidates.Add((Join-Path $installation 'data')) }
+    }
+    foreach ($programRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) {
+        if (-not $programRoot) { continue }
+        $vendorRoot = Join-Path $programRoot 'PostgreSQL'
+        if (-not (Test-Path -LiteralPath $vendorRoot -PathType Container -ErrorAction Stop)) { continue }
+        foreach ($version in @(Get-ChildItem -LiteralPath $vendorRoot -Directory -Force -ErrorAction Stop)) { $candidates.Add((Join-Path $version.FullName 'data')) }
+    }
+    foreach ($candidate in $candidates | Sort-Object -Unique) {
+        if (Test-Path -LiteralPath $candidate -ErrorAction Stop) {
+            Assert-PlainPostgresPath $candidate
+            if (@(Get-ChildItem -LiteralPath $candidate -Force -ErrorAction Stop).Count) { $evidence.Add("Existing PostgreSQL data directory '$candidate'") }
+        }
+    }
+    # Portable clusters within the lab or explicitly trusted search locations.
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    foreach ($searchRoot in @($Root) + @($AdditionalSearchPath)) {
+        if ($searchRoot -and (Test-Path -LiteralPath $searchRoot -PathType Container -ErrorAction Stop)) { $pending.Push([IO.Path]::GetFullPath($searchRoot)) }
+    }
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    while ($pending.Count) {
+        $directory = $pending.Pop()
+        if (-not $seen.Add($directory)) { continue }
+        $item = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Portable PostgreSQL discovery cannot inspect linked directory '$directory'. Select/recover the intended existing cluster explicitly." }
+        if (Test-Path -LiteralPath (Join-Path $directory 'PG_VERSION') -PathType Leaf -ErrorAction Stop) { $evidence.Add("Initialized PostgreSQL directory '$directory'"); continue }
+        if (Test-Path -LiteralPath (Join-Path $directory '.git') -ErrorAction Stop) { continue }
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Directory -Force -ErrorAction Stop)) {
+            if ($child.Name -notin @('node_modules', 'target', '.git', 'downloads', 'backups', '.metals', '.bsp', '.bloop', 'editor-profile')) { $pending.Push($child.FullName) }
+        }
+    }
+    return @($evidence | Sort-Object -Unique)
+}
+function Assert-NoExistingPostgresCluster {
+    $evidence = @(Get-LocalPostgresClusterEvidence)
+    if ($evidence.Count) { throw ("Existing PostgreSQL evidence prevents a new cluster: " + ($evidence -join '; ') + '. Select that instance/service and recover its access; no second cluster was created.') }
+}
+function New-PostgresPrivateDirectory([string]$Path) {
+    Assert-PlainPostgresPath $Path
+    if (Test-Path -LiteralPath $Path) { throw "Refusing to overwrite existing PostgreSQL setup directory '$Path'." }
+    New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
+    Protect-BootstrapState $Path
+}
+function Save-ManagedPostgresCluster([string]$BinDirectory, [string]$ServiceName, [string]$Status) {
+    Save-Json (Join-Path $Root 'postgres\cluster.json') @{
+        schema = 1; state = $Status
+        dataDirectory = [IO.Path]::GetFullPath((Join-Path $Root 'postgres\data'))
+        binDirectory = $BinDirectory; adminUser = $PgAdminUser; port = $Port; serviceName = $ServiceName
+    }
+}
+function Install-NewPostgresServer([string]$Winget, [string]$Package) {
+    Assert-NoExistingPostgresCluster
+    $managed = Join-Path $Root 'postgres'
+    New-PostgresPrivateDirectory $managed
+    $distribution = [IO.Path]::GetFullPath((Join-Path $managed 'distribution'))
+    $record = @{ schema=1; state='extracting'; directory=$distribution; package=$Package }
+    Save-Json (Join-Path $managed 'distribution.json') $record
+    $options = Join-Path $managed 'installer.options'
+    try {
+        # EDB's regular installer starts a service listening on '*'. Extract
+        # binaries only; our initdb/pg_ctl path never exposes the lab password
+        # beyond loopback, even during the first server startup.
+        if ($distribution -match '[\r\n]') { throw 'Unsupported newline in PostgreSQL distribution path.' }
+        $text = "extract-only=1`nprefix=$distribution`n"
+        [IO.File]::WriteAllText($options, $text, $Utf8)
+        $override = '--mode unattended --unattendedmodeui none --optionfile ' + (ConvertTo-WindowsArgument $options)
+        & $Winget install --id $Package --exact --source winget --no-upgrade --accept-source-agreements --accept-package-agreements --override $override | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "PostgreSQL extraction returned $LASTEXITCODE. Its files were preserved at '$managed'; inspect the partial extraction before retrying. No database was initialized." }
+        $bin = Join-Path $distribution 'bin'
+        foreach ($name in @('psql.exe', 'postgres.exe', 'initdb.exe', 'pg_ctl.exe', 'pg_isready.exe')) {
+            $executable = Join-Path $bin $name
+            Assert-PlainPostgresPath $executable
+            $probe = Invoke-ToolVersion $executable @('--version')
+            if (-not $probe.ok) { throw "Extracted PostgreSQL tool '$executable' failed validation. Repair the preserved distribution; no database was initialized." }
+        }
+        Assert-NoExistingPostgresCluster
+        $record.state = 'extracted'
+        Save-Json (Join-Path $managed 'distribution.json') $record
+        return (Join-Path $bin 'psql.exe')
+    } finally {
+        if ([IO.File]::Exists($options)) { [IO.File]::Delete($options) }
+    }
+}
+function Assert-ManagedPostgresDirectory {
+    $directory = [IO.Path]::GetFullPath((Join-Path $Root 'postgres'))
+    if (-not (Test-Path -LiteralPath $directory)) { New-PostgresPrivateDirectory $directory; return }
+    Assert-PlainPostgresPath $directory
+    $recordPath = Join-Path $directory 'distribution.json'
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) { throw "Existing PostgreSQL directory '$directory' is not a completed managed extraction. Inspect/recover it before initializing any data." }
+    Assert-PlainPostgresPath $recordPath
+    $record = Get-Content -LiteralPath $recordPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    $expected = [IO.Path]::GetFullPath((Join-Path $directory 'distribution'))
+    if ($record.schema -ne 1 -or $record.state -cne 'extracted' -or
+        -not [string]::Equals([string]$record.directory, $expected, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([IO.Path]::GetFullPath($PsqlPath), (Join-Path $expected 'bin\psql.exe'), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Managed PostgreSQL extraction is incomplete or differs from the selected binary. Inspect '$recordPath'; no duplicate download or initialization was attempted."
+    }
+    $unexpected = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop | Where-Object { $_.Name -notin @('distribution', 'distribution.json') })
+    if ($unexpected.Count) { throw "Existing files in '$directory' prevent initialization. Recover that setup before retrying." }
+}
+function Initialize-NewLocalPostgres {
+    $managed = Get-ManagedPostgresCluster
+    $bin = [IO.Path]::GetFullPath((Split-Path -Parent $PsqlPath))
+    foreach ($name in @('postgres.exe', 'initdb.exe', 'pg_ctl.exe')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $bin $name) -PathType Leaf)) { throw "Server tool '$name' is missing beside '$PsqlPath'. Select a complete PostgreSQL server installation before initializing local data." }
+    }
+    Assert-PlainPostgresPath $bin
+    $pgCtl = Join-Path $bin 'pg_ctl.exe'
+    if ($managed) {
+        if ($managed.serviceName) { throw "Managed PostgreSQL belongs to Windows service '$($managed.serviceName)'. Restore/start that service; no duplicate standalone server was created." }
+        if ([int]$managed.port -ne $Port -or -not [string]::Equals([string]$managed.binDirectory, $bin, [StringComparison]::OrdinalIgnoreCase)) { throw 'Managed PostgreSQL binary location or port differs. Select its original configuration before starting it.' }
+    } else {
+        Assert-NoExistingPostgresCluster
+        if ($PgAdminUser -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw 'A new PostgreSQL administrator requires a simple role identifier.' }
+        $directory = Join-Path $Root 'postgres'
+        Assert-ManagedPostgresDirectory
+        Save-ManagedPostgresCluster $bin '' 'initializing'
+        $passwordFile = Join-Path $directory 'initdb.password'
+        try {
+            [IO.File]::WriteAllText($passwordFile, "postgres`n", $Utf8)
+            $initDb = Join-Path $bin 'initdb.exe'
+            $dataDirectory = Join-Path $directory 'data'
+            Run { & $initDb -D $dataDirectory --username $PgAdminUser --pwfile $passwordFile --encoding UTF8 --auth-host=scram-sha-256 --auth-local=scram-sha-256 } | Out-Host
+            # Persist only this newly created cluster's settings so that later
+            # starts and password recovery see the same port/loopback binding.
+            $listenHost = if ($PgHost -eq '::1') { '::1' } else { '127.0.0.1' }
+            [IO.File]::AppendAllText((Join-Path $dataDirectory 'postgresql.conf'), "`n# Aurora local laboratory`nlisten_addresses = '$listenHost'`nport = $Port`n", $Utf8)
+            Save-ManagedPostgresCluster $bin '' 'ready'
+        } finally { if ([IO.File]::Exists($passwordFile)) { [IO.File]::Delete($passwordFile) } }
+        $managed = Get-ManagedPostgresCluster
+    }
+    $server = Join-Path $bin 'postgres.exe'
+    $version = Invoke-ToolVersion $server @('--version')
+    $major = [regex]::Match($version.text, '(?i)PostgreSQL\)?\s+(\d+)(?:\.|\s|$)')
+    $dataMajor = (Get-Content -LiteralPath (Join-Path $managed.dataDirectory 'PG_VERSION') -Raw).Trim()
+    if (-not $version.ok -or -not $major.Success -or $major.Groups[1].Value -cne $dataMajor) { throw 'Managed PostgreSQL data and server binary major versions do not match. No automatic cluster upgrade was attempted.' }
+    $listenHost = if ($PgHost -eq '::1') { '::1' } else { '127.0.0.1' }
+    $log = Join-Path (Split-Path $managed.dataDirectory -Parent) 'server.log'
+    Write-Host "Starting managed PostgreSQL at '$($managed.dataDirectory)' on ${listenHost}:$Port."
+    Run { & $pgCtl -D $managed.dataDirectory -l $log -w -t $StartupTimeoutSeconds start } | Out-Host
+    return $true
+}
 function Resolve-SystemTool([string]$Name, [string]$ExplicitPath) {
     $result = Find-SystemTool $Name $ExplicitPath
     if ($ExplicitPath -and $result.state -eq 'incompatible' -and $result.canUpgrade) {
@@ -621,8 +847,13 @@ function Resolve-SystemTool([string]$Name, [string]$ExplicitPath) {
         $arguments = @('install','--id',$package,'--exact','--source','winget','--accept-source-agreements','--accept-package-agreements')
         if (-not $upgrade) { $arguments += '--no-upgrade' }
         Write-Host "Configuring $package via WinGet."
-        & $winget.Source @arguments | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw "$Name installer returned $LASTEXITCODE. Complete any required elevation/reboot and rerun." }
+        $installedPostgresPath = $null
+        if ($Name -eq 'PostgreSQL') {
+            $installedPostgresPath = Install-NewPostgresServer $winget.Source $package
+        } else {
+            & $winget.Source @arguments | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "$Name installer returned $LASTEXITCODE. Complete any required elevation/reboot and rerun." }
+        }
         $script:ToolInventory = $null
         $script:ToolVendorLoaded.Remove($Name)
         if ($Name -eq 'PostgreSQL') { $script:ToolVendorLoaded.Remove('Services') }
@@ -631,7 +862,7 @@ function Resolve-SystemTool([string]$Name, [string]$ExplicitPath) {
         $script:ToolSearchErrors.Shared.Clear()
         $script:ToolRecords[$Name].Clear()
         # The original path can still refer to the older, now side-by-side version.
-        $result = Find-SystemTool $Name
+        $result = Find-SystemTool $Name $installedPostgresPath
         if ($result.state -eq 'npm-recovery') { $result = Repair-NodeNpm $result }
         if ($result.state -ne 'compatible') { throw "$Name failed post-install validation ($($result.state)): $($result.reason)." }
     }
@@ -990,13 +1221,14 @@ function Protect-BootstrapState([string]$Path) {
     Run { icacls.exe $Path '/inheritance:r' '/grant:r' "${identity}:(OI)(CI)F" 'SYSTEM:(OI)(CI)F' } | Out-Null
 }
 function Save-DockerCredentials($Path, $Secrets) {
+    $bootstrapPassword = if ($Secrets.bootstrapPassword) { [string]$Secrets.bootstrapPassword } else { [string]$Secrets.password }
     if (Test-Path -LiteralPath $Path) {
         $saved = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
-        if ($saved.password -ceq $Secrets.password -and [int]$saved.port -eq $Port) { return }
+        if ($saved.password -ceq $Secrets.password -and $saved.bootstrapPassword -ceq $bootstrapPassword -and [int]$saved.port -eq $Port) { return }
     }
     $tempPath = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     try {
-        Save-Json $tempPath @{ password = $Secrets.password; port = $Port }
+        Save-Json $tempPath @{ password = $Secrets.password; bootstrapPassword = $bootstrapPassword; port = $Port }
         if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($tempPath, $Path, [Management.Automation.Language.NullString]::Value) }
         else { [IO.File]::Move($tempPath, $Path) }
     } finally { if ([IO.File]::Exists($tempPath)) { [IO.File]::Delete($tempPath) } }
@@ -1062,6 +1294,64 @@ function Select-DockerDatabaseImage {
     return @{ name = 'postgres:16'; major = 16; mount = '/var/lib/postgresql/data' }
 }
 function Invoke-DockerRuntime {
+    function Test-ManagedAdminPassword([string]$Password) {
+        $savedPassword = $env:PGPASSWORD
+        $ErrorActionPreference = 'Continue'
+        try {
+            $env:PGPASSWORD = $Password
+            $reply = @(& docker.exe exec -e PGPASSWORD $databaseContainer.Id psql -X -w -h 127.0.0.1 -p 5432 -U $workerAdmin -d postgres -v ON_ERROR_STOP=1 -Atc 'SELECT 1;' 2>$null)
+            return ($LASTEXITCODE -eq 0 -and $reply.Count -eq 1 -and $reply[0] -eq '1')
+        } finally { $env:PGPASSWORD = $savedPassword }
+    }
+    function Get-ManagedAdminPassword {
+        if ($workerAdmin -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw 'Docker administrator recovery requires a simple PostgreSQL role name.' }
+        Write-Host "Trying the default PostgreSQL administrator password for '$workerAdmin' in '$ContainerName'."
+        if (Test-ManagedAdminPassword 'postgres') { return 'postgres' }
+        if ($workerAdmin -ceq $DbUser -and $env:PGPASSWORD -and $env:PGPASSWORD -cne 'postgres' -and (Test-ManagedAdminPassword $env:PGPASSWORD)) { return $env:PGPASSWORD }
+        if (-not (Test-BootstrapInteractive)) { throw "Default administrator authentication failed for '$workerAdmin'. Rerun interactively to enter the existing password or recover it inside '$ContainerName'." }
+        $secure = Read-Host "Existing administrator password for $workerAdmin (Enter to recover it)" -AsSecureString
+        try { $knownPassword = [Net.NetworkCredential]::new('', $secure).Password }
+        finally { $secure.Dispose() }
+        if ($knownPassword -and (Test-ManagedAdminPassword $knownPassword)) { return $knownPassword }
+        Remove-Variable knownPassword -ErrorAction SilentlyContinue
+        Write-Host "The administrator password was rejected. Recovery will change only the password of '$workerAdmin' in container '$ContainerName'."
+        $consent = Read-Host 'Recover this password using the container PostgreSQL account? [y/N]'
+        if (([string]$consent).Trim() -notmatch '^(y|yes|d|da)$') { throw 'PostgreSQL password recovery declined. No password was changed.' }
+        # Pin the inspected container ID and prove the authenticated server's
+        # identity before changing a password. No HBA/ident rules are relaxed.
+        $identitySql = "SELECT json_build_object('role',current_user,'data',current_setting('data_directory'),'port',current_setting('port'),'admin',rolcanlogin AND (rolsuper OR rolcreaterole)) FROM pg_catalog.pg_roles WHERE rolname=current_user;"
+        try {
+            $identity = (Run { docker.exe exec --user postgres -e PGPASSFILE=/dev/null -e PGPASSWORD= $databaseContainer.Id psql -X -w -h /var/run/postgresql -p 5432 -U $workerAdmin -d postgres -v ON_ERROR_STOP=1 -Atc $identitySql }) | ConvertFrom-Json
+        } catch { throw "Local socket authentication inside '$ContainerName' is unavailable for '$workerAdmin'. Use an existing database administrator or the container's configured recovery procedure. Authentication configuration and passwords were not changed." }
+        $expectedData = @($databaseContainer.Config.Env | Where-Object { $_ -clike 'PGDATA=*' } | ForEach-Object { $_.Substring(7).TrimEnd('/') })
+        if ($expectedData.Count -ne 1 -or $identity.role -cne $workerAdmin -or $identity.data.TrimEnd('/') -cne $expectedData[0] -or $identity.port -ne '5432' -or -not $identity.admin) {
+            throw 'Docker recovery identity check failed. The selected role/data directory does not match the inspected container; no password was changed.'
+        }
+        $first = Read-Host "New PostgreSQL password for $workerAdmin" -AsSecureString
+        $second = Read-Host 'Confirm the new PostgreSQL password' -AsSecureString
+        $savedEncoding = $OutputEncoding
+        try {
+            $newPassword = [Net.NetworkCredential]::new('', $first).Password
+            $confirmation = [Net.NetworkCredential]::new('', $second).Password
+            if (-not $newPassword -or $newPassword -match '[\r\n\x00]' -or $newPassword -cne $confirmation) { throw 'Passwords must be nonempty, match exactly, and contain no newline. No password was changed.' }
+            $OutputEncoding = New-Object Text.UTF8Encoding($false)
+            # Without a Docker TTY, psql reads its two masked password prompts
+            # from stdin and sends a verifier rather than plaintext ALTER ROLE.
+            $ErrorActionPreference = 'Continue'
+            "$newPassword`n$newPassword" | & docker.exe exec -i --user postgres -e PGPASSFILE=/dev/null -e PGPASSWORD= -e PGCLIENTENCODING=UTF8 $databaseContainer.Id psql -X -w -h /var/run/postgresql -p 5432 -U $workerAdmin -d postgres -v ON_ERROR_STOP=1 -c '\password' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL password recovery did not complete. Check the selected container and retry.' }
+            if (-not (Test-ManagedAdminPassword $newPassword)) { throw 'The password command completed, but TCP authentication with the new password failed. Check the server authentication policy before continuing.' }
+            if (Test-ManagedAdminPassword ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))) {
+                throw 'The password was updated, but the current TCP authentication policy also accepts an incorrect password. Password authentication could not be verified; review the server policy before continuing.'
+            }
+            Write-Host "Recovered PostgreSQL administrator '$workerAdmin'; authenticated TCP login passed."
+            return $newPassword
+        } finally {
+            $OutputEncoding = $savedEncoding
+            $first.Dispose(); $second.Dispose()
+            Remove-Variable newPassword, confirmation -ErrorAction SilentlyContinue
+        }
+    }
     foreach ($name in @($ContainerName, $VolumeName, $RuntimeContainerName, $RuntimeVolumeName, $RuntimeCacheVolumeName)) {
         if ($name -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$') { throw "Unsupported Docker object name '$name'." }
     }
@@ -1154,6 +1444,7 @@ function Invoke-DockerRuntime {
             $secrets = @{ password = $existingPasswords[0].Substring(18); port = $Port }
         }
         if (-not $secrets) { $secrets = @{ password = $(if ($env:PGPASSWORD) { $env:PGPASSWORD } else { 'aurora' }); port = $Port } }
+        $secrets = @{ password = [string]$secrets.password; bootstrapPassword = $(if ($secrets.bootstrapPassword) { [string]$secrets.bootstrapPassword } else { [string]$secrets.password }); port = $secrets.port }
         if (-not $secrets.password -or ($secrets.port -and [int]$secrets.port -ne $Port)) { throw 'Stored Docker credentials/port do not match the selected configuration.' }
         if ($databaseContainer) {
             $existingUsers = @($databaseContainer.Config.Env | Where-Object { $_ -clike 'POSTGRES_USER=*' } | ForEach-Object { $_.Substring(14) })
@@ -1169,7 +1460,7 @@ function Invoke-DockerRuntime {
                 $bindings[0].HostIp -ne '127.0.0.1' -or $bindings[0].HostPort -ne [string]$Port -or
                 $mounts[0].Type -ne 'volume' -or $mounts[0].Name -ne $VolumeName -or -not $mounts[0].RW -or
                 "POSTGRES_USER=$DbUser" -cnotin $databaseContainer.Config.Env -or 'POSTGRES_DB=rxnorm_public' -notin $databaseContainer.Config.Env -or
-                "POSTGRES_PASSWORD=$($secrets.password)" -cnotin $databaseContainer.Config.Env -or
+                "POSTGRES_PASSWORD=$($secrets.bootstrapPassword)" -cnotin $databaseContainer.Config.Env -or
                 $databaseContainer.HostConfig.NetworkMode -notin @('default', 'bridge')) {
                 throw 'Existing PostgreSQL container has incompatible image, mounts, network, port, or credentials. No container/volume was replaced.'
             }
@@ -1188,14 +1479,14 @@ function Invoke-DockerRuntime {
             $runtimeContainer.HostConfig.NetworkMode -ne $expectedNetwork -or
             "PGHOST=$runtimeHost" -cnotin $runtimeContainer.Config.Env -or "PGPORT=$runtimePort" -cnotin $runtimeContainer.Config.Env -or
             "PGDATABASE=$Database" -cnotin $runtimeContainer.Config.Env -or "PGUSER=$DbUser" -cnotin $runtimeContainer.Config.Env -or
-            (-not $DockerUseHostPostgres -and "PGPASSWORD=$($secrets.password)" -cnotin $runtimeContainer.Config.Env)) {
+            (-not $DockerUseHostPostgres -and "PGPASSWORD=$($secrets.bootstrapPassword)" -cnotin $runtimeContainer.Config.Env)) {
             throw 'Existing Linux runtime does not match its image, workspace/cache mounts, database namespace, host Root, or credentials. Recover/select the original configuration; no runtime was replaced.'
         }
     }
     if (-not $DockerUseHostPostgres) {
         if (-not $databaseContainer) { $seed = Select-DockerDatabaseImage }
         Save-DockerCredentials $secretPath $secrets
-        $env:POSTGRES_PASSWORD = [string]$secrets.password
+        $env:POSTGRES_PASSWORD = [string]$secrets.bootstrapPassword
         if (-not $env:PGPASSWORD) { $env:PGPASSWORD = [string]$secrets.password }
         if (-not $databaseContainer) {
             Write-Host "Using PostgreSQL image $($seed.name); mounting $VolumeName at $($seed.mount)."
@@ -1214,7 +1505,18 @@ function Invoke-DockerRuntime {
         if (-not $databaseReady) { throw 'PostgreSQL container did not become ready; no runtime tools were installed.' }
         $serverVersion = $null
         try { $serverVersion = Run { docker.exe exec -e PGPASSWORD $ContainerName psql -X -w -h 127.0.0.1 -U $DbUser -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;' } }
-        catch { Write-Host "PostgreSQL login failed for '$DbUser'. The Linux worker will check missing objects with the selected administrator; existing passwords are not reset." }
+        catch {
+            $workerAdmin = if (-not $DockerPgAdminUserSpecified) { $DbUser } else { $PgAdminUser }
+            $env:AURORA_PG_ADMIN_PASSWORD = Get-ManagedAdminPassword
+            if ($workerAdmin -ceq $DbUser) {
+                $env:PGPASSWORD = $env:AURORA_PG_ADMIN_PASSWORD
+                $secrets.password = $env:PGPASSWORD
+                Save-DockerCredentials $secretPath $secrets
+                try { $serverVersion = Run { docker.exe exec -e PGPASSWORD $databaseContainer.Id psql -X -w -h 127.0.0.1 -p 5432 -U $DbUser -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;' } }
+                catch { Write-Host 'Administrator login is verified. The Linux worker will check the missing database or its access permissions.' }
+            }
+            $workerEnvironment += @('-e', 'AURORA_PG_ADMIN_PASSWORD')
+        }
         if ($serverVersion) { Assert-ServerVersion $serverVersion }
     }
     if (-not $runtimeContainer) {
@@ -1230,7 +1532,7 @@ function Invoke-DockerRuntime {
         try {
             # Preserve the original container configuration; an explicit password
             # override is passed to this worker execution only.
-            if (-not $DockerUseHostPostgres) { $env:PGPASSWORD = [string]$secrets.password }
+            if (-not $DockerUseHostPostgres) { $env:PGPASSWORD = [string]$secrets.bootstrapPassword }
             Run { docker.exe run -d --restart unless-stopped --name $RuntimeContainerName --network $network --label 'aurora.runtime.schema=1' --label "aurora.host.root=$Root" -v "${RuntimeVolumeName}:/workspace" -v "${RuntimeCacheVolumeName}:/root" -e "PGHOST=$runtimeHost" -e "PGPORT=$runtimePort" -e "PGDATABASE=$Database" -e "PGUSER=$DbUser" @passwordOption $RuntimeImage sleep infinity } | Out-Host
         } finally { $env:PGPASSWORD = $executionPassword }
     } elseif (-not $runtimeContainer.State.Running) { Run { docker.exe start $RuntimeContainerName } | Out-Host }
@@ -1254,7 +1556,10 @@ function Invoke-DockerRuntime {
             $terminal = @('-i', '-t')
         } else { $workerOptions += '--non-interactive' }
         Run { docker.exe exec @terminal @workerEnvironment $RuntimeContainerName bash $remoteWorker @workerOptions }
-    } finally { & docker.exe exec $RuntimeContainerName rm -f $remoteWorker | Out-Null }
+    } finally {
+        Remove-Item Env:AURORA_PG_ADMIN_PASSWORD -ErrorAction SilentlyContinue
+        & docker.exe exec $RuntimeContainerName rm -f $remoteWorker | Out-Null
+    }
     # The Linux worker has already checked builds, SQL/RxNorm and the language server.
     if (-not $NoEditor) {
         $codeVersion = @(Run { code.cmd --version })[0]
@@ -1278,6 +1583,314 @@ function Invoke-DockerRuntime {
     Write-Host "READY: persistent Linux runtime and authenticated PostgreSQL checks passed. Health: ${RuntimeContainerName}:/workspace/medication-lab-setup/automatic/state/health.json"
 }
 
+# Password recovery uses Windows identity authentication, never trust rules.
+function Assert-PostgresRecoveryAdministrator {
+    if ($env:OS -ne 'Windows_NT' -or -not (Test-BootstrapInteractive)) { throw 'PostgreSQL password recovery requires an interactive Windows terminal.' }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Open PowerShell as Administrator and rerun with -RecoverPostgresPassword to reset the selected local PostgreSQL password.' }
+}
+function Get-PostgresRecoveryDirectory {
+    Join-Path $Root 'postgres-password-recovery'
+}
+function Protect-PostgresRecoveryObject([string]$Path, [switch]$Directory) {
+    $acl = if ($Directory) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
+    $acl.SetAccessRuleProtection($true, $false)
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $acl.SetOwner($administrators)
+    foreach ($sid in @(([Security.Principal.SecurityIdentifier]::new('S-1-5-18')), $administrators)) {
+        $inheritance = if ($Directory) { 'ContainerInherit, ObjectInherit' } else { 'None' }
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', $inheritance, 'None', 'Allow'))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+function Assert-PostgresRecoveryJournalAcl([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    $allowed = @('S-1-5-18', 'S-1-5-32-544')
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $allowed) { throw "The recovery journal is not owned by Windows Administrators/SYSTEM: $Path. Do not use an untrusted recovery record." }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $rule.IdentityReference.Value -notin $allowed) { throw "The recovery journal permits access by another identity: $Path. Recovery stopped before modifying PostgreSQL." }
+    }
+}
+function Save-PostgresRecoveryJournal([string]$Path, $Journal) {
+    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temporary, ($Journal | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+        Protect-PostgresRecoveryObject $temporary
+        [IO.File]::Move($temporary, $Path)
+    } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+function Assert-PostgresRecoveryPath([string]$Path) {
+    if (-not [IO.Path]::IsPathRooted($Path)) { throw "Password recovery requires an absolute local path: $Path" }
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full.StartsWith('\\')) { throw 'Password recovery supports local drives only.' }
+    $current = $full
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Password recovery refuses a linked path: $current" }
+        }
+        $parent = Split-Path -Parent $current
+        if ($parent -eq $current) { break }
+        $current = $parent
+    }
+    return $full
+}
+function Split-PostgresServiceCommand([string]$Command) {
+    if (-not ('AuroraPostgresCommandLine' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class AuroraPostgresCommandLine {
+    [DllImport("shell32.dll", SetLastError=true)] static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string command, out int count);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr value);
+    public static string[] Split(string command) {
+        int count; IntPtr result=CommandLineToArgvW(command, out count);
+        if(result==IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        try { var args=new string[count]; for(int i=0;i<count;i++) args[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(result,i*IntPtr.Size)); return args; }
+        finally { LocalFree(result); }
+    }
+}
+'@
+    }
+    [AuroraPostgresCommandLine]::Split($Command)
+}
+function Get-LocalPostgresRecoveryTarget {
+    if ($PgHost -notin @('127.0.0.1', 'localhost', '::1')) { throw 'Password recovery applies only to the selected local PostgreSQL server.' }
+    if ($PgAdminUser -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw 'Password recovery requires a simple PostgreSQL administrator role name.' }
+    $bin = Assert-PostgresRecoveryPath (Split-Path -Parent $PsqlPath)
+    $server = Join-Path $bin 'postgres.exe'
+    if (-not (Test-Path -LiteralPath $server -PathType Leaf)) { throw 'Password recovery requires the server executable belonging to the selected PostgreSQL installation.' }
+    $null = Assert-PostgresRecoveryPath $server
+    $null = Assert-PostgresRecoveryPath $PsqlPath
+    $managed = Get-ManagedPostgresCluster
+    $service = $null; $configDirectory = $null
+    if ($managed -and -not $managed.serviceName -and -not $PgServiceName) {
+        if ([IO.Path]::GetFullPath([string]$managed.binDirectory) -ine $bin -or [int]$managed.port -ne $Port) { throw 'The managed PostgreSQL cluster does not match the selected binary or port.' }
+        $configDirectory = [string]$managed.dataDirectory
+    } else {
+        $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
+            if ($PgServiceName) { $_.Name -eq $PgServiceName }
+            else { $_.PathName -match '(?i)pg_ctl[.]exe' }
+        } | Where-Object {
+            $argv = @(Split-PostgresServiceCommand ([string]$_.PathName))
+            $argv.Count -gt 0 -and [IO.Path]::GetFullPath($argv[0]) -ieq (Join-Path $bin 'pg_ctl.exe')
+        })
+        if ($services.Count -ne 1) { throw "Password recovery requires one matching local PostgreSQL service. Found $($services.Count); select its exact -PgServiceName." }
+        $service = $services[0]
+        if ($service.State -ne 'Running' -or [int]$service.ProcessId -le 0) { throw 'Start the selected PostgreSQL service before password recovery.' }
+        $argv = @(Split-PostgresServiceCommand ([string]$service.PathName))
+        if ($argv.Count -lt 2 -or $argv[1] -cne 'runservice') { throw 'Unsupported PostgreSQL service command for automatic recovery.' }
+        for ($i = 2; $i -lt $argv.Count; $i++) {
+            switch -CaseSensitive ($argv[$i]) {
+                '-D' { $i++; if ($i -ge $argv.Count -or $configDirectory) { throw 'Ambiguous PostgreSQL service data directory.' }; $configDirectory = $argv[$i] }
+                '-N' { $i++; if ($i -ge $argv.Count -or $argv[$i] -cne $service.Name) { throw 'PostgreSQL service name does not match its command.' } }
+                '-t' { $i++; if ($i -ge $argv.Count -or $argv[$i] -notmatch '^[0-9]+$') { throw 'Invalid PostgreSQL service timeout.' } }
+                '-w' { }
+                '-s' { }
+                default { throw "Unsupported PostgreSQL service option '$($argv[$i])'. Recover this customized service through its administrator." }
+            }
+        }
+    }
+    if (-not $configDirectory) { throw 'Cannot identify the selected PostgreSQL configuration directory.' }
+    $configDirectory = Assert-PostgresRecoveryPath $configDirectory
+    $values = @{}
+    foreach ($setting in @('data_directory', 'hba_file', 'ident_file', 'port')) {
+        # -C must be first: PostgreSQL permits this read-only query while elevated.
+        $answer = @(Run { & $server -C $setting -D $configDirectory })
+        if ($answer.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$answer[0])) { throw "Cannot establish PostgreSQL $setting for recovery." }
+        $values[$setting] = ([string]$answer[0]).Trim()
+    }
+    if ([int]$values.port -ne $Port) { throw 'The service configuration port does not match the selected PostgreSQL endpoint.' }
+    $data = Assert-PostgresRecoveryPath $values.data_directory
+    $hba = Assert-PostgresRecoveryPath $values.hba_file
+    $ident = Assert-PostgresRecoveryPath $values.ident_file
+    if ($hba -ieq $ident) { throw 'PostgreSQL HBA and ident files must be distinct.' }
+    foreach ($file in @($hba, $ident, (Join-Path $data 'PG_VERSION'), (Join-Path $data 'postmaster.pid'))) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "The initialized PostgreSQL instance is missing $file." }
+        $null = Assert-PostgresRecoveryPath $file
+    }
+    $pidLines = [IO.File]::ReadAllLines((Join-Path $data 'postmaster.pid'))
+    if ($pidLines.Length -lt 4 -or $pidLines[0] -notmatch '^[1-9][0-9]*$' -or $pidLines[3] -notmatch '^[0-9]+$' -or [int]$pidLines[3] -ne $Port -or [IO.Path]::GetFullPath($pidLines[1]) -ine $data) { throw 'PostgreSQL process metadata does not match the selected data directory and port.' }
+    $serverProcessId = [int]$pidLines[0]
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $serverProcessId" -ErrorAction Stop
+    if (-not $process -or [IO.Path]::GetFullPath([string]$process.ExecutablePath) -ine $server) { throw 'The PostgreSQL listener is not the verified server executable.' }
+    $recoveryHost = if ($PgHost -eq '::1') { '::1' } else { '127.0.0.1' }
+    $addresses = if ($PgHost -eq '::1') { @('::1', '::') } else { @('127.0.0.1', '0.0.0.0') }
+    $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop | Where-Object { $_.LocalAddress -in $addresses })
+    if (-not $listeners.Count -or @($listeners | Where-Object { [int]$_.OwningProcess -ne $serverProcessId }).Count) { throw 'Cannot prove the selected loopback listener belongs to the verified PostgreSQL process.' }
+    if ($PgHost -eq 'localhost') {
+        $ipv6 = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop | Where-Object { $_.LocalAddress -in @('::1', '::') })
+        if (@($ipv6 | Where-Object { [int]$_.OwningProcess -ne $serverProcessId }).Count) { throw 'IPv4 and the selected localhost endpoint do not identify the same PostgreSQL server.' }
+    }
+    if ($service) {
+        $ancestor = $process; $matchesService = $false
+        for ($depth = 0; $depth -lt 5 -and $ancestor; $depth++) {
+            if ([int]$ancestor.ProcessId -eq [int]$service.ProcessId) { $matchesService = $true; break }
+            $parentId = [int]$ancestor.ParentProcessId
+            if ($parentId -le 0) { break }
+            $ancestor = Get-CimInstance Win32_Process -Filter "ProcessId = $parentId" -ErrorAction Stop
+        }
+        if (-not $matchesService) { throw 'The PostgreSQL listener does not belong to the selected Windows service.' }
+    } elseif ([IO.Path]::GetFullPath([string]$managed.dataDirectory) -ine $data) { throw 'The running server is not the owned managed PostgreSQL cluster.' }
+    return @{ bin = $bin; data = $data; hba = $hba; ident = $ident; host = $recoveryHost; port = $Port; processId = $serverProcessId; service = $(if ($service) { $service.Name } else { '' }) }
+}
+function Get-PostgresRecoveryHash([byte[]]$Bytes) {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return [Convert]::ToBase64String($algorithm.ComputeHash($Bytes)) } finally { $algorithm.Dispose() }
+}
+function Write-PostgresRecoveryBytes([string]$Path, [byte[]]$Bytes) {
+    $temporary = "$Path.aurora-$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllBytes($temporary, $Bytes)
+        # ReplaceFile preserves the destination's ACL/owner; give the staged file
+        # its access rules too so the PostgreSQL service can read the replacement.
+        $originalAcl = Get-Acl -LiteralPath $Path
+        $stageAcl = Get-Acl -LiteralPath $temporary
+        $stageAcl.SetSecurityDescriptorSddlForm($originalAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access), [Security.AccessControl.AccessControlSections]::Access)
+        Set-Acl -LiteralPath $temporary -AclObject $stageAcl
+        [IO.File]::Replace($temporary, $Path, [Management.Automation.Language.NullString]::Value)
+    } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+function Restore-PostgresRecoveryJournal($Target, [string]$Directory) {
+    $path = Join-Path $Directory 'journal.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+    Assert-PostgresRecoveryJournalAcl $Directory
+    $null = Assert-PostgresRecoveryPath $path
+    Assert-PostgresRecoveryJournalAcl $path
+    $journal = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+    if ($journal.schema -ne 1 -or $journal.data -ine $Target.data -or $journal.bin -ine $Target.bin -or [int]$journal.port -ne $Target.port -or @($journal.files).Count -ne 2) { throw "The pending password-recovery journal does not match this instance: $path" }
+    $expected = @($Target.hba, $Target.ident)
+    for ($i = 0; $i -lt 2; $i++) {
+        $entry = $journal.files[$i]
+        if ($entry.path -ine $expected[$i]) { throw "Unexpected configuration path in recovery journal: $path" }
+        $currentHash = Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))
+        if ($currentHash -cnotin @($entry.originalHash, $entry.temporaryHash)) { throw "Recovery stopped because '$($entry.path)' changed concurrently. Its original bytes are retained in $path; reconcile it before retrying." }
+        if ((Get-Acl -LiteralPath $entry.path).Sddl -cne $entry.acl) { throw "Recovery stopped because the ACL of '$($entry.path)' changed concurrently. Restore its recorded permissions before retrying: $path" }
+        $original = [Convert]::FromBase64String($entry.original)
+        if ((Get-PostgresRecoveryHash $original) -cne $entry.originalHash) { throw "The recovery journal failed its integrity check: $path" }
+    }
+    # Close the temporary authentication route before removing its identity map.
+    foreach ($entry in $journal.files) {
+        $currentHash = Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))
+        if ($currentHash -ceq $entry.temporaryHash) { Write-PostgresRecoveryBytes $entry.path ([Convert]::FromBase64String($entry.original)) }
+        elseif ($currentHash -cne $entry.originalHash) { throw "Recovery configuration changed during restoration: $($entry.path). Journal: $path" }
+        if ((Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))) -cne $entry.originalHash -or (Get-Acl -LiteralPath $entry.path).Sddl -cne $entry.acl) { throw "Could not verify restored PostgreSQL configuration: $($entry.path). Journal: $path" }
+    }
+    [IO.File]::Delete($path)
+}
+function Restore-PendingLocalPostgresRecovery {
+    $directory = Get-PostgresRecoveryDirectory
+    if (-not (Test-Path -LiteralPath (Join-Path $directory 'journal.json'))) { return }
+    Assert-PostgresRecoveryAdministrator
+    $null = Assert-PostgresRecoveryPath $directory
+    Assert-PostgresRecoveryJournalAcl $directory
+    $target = Get-LocalPostgresRecoveryTarget
+    $lock = [IO.File]::Open((Join-Path $directory 'lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try { Restore-PostgresRecoveryJournal $target $directory; Write-Host 'Restored authentication files from the interrupted PostgreSQL password recovery.' }
+    finally { $lock.Dispose() }
+    Remove-Item -LiteralPath (Join-Path $directory 'lock') -Force
+    if (-not @(Get-ChildItem -LiteralPath $directory -Force).Count) { [IO.Directory]::Delete($directory) }
+}
+function Invoke-PostgresRecoveryClient([string]$Command, [string]$InputText = '', [string]$Password = '', [switch]$AuthenticationProbe) {
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $PsqlPath
+    $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = New-Object Text.UTF8Encoding($false)
+    $start.StandardErrorEncoding = New-Object Text.UTF8Encoding($false)
+    $clientHost = if ($PgHost -eq '::1') { '::1' } else { '127.0.0.1' }
+    $arguments = @('-X', '-w', '-h', $clientHost, '-p', [string]$Port, '-U', $PgAdminUser, '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-At', '-c', $Command)
+    $start.Arguments = (@($arguments | ForEach-Object { ConvertTo-WindowsArgument $_ }) -join ' ')
+    foreach ($name in @('PGPASSWORD', 'PGHOSTADDR', 'PGSERVICE', 'PGOPTIONS')) { $start.EnvironmentVariables.Remove($name) }
+    $start.EnvironmentVariables['PGCLIENTENCODING'] = 'UTF8'
+    $start.EnvironmentVariables['PGCONNECT_TIMEOUT'] = '10'
+    $start.EnvironmentVariables['PGSSLMODE'] = 'disable'
+    # PostgreSQL's Windows prompt fallback consumes redirected stdin with this
+    # setting. Password confirmation stays inside psql/libpq and is encrypted
+    # client-side; the plaintext never enters SQL, argv, files, or output.
+    $start.EnvironmentVariables['OSTYPE'] = 'msys'
+    if ($Password) { $start.EnvironmentVariables['PGPASSWORD'] = $Password }
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $inputBytes = [Text.Encoding]::UTF8.GetBytes($InputText)
+        $process.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit(30000)) { $process.Kill(); $process.WaitForExit(); throw 'PostgreSQL password recovery client timed out.' }
+        $output = $stdout.GetAwaiter().GetResult(); $diagnostic = $stderr.GetAwaiter().GetResult()
+        if ($AuthenticationProbe) { return @{ accepted = ($process.ExitCode -eq 0); rejected = ($process.ExitCode -ne 0 -and $diagnostic -match 'password authentication failed') } }
+        if ($process.ExitCode -ne 0) { throw 'PostgreSQL recovery authentication or password change failed. The new password was not written to a log by bootstrap.' }
+        return $output.Trim()
+    } finally { $process.Dispose() }
+}
+function Recover-LocalPostgresPassword {
+    Assert-PostgresRecoveryAdministrator
+    $target = Get-LocalPostgresRecoveryTarget
+    Restore-PendingLocalPostgresRecovery
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $parts = $identity.Name.Split('\')
+    if ($parts.Length -ne 2 -or $identity.Name -match '["\r\n\x00]' -or -not $parts[0] -or -not $parts[1]) { throw 'Cannot construct an exact Windows identity mapping for recovery.' }
+    $principalName = $parts[1] + '@' + $parts[0]
+    Write-Host "Password recovery target: '$PgAdminUser' at $($target.host):$Port; data directory '$($target.data)'; Windows identity '$($identity.Name)'."
+    $answer = Read-Host 'Reset this PostgreSQL account password using your Windows administrator identity? [y/N]'
+    if (([string]$answer).Trim() -notmatch '^(y|yes|d|da)$') { throw 'PostgreSQL password recovery was declined.' }
+    $first = Read-Host "New password for PostgreSQL account $PgAdminUser" -AsSecureString
+    $second = Read-Host 'Confirm the new password' -AsSecureString
+    $newPassword = $null
+    try {
+        $newPassword = [Net.NetworkCredential]::new('', $first).Password
+        $confirmation = [Net.NetworkCredential]::new('', $second).Password
+        if (-not $newPassword -or $newPassword -match '[\r\n\x00]' -or $newPassword -cne $confirmation) { throw 'The new passwords must match, be nonempty, and contain no line breaks.' }
+        Remove-Variable confirmation
+        $directory = Assert-PostgresRecoveryPath (Get-PostgresRecoveryDirectory)
+        if (-not (Test-Path -LiteralPath $directory)) { $null = New-Item -ItemType Directory -Path $directory; Protect-PostgresRecoveryObject $directory -Directory }
+        else { Assert-PostgresRecoveryJournalAcl $directory }
+        $lock = [IO.File]::Open((Join-Path $directory 'lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            if (Test-Path -LiteralPath (Join-Path $directory 'journal.json')) { throw 'A password-recovery journal appeared concurrently. Retry after the other operation finishes.' }
+            $map = 'aurora_recovery_' + [guid]::NewGuid().ToString('N')
+            $address = if ($target.host -eq '::1') { '::1/128' } else { '127.0.0.1/32' }
+            $prefixes = @("host `"postgres`" `"$PgAdminUser`" $address sspi include_realm=1 compat_realm=1 upn_username=0 map=$map`r`n", "$map `"$principalName`" `"$PgAdminUser`"`r`n")
+            $entries = @(); $temporaryBytes = @()
+            $paths = @($target.hba, $target.ident)
+            for ($i = 0; $i -lt 2; $i++) {
+                $bytes = [IO.File]::ReadAllBytes($paths[$i])
+                if ([Array]::IndexOf($bytes, [byte]0) -ge 0 -or ($bytes.Length -ge 2 -and (($bytes[0] -eq 255 -and $bytes[1] -eq 254) -or ($bytes[0] -eq 254 -and $bytes[1] -eq 255)))) { throw 'Recovery supports ordinary ASCII/UTF-8 PostgreSQL authentication files only.' }
+                $prefix = [Text.Encoding]::UTF8.GetBytes($prefixes[$i])
+                $bom = if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) { 3 } else { 0 }
+                $temporary = New-Object byte[] ($bytes.Length + $prefix.Length)
+                [Array]::Copy($bytes, 0, $temporary, 0, $bom)
+                [Array]::Copy($prefix, 0, $temporary, $bom, $prefix.Length)
+                [Array]::Copy($bytes, $bom, $temporary, ($bom + $prefix.Length), ($bytes.Length - $bom))
+                $temporaryBytes += ,$temporary
+                $entries += @{ path = $paths[$i]; original = [Convert]::ToBase64String($bytes); originalHash = (Get-PostgresRecoveryHash $bytes); temporaryHash = (Get-PostgresRecoveryHash $temporary); acl = (Get-Acl -LiteralPath $paths[$i]).Sddl }
+            }
+            Save-PostgresRecoveryJournal (Join-Path $directory 'journal.json') @{ schema = 1; data = $target.data; bin = $target.bin; port = $Port; files = $entries }
+            try {
+                Write-PostgresRecoveryBytes $target.ident $temporaryBytes[1]
+                Write-PostgresRecoveryBytes $target.hba $temporaryBytes[0]
+                $probe = Invoke-PostgresRecoveryClient "SELECT json_build_object('login',current_user,'data',current_setting('data_directory'),'hba',current_setting('hba_file'),'ident',current_setting('ident_file'))::text;" | ConvertFrom-Json
+                if ($probe.login -cne $PgAdminUser -or [IO.Path]::GetFullPath([string]$probe.data) -ine $target.data -or [IO.Path]::GetFullPath([string]$probe.hba) -ine $target.hba -or [IO.Path]::GetFullPath([string]$probe.ident) -ine $target.ident) { throw 'The authenticated recovery connection does not match the verified local PostgreSQL instance.' }
+                $null = Invoke-PostgresRecoveryClient '\password' ($newPassword + "`n" + $newPassword + "`n")
+            } finally { Restore-PostgresRecoveryJournal $target $directory }
+        } finally { $lock.Dispose() }
+        Remove-Item -LiteralPath (Join-Path $directory 'lock') -Force
+        if (-not @(Get-ChildItem -LiteralPath $directory -Force).Count) { [IO.Directory]::Delete($directory) }
+        $verified = Invoke-PostgresRecoveryClient 'SELECT current_user;' '' $newPassword
+        if ($verified -cne $PgAdminUser) { throw 'The recovered PostgreSQL password did not pass verification under the restored authentication configuration.' }
+        $negative = @{ accepted = $false; rejected = $false }
+        try { $negative = Invoke-PostgresRecoveryClient 'SELECT current_user;' '' ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')) -AuthenticationProbe } catch { }
+        if ($negative.rejected) { Write-Host "Password recovery succeeded for '$PgAdminUser'. Original authentication files were restored and password authentication was verified." }
+        elseif ($negative.accepted) { Write-Warning "The password for '$PgAdminUser' was updated and original authentication files restored, but this connection policy also accepts a different password. Password authentication could not be verified under the existing policy." }
+        else { Write-Warning "The password for '$PgAdminUser' was updated and original authentication files restored. Login with the new password succeeded, but the negative authentication check was inconclusive." }
+        return $newPassword
+    } finally {
+        $first.Dispose(); $second.Dispose()
+        Remove-Variable newPassword, confirmation -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-PostgresReady {
     $ErrorActionPreference = 'Continue'
     & $PgIsReady -h $PgHost -p $Port -U $DbUser -d $Database -t 3 *> $null
@@ -1291,9 +1904,15 @@ function Wait-Postgres {
     } until ((Get-Date) -ge $deadline)
     throw "PostgreSQL did not become ready at ${PgHost}:$Port. Check the selected database service and port."
 }
-function Ensure-LocalPostgres {
+function Ensure-LocalPostgres([switch]$ExistingOnly) {
     if (Test-PostgresReady) { return }
     $names = @(if ($PgServiceName) { $PgServiceName } else { Get-PostgresServiceCandidates $PsqlPath })
+    if ($names.Count -eq 0 -and -not $PgServiceName) {
+        if ($ExistingOnly -and -not (Get-ManagedPostgresCluster)) { throw 'No initialized managed PostgreSQL cluster or matching service was selected. Password recovery does not create a new instance.' }
+        $null = Initialize-NewLocalPostgres
+        Wait-Postgres
+        return
+    }
     if ($names.Count -ne 1) {
         throw "No responding PostgreSQL at ${PgHost}:$Port. Found $($names.Count) services for the selected installation. Start the intended service or pass its exact -PgServiceName."
     }
@@ -1338,15 +1957,31 @@ function Initialize-LabDatabase {
     # Use an authenticated catalog query to prove absence. A failed application
     # login can mean a missing role, a wrong password, or an unavailable database.
     if ($DbUser -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw 'Creating a lab role requires a simple PostgreSQL identifier.' }
-    if (-not (Test-BootstrapInteractive)) { throw "PostgreSQL authentication/connection failed for '$DbUser' at ${PgHost}:$Port/$Database. Run interactively so an administrator can check whether the role or database is missing. Existing credentials were not changed." }
     $labPassword = $env:PGPASSWORD
     Write-Host "Cannot connect as '$DbUser' to '$Database'. An administrator must check whether the role or database is missing."
-    $secure = Read-Host "Administrator password for $PgAdminUser on ${PgHost}:$Port" -AsSecureString
+    $secure = $null
     try {
-        $adminPassword = [System.Net.NetworkCredential]::new('', $secure).Password
+        $adminPassword = 'postgres'
         $env:PGPASSWORD = $adminPassword
-        try { $serverNumber = Invoke-DatabaseSql 'SHOW server_version_num;' $PgAdminUser 'postgres' }
-        catch { throw "PostgreSQL administrator authentication/connection failed for '$PgAdminUser' at ${PgHost}:$Port. Cannot check or create '$DbUser'. No role or database was changed." }
+        $serverNumber = $null
+        Write-Host "Trying the default PostgreSQL administrator password for '$PgAdminUser' at ${PgHost}:$Port."
+        try { $serverNumber = Invoke-DatabaseSql 'SHOW server_version_num;' $PgAdminUser 'postgres' 2>$null } catch { }
+        if (-not $serverNumber) {
+            if (-not (Test-BootstrapInteractive)) { throw "PostgreSQL default administrator authentication failed for '$PgAdminUser'. Rerun interactively to enter its password or recover local access. No role or database was changed." }
+            $secure = Read-Host "Existing password for $PgAdminUser (leave empty for local password recovery)" -AsSecureString
+            $adminPassword = [System.Net.NetworkCredential]::new('', $secure).Password
+            if ($adminPassword) {
+                $env:PGPASSWORD = $adminPassword
+                try { $serverNumber = Invoke-DatabaseSql 'SHOW server_version_num;' $PgAdminUser 'postgres' 2>$null } catch { }
+            }
+            if (-not $serverNumber) {
+                Write-Host 'Administrator authentication was not established. Local password recovery is available to an elevated Windows administrator.'
+                $adminPassword = Recover-LocalPostgresPassword
+                if ($DbUser -ceq $PgAdminUser) { $labPassword = $adminPassword }
+                $env:PGPASSWORD = $adminPassword
+                $serverNumber = Invoke-DatabaseSql 'SHOW server_version_num;' $PgAdminUser 'postgres'
+            }
+        }
         Assert-ServerVersion $serverNumber
         $hasRole = Invoke-DatabaseSql "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname='$DbUser';" $PgAdminUser 'postgres'
         $hasDb = Invoke-DatabaseSql "SELECT count(*) FROM pg_catalog.pg_database WHERE datname='$Database';" $PgAdminUser 'postgres'
@@ -1371,7 +2006,7 @@ function Initialize-LabDatabase {
         }
     } finally {
         $env:PGPASSWORD = $labPassword
-        $secure.Dispose()
+        if ($secure) { $secure.Dispose() }
         Remove-Variable adminPassword -ErrorAction SilentlyContinue
     }
 }
@@ -1387,6 +2022,7 @@ function Assert-ServerVersion($Number) {
 }
 function Open-LabDatabase {
     Ensure-LocalPostgres
+    Restore-PendingLocalPostgresRecovery
     try { $version = Invoke-DatabaseSql 'SHOW server_version_num;' }
     catch {
         if (-not $ProvisionDatabase -and $DbUser -cne 'scala_lab') { throw "PostgreSQL authentication/connection failed for '$DbUser' on ${PgHost}:$Port/$Database. Check the credentials. Use -ProvisionDatabase to check/create a custom lab role or database." }
@@ -1613,8 +2249,9 @@ if ($Help) {
     Write-Host 'Multiple matches require -ScalaRepoPath / -LangiumRepoPath, absolute or relative to Root. Missing partners are cloned beside the existing repo; with neither present, use Root\repos if it exists, otherwise Root.'
     Write-Host 'Discovery excludes setup/backups, tools, dependencies, build outputs, linked directories and the inside of Git checkouts. An incomplete, divergent or non-Git copy requires explicit reconciliation; it is never replaced.'
     Write-Host 'Reuse the unique existing medication-lab-setup\automatic directory below Root; otherwise create it directly below Root. Multiple setup directories require -SetupPath. Local source and personal files remain in place; upstream conflicts stop setup. Run one bootstrap at a time.'
-    Write-Host 'Default: existing local PostgreSQL, no Docker checks or commands. Connection defaults: PGHOST/PGPORT/PGDATABASE/PGUSER, then 127.0.0.1:5432 / scala_testing_lab / scala_lab. Explicit arguments override those defaults.'
-    Write-Host 'Native mode defaults to scala_lab with password aurora; PGPASSWORD overrides it. A successful login is reused. On failure, the administrator verifies the catalog and creates only a missing role/database. Existing passwords are never reset; rejected credentials produce an error. -PgAdminUser selects the administrator (default postgres). Custom roles require -ProvisionDatabase for creation.'
+    Write-Host 'Default: local PostgreSQL, no Docker checks or commands. Reuse an existing cluster; initialize owned loopback-only data with administrator password postgres only when no existing cluster is found. Connection defaults: PGHOST/PGPORT/PGDATABASE/PGUSER, then 127.0.0.1:5432 / scala_testing_lab / scala_lab. Explicit arguments override those defaults.'
+    Write-Host 'Native mode defaults to scala_lab with password aurora; PGPASSWORD overrides it. A successful login is reused. On failure, the administrator verifies the catalog and creates only a missing role/database. Application passwords are not reset automatically. -PgAdminUser selects the administrator (default postgres). Custom roles require -ProvisionDatabase for creation.'
+    Write-Host 'Administrator access first tries password postgres. If rejected, enter the existing password or choose interactive recovery. -RecoverPostgresPassword runs only local Windows recovery, with elevation and confirmation, and asks for a new password. Recovery preserves database contents and restores authentication configuration.'
     Write-Host 'A ready local RxNorm import with compatible manifests is reused. Empty databases receive the verified prescribable archive; incomplete/incompatible existing releases are not replaced.'
     Write-Host 'A stopped service can be started only when its executable belongs to the selected PostgreSQL installation. Use -PgServiceName to select another service or resolve ambiguity.'
     Write-Host 'Existing tools are discovered and version-checked outside PATH, including Program Files, registry/services and user installs. Only genuinely missing tools may use WinGet --no-upgrade.'
@@ -1622,7 +2259,7 @@ if ($Help) {
     Write-Host 'Options: -JavaPath/-NodePath/-NpmPath/-GitPath/-CodePath/-DockerPath select executables; -AdditionalSearchPath adds search roots; -SessionOnlyEnvironment avoids saving tool homes/PATH to the user environment.'
     Write-Host 'For incompatible versions, setup describes the change and asks before upgrading. Default: No. -AllowToolUpgrade grants explicit unattended consent. Incomplete/inaccessible discovery needs repair. -SbtLauncherPath selects an existing launcher JAR.'
     Write-Host '--Docker selects the complete toolchain in a persistent Linux workspace; existing native repository locations are reported and their files are preserved.'
-    Write-Host 'New managed Docker databases use scala_lab / aurora (PGPASSWORD overrides the default). Existing legacy rxnorm_lab containers retain their original account, credentials and data. Each run checks authentication. -PgAdminUser selects a recovery administrator; existing passwords are never reset.'
+    Write-Host 'New managed Docker databases use scala_lab / aurora (PGPASSWORD overrides the default). Existing legacy rxnorm_lab containers retain their original account and data. Each run checks authentication. -PgAdminUser selects a recovery administrator; password resets require interactive confirmation.'
     Write-Host 'Docker can reuse Windows PostgreSQL or a published container: --Docker -DockerUseHostPostgres -Port 5432 -Database scala_testing_lab -DbUser scala_lab. Enable host networking in Docker Desktop 4.34+. PGPASSWORD is forwarded to the worker only; set the extension password in VS Code SecretStorage.'
     Write-Host 'If a separate server is wanted while another PostgreSQL is detected, choose -DockerUseManagedPostgres. Imported data and existing servers are never migrated automatically.'
     Write-Host 'Docker: -DockerToolSearchPath accepts additional Linux directories mounted in the runtime; use -AdditionalSearchPath for Windows executables.'
@@ -1636,7 +2273,7 @@ $DatabaseMode = 'local'
 $RuntimeImageSpecified = $PSBoundParameters.ContainsKey('RuntimeImage')
 if (($DockerUseHostPostgres -or $DockerUseManagedPostgres -or $DockerToolSearchPath) -and -not $UseDocker) { throw 'The selected Docker options require --Docker.' }
 if ($DockerUseHostPostgres -and $DockerUseManagedPostgres) { throw 'Select one Docker database mode.' }
-if ($UseDocker -and ($PsqlPath -or $PgServiceName)) { throw 'Select the database by port, database and user in Docker mode. Windows psql/service overrides apply only to native runs.' }
+if ($UseDocker -and -not $RecoverPostgresPassword -and ($PsqlPath -or $PgServiceName)) { throw 'Select the database by port, database and user in Docker mode. Windows psql/service overrides apply only to native runs.' }
 if ($UseDocker -and -not $DockerUseHostPostgres) {
     $DatabaseMode = 'docker-managed'
     $DockerDbUserSpecified = $PSBoundParameters.ContainsKey('DbUser')
@@ -1672,6 +2309,18 @@ if (Test-Path -LiteralPath (Join-Path $Root '.git')) { throw 'Root must be a par
 $Root = $rootItem.FullName
 Write-Host "Search root: $Root"
 Initialize-ToolDiscovery
+if ($RecoverPostgresPassword) {
+    if ($UseDocker -and -not $DockerUseHostPostgres) { throw 'For a managed Docker database, run --Docker normally and use its interactive recovery prompt. -RecoverPostgresPassword targets a local Windows instance.' }
+    $postgresTool = Find-SystemTool 'PostgreSQL' $PsqlPath
+    if ($postgresTool.state -ne 'compatible') { throw 'Recovery requires an existing compatible PostgreSQL client. Select it with -PsqlPath; no software was installed.' }
+    $PsqlPath = $postgresTool.path
+    $PgIsReady = $postgresTool.ready
+    Ensure-LocalPostgres -ExistingOnly
+    $recoveredPassword = Recover-LocalPostgresPassword
+    Remove-Variable recoveredPassword
+    Write-Host "Password recovery completed for '$PgAdminUser'. Rerun setup to continue the lab installation."
+    return
+}
 if ($UseDocker) {
     if ($JavaPath -or $NodePath -or $NpmPath -or $SbtLauncherPath -or $GitPath -or $ScalaRepoPath -or $LangiumRepoPath) {
         throw 'Docker uses a persistent Linux workspace and tools. Native tool/repository overrides cannot be combined with -UseDocker.'
