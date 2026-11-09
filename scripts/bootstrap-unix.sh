@@ -11,12 +11,15 @@ CONTAINER_RUNTIME=0
 RELAUNCH_COUNT=0
 ALLOW_TOOL_UPGRADE=0
 NON_INTERACTIVE=0
+PROVISION_DATABASE=0
+PG_ADMIN_USER=postgres
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --container-runtime) CONTAINER_RUNTIME=1; shift ;;
         --allow-tool-upgrade) ALLOW_TOOL_UPGRADE=1; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
-        --root|--scala-branch|--langium-branch|--startup-timeout|--relaunch-count)
+        --provision-database) PROVISION_DATABASE=1; shift ;;
+        --root|--scala-branch|--langium-branch|--startup-timeout|--relaunch-count|--pg-admin-user)
             [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 1; }
             case "$1" in
                 --root) ROOT=$2 ;;
@@ -24,9 +27,10 @@ while [ "$#" -gt 0 ]; do
                 --langium-branch) LANGIUM_BRANCH=$2 ;;
                 --startup-timeout) STARTUP_TIMEOUT=$2 ;;
                 --relaunch-count) RELAUNCH_COUNT=$2 ;;
+                --pg-admin-user) PG_ADMIN_USER=$2 ;;
             esac
             shift 2 ;;
-        --help) echo 'Linux runtime worker: bootstrap-unix.sh --container-runtime --root /workspace [--scala-branch NAME] [--langium-branch NAME] [--startup-timeout SECONDS] [--allow-tool-upgrade] [--non-interactive]. Start with bootstrap-windows.ps1 --Docker; tools and repositories remain in the persistent Linux runtime.'; exit 0 ;;
+        --help) echo 'Linux runtime worker: bootstrap-unix.sh --container-runtime --root /workspace [--scala-branch NAME] [--langium-branch NAME] [--startup-timeout SECONDS] [--allow-tool-upgrade] [--pg-admin-user NAME] [--provision-database] [--non-interactive]. Start with bootstrap-windows.ps1 --Docker; tools and repositories remain in the persistent Linux runtime.'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -60,6 +64,7 @@ finish_runtime() {
 trap finish_runtime EXIT
 printf '{"status":"running"}\n' > "$HEALTH"
 # Both managed and host-network runtimes use the application's loopback-only contract.
+if [[ ${PGUSER:-} = scala_lab && -z ${PGPASSWORD:-} ]]; then export PGPASSWORD=aurora; fi
 if [[ ${PGHOST:-} != 127.0.0.1 && ${PGHOST:-} != ::1 ]] ||
    ! [[ ${PGPORT:-} =~ ^[1-9][0-9]{0,4}$ ]] || ((PGPORT > 65535)) ||
    ! [[ ${PGDATABASE:-} =~ ^[A-Za-z_][A-Za-z_0-9]{0,62}$ ]] ||
@@ -564,13 +569,65 @@ ensure_runtime_tools
 printf 'Linux repositories: %s/repos (persistent Docker workspace).\n' "$ROOT"
 
 sql() { "$PSQL" -X -w -v ON_ERROR_STOP=1 -Atc "$1"; }
+initialize_lab_database() {
+    local admin_password server_number has_role has_db verification_db literal
+    [[ "$PGUSER" =~ ^[A-Za-z_][A-Za-z_0-9]{0,62}$ ]] || { echo 'Creating a lab role requires a simple PostgreSQL identifier.' >&2; return 1; }
+    if [ "${NON_INTERACTIVE:-0}" = 1 ] || [ ! -t 0 ]; then
+        echo "PostgreSQL authentication/connection failed for '$PGUSER' at $PGHOST:$PGPORT/$PGDATABASE. Run interactively so an administrator can check missing roles/databases. Existing credentials were not changed." >&2
+        return 1
+    fi
+    echo "Cannot connect as '$PGUSER' to '$PGDATABASE'. An administrator must check whether the role or database is missing." >&2
+    IFS= read -r -s -p "Administrator password for $PG_ADMIN_USER on $PGHOST:$PGPORT: " admin_password || return 1
+    printf '\n' >&2
+    if ! server_number=$(PGPASSWORD="$admin_password" "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;'); then
+        echo "PostgreSQL administrator authentication/connection failed for '$PG_ADMIN_USER'. No role or database was changed." >&2
+        return 1
+    fi
+    [[ "$server_number" =~ ^[0-9]+$ ]] && ((server_number >= 150000)) || { echo 'PostgreSQL 15+ is required before creating lab objects.' >&2; return 1; }
+    has_role=$(PGPASSWORD="$admin_password" "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname='$PGUSER';") || return 1
+    has_db=$(PGPASSWORD="$admin_password" "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM pg_catalog.pg_database WHERE datname='$PGDATABASE';") || return 1
+    [[ "$has_role" =~ ^[01]$ && "$has_db" =~ ^[01]$ ]] || { echo 'Unexpected PostgreSQL catalog response; stopping provisioning.' >&2; return 1; }
+    if [ "$has_role" = 0 ]; then
+        echo "Creating missing PostgreSQL login '$PGUSER'." >&2
+        literal=${PGPASSWORD//\'/\'\'}
+        # SQL travels through stdin, not command arguments/files. Suppress errors
+        # for this statement because the server may echo its password literal.
+        if ! printf 'SET standard_conforming_strings = on;\nCREATE ROLE "%s" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '\''%s'\'';\n' "$PGUSER" "$literal" |
+            PGPASSWORD="$admin_password" PGCLIENTENCODING=UTF8 "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -f - >/dev/null 2>&1; then
+            echo "Could not create PostgreSQL role '$PGUSER'. Check the administrator's CREATEROLE permission. Existing roles were not changed." >&2
+            return 1
+        fi
+        unset literal
+    fi
+    verification_db=postgres
+    [ "$has_db" = 0 ] || verification_db=$PGDATABASE
+    if ! "$PSQL" -X -w -d "$verification_db" -v ON_ERROR_STOP=1 -Atc 'SELECT 1;' >/dev/null; then
+        echo "PostgreSQL authentication/access failed: role '$PGUSER' exists, but the configured password or permissions were rejected for '$verification_db'. Supply the correct PGPASSWORD or check LOGIN/CONNECT permissions. The existing password was not reset." >&2
+        return 1
+    fi
+    if [ "$has_db" = 0 ]; then
+        PGPASSWORD="$admin_password" "$PSQL" -X -w -U "$PG_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -Atc "CREATE DATABASE \"$PGDATABASE\" OWNER \"$PGUSER\";" >&2 || return 1
+    fi
+}
+open_lab_database() {
+    local version
+    if ! version=$(sql 'SHOW server_version_num;'); then
+        if [[ "$PGUSER" != scala_lab && "${PROVISION_DATABASE:-0}" != 1 ]]; then
+            echo "PostgreSQL authentication/connection failed for '$PGUSER'. Check credentials or use -ProvisionDatabase for a custom role. Existing credentials were not changed." >&2
+            return 1
+        fi
+        initialize_lab_database || return 1
+        version=$(sql 'SHOW server_version_num;') || return 1
+    fi
+    printf '%s\n' "$version"
+}
 start=$SECONDS
 until "$PG_ISREADY" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -t 3 >/dev/null 2>&1; do
     [ "$((SECONDS - start))" -lt "$STARTUP_TIMEOUT" ] || { echo 'PostgreSQL did not become ready.' >&2; exit 1; }
     sleep 1
 done
 # This authenticated query checks both login and the actual server version.
-server_version=$(sql 'SHOW server_version_num;')
+server_version=$(open_lab_database)
 [[ "$server_version" =~ ^[0-9]+$ ]] || { echo 'Cannot determine the authenticated PostgreSQL server version.' >&2; exit 1; }
 if ((server_version < 150000)); then
     if confirm_tool_upgrade "PostgreSQL $server_version is below the supported 15+ range. Show manual upgrade steps"; then
@@ -664,6 +721,8 @@ if ! cmp -s "$0" "$SCALA/scripts/bootstrap-unix.sh"; then
     relaunch_options=()
     [ "$ALLOW_TOOL_UPGRADE" = 0 ] || relaunch_options+=(--allow-tool-upgrade)
     [ "$NON_INTERACTIVE" = 0 ] || relaunch_options+=(--non-interactive)
+    [ "$PROVISION_DATABASE" = 0 ] || relaunch_options+=(--provision-database)
+    relaunch_options+=(--pg-admin-user "$PG_ADMIN_USER")
     exec bash "$SCALA/scripts/bootstrap-unix.sh" "${relaunch_options[@]}" --container-runtime --root "$ROOT" --scala-branch "$SCALA_BRANCH" --langium-branch "$LANGIUM_BRANCH" --startup-timeout "$STARTUP_TIMEOUT" --relaunch-count "$((RELAUNCH_COUNT + 1))"
 fi
 

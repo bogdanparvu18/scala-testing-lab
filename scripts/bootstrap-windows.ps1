@@ -1127,17 +1127,19 @@ function Invoke-DockerRuntime {
     $runtimeHost = if ($DockerUseHostPostgres -and $PgHost -eq '::1') { '::1' } else { '127.0.0.1' }
     $runtimePort = if ($DockerUseHostPostgres) { $Port } else { 5432 }
     if ($DockerUseHostPostgres) {
+        if (-not $env:PGPASSWORD -and $DbUser -ceq 'scala_lab') { $env:PGPASSWORD = 'aurora' }
         if (-not $env:PGPASSWORD) {
             if (-not (Test-BootstrapInteractive)) { throw 'Supply the existing database password via PGPASSWORD for a noninteractive run.' }
             $secure = Read-Host "Existing PostgreSQL password for $DbUser" -AsSecureString
-            $env:PGPASSWORD = [Net.NetworkCredential]::new('', $secure).Password
+            try { $env:PGPASSWORD = [Net.NetworkCredential]::new('', $secure).Password }
+            finally { $secure.Dispose() }
         }
         if (-not $env:PGPASSWORD) { throw 'An existing database password is required.' }
     } else {
         $secretPath = Join-Path $dockerState 'secrets.json'
         $secrets = $null
-        if (Test-Path -LiteralPath $secretPath) { $secrets = Get-Content -LiteralPath $secretPath -Raw | ConvertFrom-Json }
-        if (-not $secrets) {
+        if ($databaseContainer -and (Test-Path -LiteralPath $secretPath)) { $secrets = Get-Content -LiteralPath $secretPath -Raw | ConvertFrom-Json }
+        if ($databaseContainer -and -not $secrets) {
             $legacyPaths = @((Join-Path $Root 'medication-lab-setup\automatic\state\secrets.json'))
             if ($SetupPath) { $legacyPaths = @((Join-Path $SetupPath 'state\secrets.json')) + $legacyPaths }
             foreach ($candidate in $legacyPaths) {
@@ -1151,9 +1153,14 @@ function Invoke-DockerRuntime {
             }
             $secrets = @{ password = $existingPasswords[0].Substring(18); port = $Port }
         }
-        if (-not $secrets) { $secrets = @{ password = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'); port = $Port } }
+        if (-not $secrets) { $secrets = @{ password = $(if ($env:PGPASSWORD) { $env:PGPASSWORD } else { 'aurora' }); port = $Port } }
         if (-not $secrets.password -or ($secrets.port -and [int]$secrets.port -ne $Port)) { throw 'Stored Docker credentials/port do not match the selected configuration.' }
         if ($databaseContainer) {
+            $existingUsers = @($databaseContainer.Config.Env | Where-Object { $_ -clike 'POSTGRES_USER=*' } | ForEach-Object { $_.Substring(14) })
+            if ($existingUsers.Count -ne 1 -or $existingUsers[0] -cnotin @('scala_lab', 'rxnorm_lab')) { throw 'Existing managed PostgreSQL has an unrecognized role. Select its connection explicitly with -DockerUseHostPostgres.' }
+            if ($DockerDbUserSpecified -and $DbUser -cne $existingUsers[0]) { throw "Existing managed PostgreSQL uses '$($existingUsers[0])', not '$DbUser'. Omit -DbUser to reuse its original account; no account or data was changed." }
+            $DbUser = $existingUsers[0]
+            if ($DbUser -ceq 'rxnorm_lab') { Write-Host "Reusing the legacy Docker account 'rxnorm_lab' and its stored credentials. Existing RxNorm data and ownership are preserved." }
             $bindings = @($databaseContainer.HostConfig.PortBindings.'5432/tcp')
             $mounts = @($databaseContainer.Mounts | Where-Object { $_.Destination -in @('/var/lib/postgresql/data', '/var/lib/postgresql') })
             $pgData = @($databaseContainer.Config.Env | Where-Object { $_ -clike 'PGDATA=*' } | ForEach-Object { $_.Substring(7).TrimEnd('/') })
@@ -1161,12 +1168,13 @@ function Invoke-DockerRuntime {
                 $pgData.Count -ne 1 -or $mounts.Count -ne 1 -or ($pgData[0] -cne $mounts[0].Destination -and -not $pgData[0].StartsWith($mounts[0].Destination + '/', [StringComparison]::Ordinal)) -or $bindings.Count -ne 1 -or
                 $bindings[0].HostIp -ne '127.0.0.1' -or $bindings[0].HostPort -ne [string]$Port -or
                 $mounts[0].Type -ne 'volume' -or $mounts[0].Name -ne $VolumeName -or -not $mounts[0].RW -or
-                'POSTGRES_USER=rxnorm_lab' -notin $databaseContainer.Config.Env -or 'POSTGRES_DB=rxnorm_public' -notin $databaseContainer.Config.Env -or
-                "POSTGRES_PASSWORD=$($secrets.password)" -notin $databaseContainer.Config.Env -or
+                "POSTGRES_USER=$DbUser" -cnotin $databaseContainer.Config.Env -or 'POSTGRES_DB=rxnorm_public' -notin $databaseContainer.Config.Env -or
+                "POSTGRES_PASSWORD=$($secrets.password)" -cnotin $databaseContainer.Config.Env -or
                 $databaseContainer.HostConfig.NetworkMode -notin @('default', 'bridge')) {
                 throw 'Existing PostgreSQL container has incompatible image, mounts, network, port, or credentials. No container/volume was replaced.'
             }
         }
+        if (-not $databaseContainer -and $DbUser -cne 'scala_lab') { throw 'New managed Docker databases use scala_lab. rxnorm_lab is supported only for existing legacy containers.' }
     }
     # Validate the runtime before starting or creating any service.
     if ($runtimeContainer) {
@@ -1188,24 +1196,26 @@ function Invoke-DockerRuntime {
         if (-not $databaseContainer) { $seed = Select-DockerDatabaseImage }
         Save-DockerCredentials $secretPath $secrets
         $env:POSTGRES_PASSWORD = [string]$secrets.password
-        $env:PGPASSWORD = [string]$secrets.password
+        if (-not $env:PGPASSWORD) { $env:PGPASSWORD = [string]$secrets.password }
         if (-not $databaseContainer) {
             Write-Host "Using PostgreSQL image $($seed.name); mounting $VolumeName at $($seed.mount)."
-            Run { docker.exe run -d --restart unless-stopped --name $ContainerName -e POSTGRES_USER=rxnorm_lab -e POSTGRES_DB=rxnorm_public -e POSTGRES_PASSWORD -p "127.0.0.1:${Port}:5432" -v "${VolumeName}:$($seed.mount)" $seed.name } | Out-Host
+            Run { docker.exe run -d --restart unless-stopped --name $ContainerName -e "POSTGRES_USER=$DbUser" -e POSTGRES_DB=rxnorm_public -e POSTGRES_PASSWORD -p "127.0.0.1:${Port}:5432" -v "${VolumeName}:$($seed.mount)" $seed.name } | Out-Host
             $databaseContainer = @(Run { docker.exe container inspect $ContainerName } | ConvertFrom-Json)[0]
         } elseif (-not $databaseContainer.State.Running) { Run { docker.exe start $ContainerName } | Out-Host }
         $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
         do {
             $probePreference = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
-            & docker.exe exec $ContainerName pg_isready -h 127.0.0.1 -p 5432 -U rxnorm_lab -d rxnorm_public -t 3 *> $null
+            & docker.exe exec $ContainerName pg_isready -h 127.0.0.1 -p 5432 -U $DbUser -d rxnorm_public -t 3 *> $null
             $databaseReady = ($LASTEXITCODE -eq 0)
             $ErrorActionPreference = $probePreference
             if (-not $databaseReady) { Start-Sleep -Seconds 1 }
         } until ($databaseReady -or (Get-Date) -ge $deadline)
         if (-not $databaseReady) { throw 'PostgreSQL container did not become ready; no runtime tools were installed.' }
-        $serverVersion = Run { docker.exe exec -e PGPASSWORD $ContainerName psql -X -w -h 127.0.0.1 -U rxnorm_lab -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;' }
-        Assert-ServerVersion $serverVersion
+        $serverVersion = $null
+        try { $serverVersion = Run { docker.exe exec -e PGPASSWORD $ContainerName psql -X -w -h 127.0.0.1 -U $DbUser -d rxnorm_public -v ON_ERROR_STOP=1 -Atc 'SHOW server_version_num;' } }
+        catch { Write-Host "PostgreSQL login failed for '$DbUser'. The Linux worker will check missing objects with the selected administrator; existing passwords are not reset." }
+        if ($serverVersion) { Assert-ServerVersion $serverVersion }
     }
     if (-not $runtimeContainer) {
         $null = Ensure-DockerImage $RuntimeImage
@@ -1216,7 +1226,13 @@ function Invoke-DockerRuntime {
             try { Run { docker.exe run --rm --network host --entrypoint timeout $RuntimeImage 5 bash -c 'true > /dev/tcp/$1/$2' _ $runtimeHost $Port } | Out-Null }
             catch { throw "Cannot reach the selected Windows database on port $Port from Linux. Enable host networking under Docker Desktop > Settings > Resources > Network (4.34+), check PostgreSQL, then retry." }
         } else { $passwordOption = @('-e', 'PGPASSWORD') }
-        Run { docker.exe run -d --restart unless-stopped --name $RuntimeContainerName --network $network --label 'aurora.runtime.schema=1' --label "aurora.host.root=$Root" -v "${RuntimeVolumeName}:/workspace" -v "${RuntimeCacheVolumeName}:/root" -e "PGHOST=$runtimeHost" -e "PGPORT=$runtimePort" -e "PGDATABASE=$Database" -e "PGUSER=$DbUser" @passwordOption $RuntimeImage sleep infinity } | Out-Host
+        $executionPassword = $env:PGPASSWORD
+        try {
+            # Preserve the original container configuration; an explicit password
+            # override is passed to this worker execution only.
+            if (-not $DockerUseHostPostgres) { $env:PGPASSWORD = [string]$secrets.password }
+            Run { docker.exe run -d --restart unless-stopped --name $RuntimeContainerName --network $network --label 'aurora.runtime.schema=1' --label "aurora.host.root=$Root" -v "${RuntimeVolumeName}:/workspace" -v "${RuntimeCacheVolumeName}:/root" -e "PGHOST=$runtimeHost" -e "PGPORT=$runtimePort" -e "PGDATABASE=$Database" -e "PGUSER=$DbUser" @passwordOption $RuntimeImage sleep infinity } | Out-Host
+        } finally { $env:PGPASSWORD = $executionPassword }
     } elseif (-not $runtimeContainer.State.Running) { Run { docker.exe start $RuntimeContainerName } | Out-Host }
     elseif ($databaseWasStopped) {
         # A running sibling retains the old namespace when the database restarts.
@@ -1229,6 +1245,9 @@ function Invoke-DockerRuntime {
     $remoteWorker = Copy-DockerWorker (Join-Path $PSScriptRoot 'bootstrap-unix.sh') $dockerState
     try {
         $workerOptions = @('--container-runtime', '--root', '/workspace', '--scala-branch', $ScalaBranch, '--langium-branch', $LangiumBranch, '--startup-timeout', [string]$StartupTimeoutSeconds)
+        $workerAdmin = if (-not $DockerUseHostPostgres -and -not $DockerPgAdminUserSpecified) { $DbUser } else { $PgAdminUser }
+        $workerOptions += @('--pg-admin-user', $workerAdmin)
+        if ($ProvisionDatabase) { $workerOptions += '--provision-database' }
         $terminal = @()
         if ($AllowToolUpgrade) { $workerOptions += '--allow-tool-upgrade' }
         if ((Test-BootstrapInteractive) -and -not [Console]::IsOutputRedirected) {
@@ -1296,36 +1315,60 @@ function Ensure-LocalPostgres {
 function Invoke-DatabaseSql([string]$Sql, [string]$Login = $DbUser, [string]$DbName = $Database) {
     Run { & $PsqlPath -X -w -h $PgHost -p $Port -U $Login -d $DbName -v ON_ERROR_STOP=1 -Atc $Sql }
 }
+function New-LabDatabaseRole([string]$Password) {
+    # Send the password through stdin, never through process arguments or files.
+    # Suppress SQL diagnostics here because the server may echo the statement.
+    $ErrorActionPreference = 'Continue'
+    $savedEncoding = $OutputEncoding
+    $savedClientEncoding = $env:PGCLIENTENCODING
+    try {
+        $OutputEncoding = New-Object Text.UTF8Encoding($false)
+        $env:PGCLIENTENCODING = 'UTF8'
+        $literal = $Password.Replace("'", "''")
+        $sql = "SET standard_conforming_strings = on;`nCREATE ROLE `"$DbUser`" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$literal';"
+        $sql | & $PsqlPath -X -w -h $PgHost -p $Port -U $PgAdminUser -d postgres -v ON_ERROR_STOP=1 -f - *> $null
+        if ($LASTEXITCODE -ne 0) { throw "Could not create PostgreSQL role '$DbUser'. Check the administrator's CREATEROLE permission and retry. Existing roles were not changed." }
+    } finally {
+        $OutputEncoding = $savedEncoding
+        $env:PGCLIENTENCODING = $savedClientEncoding
+        Remove-Variable literal, sql -ErrorAction SilentlyContinue
+    }
+}
 function Initialize-LabDatabase {
-    # This opt-in recovery is only called after an application login failed.
-    # Use the catalog to prove absence; a password error alone is never evidence.
-    if ($DbUser -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw '-ProvisionDatabase requires a simple lab role identifier.' }
-    if (-not (Test-BootstrapInteractive)) { throw 'Run -ProvisionDatabase in an interactive terminal to enter the administrator and new role passwords.' }
+    # Use an authenticated catalog query to prove absence. A failed application
+    # login can mean a missing role, a wrong password, or an unavailable database.
+    if ($DbUser -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') { throw 'Creating a lab role requires a simple PostgreSQL identifier.' }
+    if (-not (Test-BootstrapInteractive)) { throw "PostgreSQL authentication/connection failed for '$DbUser' at ${PgHost}:$Port/$Database. Run interactively so an administrator can check whether the role or database is missing. Existing credentials were not changed." }
     $labPassword = $env:PGPASSWORD
+    Write-Host "Cannot connect as '$DbUser' to '$Database'. An administrator must check whether the role or database is missing."
     $secure = Read-Host "Administrator password for $PgAdminUser on ${PgHost}:$Port" -AsSecureString
     try {
         $adminPassword = [System.Net.NetworkCredential]::new('', $secure).Password
         $env:PGPASSWORD = $adminPassword
-        $serverNumber = Invoke-DatabaseSql 'SHOW server_version_num;' $PgAdminUser 'postgres'
+        try { $serverNumber = Invoke-DatabaseSql 'SHOW server_version_num;' $PgAdminUser 'postgres' }
+        catch { throw "PostgreSQL administrator authentication/connection failed for '$PgAdminUser' at ${PgHost}:$Port. Cannot check or create '$DbUser'. No role or database was changed." }
         Assert-ServerVersion $serverNumber
         $hasRole = Invoke-DatabaseSql "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname='$DbUser';" $PgAdminUser 'postgres'
         $hasDb = Invoke-DatabaseSql "SELECT count(*) FROM pg_catalog.pg_database WHERE datname='$Database';" $PgAdminUser 'postgres'
         if ($hasRole -notin @('0', '1') -or $hasDb -notin @('0', '1')) { throw 'Unexpected PostgreSQL catalog response. Stopping provisioning.' }
-        if ($hasDb -eq '1') { throw "Database '$Database' exists; verify its login, password, and permissions. No existing role, password or database was altered." }
         if ($hasRole -eq '0') {
-            $createUser = Join-Path (Split-Path -Parent $PsqlPath) 'createuser.exe'
-            if (-not (Test-Path -LiteralPath $createUser -PathType Leaf)) { throw "Missing $createUser. Create the lab login using the PostgreSQL administration tools." }
-            Write-Host "Creating login '$DbUser'. At the two createuser prompts, enter the lab password supplied to bootstrap."
-            # createuser encrypts the password client-side and sends the verifier.
-            # Passwords never appear in the command line, SQL text or setup files.
-            Run { & $createUser -w -h $PgHost -p $Port -U $PgAdminUser --pwprompt --no-superuser --no-createrole --no-createdb -- $DbUser } | Out-Host
+            Write-Host "Creating missing PostgreSQL login '$DbUser'."
+            New-LabDatabaseRole $labPassword
         }
-        # Verify the application's existing/new password before creating its DB.
+        # Test an existing role's password before any database creation. Never
+        # reset credentials or infer absence from an authentication failure.
         $env:PGPASSWORD = $labPassword
-        if ((Invoke-DatabaseSql 'SELECT 1;' $DbUser 'postgres') -ne '1') { throw "Cannot verify lab role '$DbUser' against the maintenance database." }
-        $env:PGPASSWORD = $adminPassword
-        # Both identifiers were validated before use. Preserve case with quotes.
-        Invoke-DatabaseSql "CREATE DATABASE `"$Database`" OWNER `"$DbUser`";" $PgAdminUser 'postgres' | Out-Host
+        $verificationDb = if ($hasDb -eq '1') { $Database } else { 'postgres' }
+        try {
+            if ((Invoke-DatabaseSql 'SELECT 1;' $DbUser $verificationDb) -ne '1') { throw 'Unexpected login response.' }
+        } catch {
+            throw "PostgreSQL authentication/access failed: role '$DbUser' exists, but the configured password or database permissions were rejected for '$verificationDb' at ${PgHost}:$Port. Supply the correct PGPASSWORD or check its LOGIN/CONNECT permissions. The existing password was not reset."
+        }
+        if ($hasDb -eq '0') {
+            $env:PGPASSWORD = $adminPassword
+            # Both identifiers were validated before use. Preserve case with quotes.
+            Invoke-DatabaseSql "CREATE DATABASE `"$Database`" OWNER `"$DbUser`";" $PgAdminUser 'postgres' | Out-Host
+        }
     } finally {
         $env:PGPASSWORD = $labPassword
         $secure.Dispose()
@@ -1346,7 +1389,7 @@ function Open-LabDatabase {
     Ensure-LocalPostgres
     try { $version = Invoke-DatabaseSql 'SHOW server_version_num;' }
     catch {
-        if (-not $ProvisionDatabase) { throw "PostgreSQL login failed for '$DbUser' on ${PgHost}:$Port/$Database. Check the credentials. For a new installation, rerun with -ProvisionDatabase to create missing lab objects." }
+        if (-not $ProvisionDatabase -and $DbUser -cne 'scala_lab') { throw "PostgreSQL authentication/connection failed for '$DbUser' on ${PgHost}:$Port/$Database. Check the credentials. Use -ProvisionDatabase to check/create a custom lab role or database." }
         Initialize-LabDatabase
         $version = Invoke-DatabaseSql 'SHOW server_version_num;'
     }
@@ -1571,7 +1614,7 @@ if ($Help) {
     Write-Host 'Discovery excludes setup/backups, tools, dependencies, build outputs, linked directories and the inside of Git checkouts. An incomplete, divergent or non-Git copy requires explicit reconciliation; it is never replaced.'
     Write-Host 'Reuse the unique existing medication-lab-setup\automatic directory below Root; otherwise create it directly below Root. Multiple setup directories require -SetupPath. Local source and personal files remain in place; upstream conflicts stop setup. Run one bootstrap at a time.'
     Write-Host 'Default: existing local PostgreSQL, no Docker checks or commands. Connection defaults: PGHOST/PGPORT/PGDATABASE/PGUSER, then 127.0.0.1:5432 / scala_testing_lab / scala_lab. Explicit arguments override those defaults.'
-    Write-Host 'Local mode uses PGPASSWORD or asks for the lab password. On a fresh installation use -ProvisionDatabase [-PgAdminUser postgres]. If the application login fails, the administrator verifies the catalog and creates only missing objects. Existing credentials and database ownership are preserved.'
+    Write-Host 'Native mode defaults to scala_lab with password aurora; PGPASSWORD overrides it. A successful login is reused. On failure, the administrator verifies the catalog and creates only a missing role/database. Existing passwords are never reset; rejected credentials produce an error. -PgAdminUser selects the administrator (default postgres). Custom roles require -ProvisionDatabase for creation.'
     Write-Host 'A ready local RxNorm import with compatible manifests is reused. Empty databases receive the verified prescribable archive; incomplete/incompatible existing releases are not replaced.'
     Write-Host 'A stopped service can be started only when its executable belongs to the selected PostgreSQL installation. Use -PgServiceName to select another service or resolve ambiguity.'
     Write-Host 'Existing tools are discovered and version-checked outside PATH, including Program Files, registry/services and user installs. Only genuinely missing tools may use WinGet --no-upgrade.'
@@ -1579,6 +1622,7 @@ if ($Help) {
     Write-Host 'Options: -JavaPath/-NodePath/-NpmPath/-GitPath/-CodePath/-DockerPath select executables; -AdditionalSearchPath adds search roots; -SessionOnlyEnvironment avoids saving tool homes/PATH to the user environment.'
     Write-Host 'For incompatible versions, setup describes the change and asks before upgrading. Default: No. -AllowToolUpgrade grants explicit unattended consent. Incomplete/inaccessible discovery needs repair. -SbtLauncherPath selects an existing launcher JAR.'
     Write-Host '--Docker selects the complete toolchain in a persistent Linux workspace; existing native repository locations are reported and their files are preserved.'
+    Write-Host 'New managed Docker databases use scala_lab / aurora (PGPASSWORD overrides the default). Existing legacy rxnorm_lab containers retain their original account, credentials and data. Each run checks authentication. -PgAdminUser selects a recovery administrator; existing passwords are never reset.'
     Write-Host 'Docker can reuse Windows PostgreSQL or a published container: --Docker -DockerUseHostPostgres -Port 5432 -Database scala_testing_lab -DbUser scala_lab. Enable host networking in Docker Desktop 4.34+. PGPASSWORD is forwarded to the worker only; set the extension password in VS Code SecretStorage.'
     Write-Host 'If a separate server is wanted while another PostgreSQL is detected, choose -DockerUseManagedPostgres. Imported data and existing servers are never migrated automatically.'
     Write-Host 'Docker: -DockerToolSearchPath accepts additional Linux directories mounted in the runtime; use -AdditionalSearchPath for Windows executables.'
@@ -1589,19 +1633,20 @@ if ($LocateToolsOnFixedDrives) { Show-FixedDriveToolLocations; return }
 try {
 # The two backends are explicit, never selected by probing Docker installation.
 $DatabaseMode = 'local'
-if ($UseDocker -and ($ProvisionDatabase -or $PSBoundParameters.ContainsKey('PgAdminUser'))) { throw '-ProvisionDatabase and -PgAdminUser apply only to native Windows installations.' }
-if ($PSBoundParameters.ContainsKey('PgAdminUser') -and -not $ProvisionDatabase) { throw '-PgAdminUser requires -ProvisionDatabase.' }
 $RuntimeImageSpecified = $PSBoundParameters.ContainsKey('RuntimeImage')
 if (($DockerUseHostPostgres -or $DockerUseManagedPostgres -or $DockerToolSearchPath) -and -not $UseDocker) { throw 'The selected Docker options require --Docker.' }
 if ($DockerUseHostPostgres -and $DockerUseManagedPostgres) { throw 'Select one Docker database mode.' }
 if ($UseDocker -and ($PsqlPath -or $PgServiceName)) { throw 'Select the database by port, database and user in Docker mode. Windows psql/service overrides apply only to native runs.' }
 if ($UseDocker -and -not $DockerUseHostPostgres) {
     $DatabaseMode = 'docker-managed'
-    if (($PgHost -and $PgHost -ne '127.0.0.1') -or ($Database -and $Database -ne 'rxnorm_public') -or ($DbUser -and $DbUser -ne 'rxnorm_lab')) {
+    $DockerDbUserSpecified = $PSBoundParameters.ContainsKey('DbUser')
+    $DockerPgAdminUserSpecified = $PSBoundParameters.ContainsKey('PgAdminUser')
+    if (($PgHost -and $PgHost -ne '127.0.0.1') -or ($Database -and $Database -ne 'rxnorm_public') -or ($DbUser -and $DbUser -cnotin @('scala_lab', 'rxnorm_lab'))) {
         throw 'Use -DockerUseHostPostgres to select an existing database with your own connection settings.'
     }
     if (-not $PSBoundParameters.ContainsKey('Port')) { $Port = 55433 }
-    $PgHost = '127.0.0.1'; $Database = 'rxnorm_public'; $DbUser = 'rxnorm_lab'
+    $PgHost = '127.0.0.1'; $Database = 'rxnorm_public'
+    if (-not $DbUser) { $DbUser = 'scala_lab' }
 } else {
     if ($DockerUseHostPostgres) { $DatabaseMode = 'docker-host-postgres' }
     if (-not $PSBoundParameters.ContainsKey('PgHost')) { $PgHost = if ($env:PGHOST) { $env:PGHOST } else { '127.0.0.1' } }
@@ -1674,6 +1719,10 @@ $HealthFile = Join-Path $State 'health.json'
 Save-Json $HealthFile @{ status = 'running'; startedAt = (Get-Date).ToUniversalTime().ToString('o') }
 # Protect local setup state; existing database credentials are never persisted here.
 Protect-BootstrapState $State
+if (-not $env:PGPASSWORD -and $DbUser -ceq 'scala_lab') {
+    $env:PGPASSWORD = 'aurora'
+    Write-Host "Using the default lab credentials for '$DbUser'. PGPASSWORD can select an existing password."
+}
 if (-not $env:PGPASSWORD) {
     if (-not (Test-BootstrapInteractive)) { throw 'Supply the lab password via PGPASSWORD for a noninteractive run.' }
     $securePassword = Read-Host "PostgreSQL lab password for $DbUser" -AsSecureString
@@ -1715,7 +1764,8 @@ if ((Get-FileHash -LiteralPath $UpdatedScript -Algorithm SHA256).Hash -ne $Entry
     if (-not $UseDocker) {
         $next.PgHost = $PgHost; $next.Database = $Database; $next.DbUser = $DbUser
         if ($PSBoundParameters.ContainsKey('PsqlPath')) { $next.PsqlPath = $PsqlPath }; $next.PgServiceName = $PgServiceName
-        if ($ProvisionDatabase) { $next.ProvisionDatabase = $true; $next.PgAdminUser = $PgAdminUser }
+        if ($ProvisionDatabase) { $next.ProvisionDatabase = $true }
+        $next.PgAdminUser = $PgAdminUser
     }
     & $UpdatedScript @next
     return
@@ -1891,6 +1941,11 @@ Write-Host 'Change strength 325 mg to strength 32500 mg and pause to see PRODUCT
     if ($HealthFile) {
         try { Save-Json $HealthFile @{ status = 'failed'; failedAt = (Get-Date).ToUniversalTime().ToString('o'); error = $_.Exception.Message } }
         catch { Write-Warning 'Could not write the failed health report.' }
+    }
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    if ($HealthFile) { Write-Host "Details: $HealthFile" }
+    if ($RelaunchCount -eq 0 -and (Test-BootstrapInteractive)) {
+        try { Read-Host 'Press Enter after reading the error' | Out-Null } catch { }
     }
     throw
 } finally {

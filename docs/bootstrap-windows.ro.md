@@ -9,7 +9,7 @@ Din directorul care conține scriptul, comanda implicită pregătește laborator
 .\bootstrap-windows.ps1 --Docker
 ```
 
-Comenzile de mai sus folosesc versiunea publicată în `main`. Pentru verificare înainte de integrarea PR-ului, lansează scriptul din branch-ul PR-ului și transmite și `-ScalaBranch fix/recover-existing-toolchains`. Astfel, actualizarea automată a laboratorului urmează același cod pe care îl testezi.
+Comenzile de mai sus folosesc versiunea publicată în `main`. Pentru verificarea unui PR înainte de integrare, lansează scriptul din branch-ul PR-ului și transmite și `-ScalaBranch` cu numele acelui branch. Astfel, actualizarea automată a laboratorului urmează același cod pe care îl testezi.
 
 ## Alegerea instrumentelor
 
@@ -34,14 +34,28 @@ O componentă lipsă poate fi instalată după căutare. Repararea dependențelo
 
 ## PostgreSQL local sau în Docker
 
-Pentru o bază și un rol deja existente, folosește contul aplicației. Scriptul verifică autentificarea înainte de build. Pe un Windows nou, poți cere explicit crearea obiectelor lipsă. Scriptul solicită datele administratorului atunci când are nevoie de ele.
+Rularea standard folosește implicit utilizatorul PostgreSQL **`scala_lab`** și parola **`aurora`**, fără să ceară parola aplicației la fiecare execuție. Un `PGPASSWORD` deja configurat are prioritate. `-DbUser` sau `PGUSER` permit selectarea altui cont existent.
+
+1. Scriptul încearcă autentificarea înainte de build. Dacă reușește, continuă fără crearea unui cont și fără solicitarea parolei administratorului.
+2. Dacă nu se poate conecta, solicită parola administratorului PostgreSQL, implicit `postgres`. Aceasta este parola existentă a administratorului, nu parola `aurora` a aplicației. `-PgAdminUser` permite alegerea altui administrator.
+3. Prin conexiunea administrativă verifică separat existența rolului și a bazei. Creează `scala_lab` cu parola configurată numai dacă rolul lipsește. Creează baza selectată numai dacă aceasta lipsește.
+4. Dacă rolul există, dar parola sau permisiunile sunt respinse, afișează eroarea și se oprește. Nu resetează parola existentă. O bază existentă își păstrează proprietarul și privilegiile.
+
+Nu mai este necesar `-ProvisionDatabase` pentru `scala_lab`. Opțiunea rămâne disponibilă pentru crearea unui rol particularizat. Fără terminal interactiv, o conexiune existentă funcționează normal; dacă este necesară autentificarea administratorului, scriptul raportează cum se reia configurarea interactivă.
 
 ```powershell
 .\bootstrap-windows.ps1 -PgServiceName ClinicalDB -Database scala_testing_lab -DbUser scala_lab
-.\bootstrap-windows.ps1 -ProvisionDatabase -PgAdminUser postgres
+.\bootstrap-windows.ps1 -PgAdminUser postgres
+.\bootstrap-windows.ps1 -DbUser alt_rol -ProvisionDatabase
 ```
 
+La eroare, PowerShell afișează mesajul și locația `health.json`. Într-o sesiune interactivă așteaptă Enter, astfel încât o fereastră pornită prin „Run with PowerShell” să nu dispară înainte de citirea erorii. Execuțiile neinteractive se termină cu eroare fără această pauză.
+
 Cu `--Docker`, PowerShell găsește Docker și, dacă ai cerut editorul, VS Code pe Windows. Java, sbt, Scala, Node și Langium se execută în containerul Linux. Scriptul verifică instrumentele din acel container, inclusiv căile din imagine, alternativele și pachetele înregistrate în Linux, managerii de versiuni și cache-urile persistente. Pentru directoare suplimentare deja vizibile în container, poți adăuga `-DockerToolSearchPath @('/opt/company', '/workspace/tools')`. Un `java.exe` Windows și un executabil Java Linux sunt programe pentru sisteme de operare diferite.
+
+Un PostgreSQL Docker nou este inițializat cu **`scala_lab` / `aurora`**, sau cu parola furnizată explicit prin `PGPASSWORD`, și baza `rxnorm_public`. La următoarea rulare se verifică autentificarea și se reutilizează containerul și volumul. Pentru containerele create de versiunile anterioare, scriptul recunoaște contul `rxnorm_lab`, anunță reutilizarea lui și păstrează configurația originală, inclusiv datele RxNorm. Nu migrează automat proprietatea datelor la un cont diferit.
+
+Și modul Docker care folosește serverul local poate crea `scala_lab` dacă lipsește, după verificarea prin administrator. Parola administratorului se introduce în terminalul interactiv al workerului Linux. `-PgAdminUser` permite alegerea lui; implicit este `postgres` pentru serverul gazdei și contul de inițializare pentru containerul administrat de script. La o eroare de autentificare, o parolă deja existentă nu este suprascrisă.
 
 Docker poate folosi serverul PostgreSQL deja disponibil pe portul local al gazdei, inclusiv un alt container care publică portul pe loopback. Activează **Enable host networking** în Docker Desktop 4.34 sau mai nou, alege baza și rolul, apoi rulează:
 
