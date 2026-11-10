@@ -2663,6 +2663,15 @@ AND p.sha256_json::jsonb->>'RXNSAT.RRF' ~ '^[0-9a-fA-F]{64}$'
 AND p.sha256_json::jsonb->>'RXNCONSO.RRF'=r.sha256_json::jsonb->>'RXNCONSO.RRF'
 AND p.sha256_json::jsonb->>'RXNREL.RRF'=r.sha256_json::jsonb->>'RXNREL.RRF';
 "@
+# A previous non-forked CLI could exit sbt after committing only the base.
+# Resume that case only for the exact archive managed by Get-RxNormFiles.
+# Other source manifests require their original matching archive, not replacement.
+$resumableBaseQuery = @"
+SELECT 1 FROM rxnorm_lab.release r
+WHERE r.release='2026-10-05' AND r.state='ready' AND r.scope='all-active-rxnorm-pg-v4'
+AND r.sha256_json::jsonb->>'RXNCONSO.RRF'='555730c3ff2a981796dc5d649acc482e4685f7a31f7b0442941393ae50dd5209'
+AND r.sha256_json::jsonb->>'RXNREL.RRF'='cca47f32a2c32ef60d65c6789851385ff5dcf287750ca01a53f800a5cf5ef694';
+"@
 # Missing schema is a normal first-install state. Authentication/SQL failures
 # must not be swallowed and mistaken for an absent import.
 $manifest = Invoke-DatabaseSql "SELECT CASE WHEN to_regclass('rxnorm_lab.release') IS NULL THEN 'empty' WHEN to_regclass('rxnorm_lab.product_release') IS NULL THEN 'base' ELSE 'both' END;"
@@ -2670,13 +2679,25 @@ $ready = $false
 if ($manifest -eq 'both') { $ready = (Invoke-DatabaseSql $query) -eq '1' }
 $ImportCommands = @()
 if (-not $ready) {
-    if ($manifest -ne 'empty' -and (Invoke-DatabaseSql "SELECT count(*) FROM rxnorm_lab.release WHERE release='2026-10-05';") -ne '0') {
-        throw 'The local 2026-10-05 import is incomplete or incompatible. Complete it using its original matching RxNorm archive (README section 7), or select a separate empty database. No existing release was replaced.'
+    $resumeProducts = $false
+    if ($manifest -ne 'empty') {
+        $baseCount = Invoke-DatabaseSql "SELECT count(*) FROM rxnorm_lab.release WHERE release='2026-10-05';"
+        if ($baseCount -notin @('0', '1')) { throw 'Unexpected RxNorm base manifest response. No import was started.' }
+        if ($baseCount -eq '1') {
+            $productCount = if ($manifest -eq 'both') { Invoke-DatabaseSql "SELECT count(*) FROM rxnorm_lab.product_release WHERE release='2026-10-05';" } else { '0' }
+            if ($productCount -eq '0' -and (Invoke-DatabaseSql $resumableBaseQuery) -eq '1') {
+                $resumeProducts = $true
+                Write-Host 'Verified base RxNorm import reused; completing only the missing product-attribute index.'
+            } else {
+                throw 'The local 2026-10-05 import is incomplete or incompatible with the managed archive. Complete it using its original matching RxNorm archive (README section 7), or select a separate empty database. Existing release data was preserved; no archive was downloaded.'
+            }
+        }
     }
     $rrfDirectory = Join-Path $Data 'rrf'
     Get-RxNormFiles $rrfDirectory (Join-Path $Downloads 'RxNorm_full_prescribe_10052026.zip')
     $rrf = ConvertTo-SbtPath $rrfDirectory
-    $ImportCommands = @("run import-rxnorm $rrf 2026-10-05", "run import-product-attributes $rrf 2026-10-05")
+    if (-not $resumeProducts) { $ImportCommands += "run import-rxnorm $rrf 2026-10-05" }
+    $ImportCommands += "run import-product-attributes $rrf 2026-10-05"
 } else { Write-Host 'Verified RxNorm import reused.' }
 
 # leave an existing demo file alone
@@ -2701,11 +2722,11 @@ foreach ($case in @('valid', 'invalid')) {
     $resultArg = ConvertTo-SbtPath $resultFile
     $SmokeCommands += "run resolve $astArg $resultArg"
 }
-# test compiles the project. The same sbt process runs both imports before resolution.
+# test compiles the project. sbt forks each CLI so ZIO's exit cannot skip queued commands.
 Invoke-Sbt $SmokeCommands
 if ($ImportCommands.Count) {
-    Invoke-DatabaseSql 'ANALYZE;' | Out-Host
-    if ((Invoke-DatabaseSql $query) -ne '1') { throw 'RxNorm release/product index verification failed after import.' }
+    if ((Invoke-DatabaseSql $query) -ne '1') { throw 'RxNorm verification failed: both ready base and product manifests with matching source hashes are required. Existing data was preserved; inspect the import output for the missing or incompatible stage.' }
+    Invoke-DatabaseSql 'ANALYZE rxnorm_lab.release, rxnorm_lab.rxnconso, rxnorm_lab.rxnrel, rxnorm_lab.rx_concept, rxnorm_lab.lexical_name, rxnorm_lab.product_release, rxnorm_lab.rxnsat, rxnorm_lab.product_attribute;' | Out-Host
 }
 foreach ($case in @('valid', 'invalid')) {
     $resultFile = Join-Path $Smoke "$case.result.json"
