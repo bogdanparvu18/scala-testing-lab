@@ -1738,17 +1738,144 @@ function Get-PostgresRecoveryHash([byte[]]$Bytes) {
     $algorithm = [Security.Cryptography.SHA256]::Create()
     try { return [Convert]::ToBase64String($algorithm.ComputeHash($Bytes)) } finally { $algorithm.Dispose() }
 }
-function Write-PostgresRecoveryBytes([string]$Path, [byte[]]$Bytes) {
+function Enter-PostgresRecoveryPrivilege([ValidateSet('SeRestorePrivilege', 'SeSecurityPrivilege')][string]$Name) {
+    if ($env:OS -ne 'Windows_NT') { throw 'PostgreSQL file-security preservation requires Windows.' }
+    if (-not ('AuroraPostgresRecoveryPrivilege' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public sealed class AuroraPostgresRecoveryPrivilege : IDisposable {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Luid { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenPrivileges { public uint Count; public Luid Luid; public uint Attributes; }
+    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentThread();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool OpenThreadToken(IntPtr thread, uint access, bool asSelf, out IntPtr token);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool LookupPrivilegeValue(string system, string name, out Luid luid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges state, uint length, out TokenPrivileges previous, out uint returnedLength);
+    [DllImport("advapi32.dll", EntryPoint = "AdjustTokenPrivileges", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool RestoreTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges state, uint length, IntPtr previous, IntPtr returnedLength);
+
+    private IntPtr token;
+    private TokenPrivileges previous;
+    private readonly string name;
+    private AuroraPostgresRecoveryPrivilege(string privilege) {
+        if (privilege != "SeRestorePrivilege" && privilege != "SeSecurityPrivilege") throw new ArgumentException("Unsupported PostgreSQL recovery privilege.", "privilege");
+        name = privilege;
+        if (!OpenThreadToken(GetCurrentThread(), 0x28, true, out token)) {
+            int error = Marshal.GetLastWin32Error();
+            if (error != 1008) throw new Win32Exception(error, "Cannot open the effective Windows token.");
+            if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot open the Windows process token.");
+        }
+        try {
+            Luid luid;
+            if (!LookupPrivilegeValue(null, name, out luid)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot resolve " + name + ".");
+            TokenPrivileges desired = new TokenPrivileges { Count = 1, Luid = luid, Attributes = 2 };
+            uint returnedLength;
+            TokenPrivileges saved;
+            bool adjusted = AdjustTokenPrivileges(token, false, ref desired, (uint)Marshal.SizeOf(typeof(TokenPrivileges)), out saved, out returnedLength);
+            int error = Marshal.GetLastWin32Error();
+            // TRUE with ERROR_NOT_ALL_ASSIGNED also means the right is absent.
+            if (!adjusted || error != 0) throw new Win32Exception(error, "Cannot enable " + name + " for PostgreSQL file-security preservation.");
+            previous = saved;
+        } catch {
+            try { Restore(); } finally { CloseHandle(token); token = IntPtr.Zero; }
+            throw;
+        }
+    }
+    public static IDisposable Enter(string name) { return new AuroraPostgresRecoveryPrivilege(name); }
+    private void Restore() {
+        if (previous.Count == 0) return;
+        bool restored = RestoreTokenPrivileges(token, false, ref previous, 0, IntPtr.Zero, IntPtr.Zero);
+        int error = Marshal.GetLastWin32Error();
+        if (!restored || error != 0) throw new Win32Exception(error, "Cannot restore the previous state of " + name + ".");
+        previous.Count = 0;
+    }
+    public void Dispose() {
+        if (token == IntPtr.Zero) return;
+        try { Restore(); } finally { CloseHandle(token); token = IntPtr.Zero; }
+    }
+}
+'@ -ErrorAction Stop
+    }
+    return [AuroraPostgresRecoveryPrivilege]::Enter($Name)
+}
+function Get-PostgresRecoveryFileSecurity([string]$Path) {
+    $scope = Enter-PostgresRecoveryPrivilege 'SeSecurityPrivilege'
+    try {
+        $acl = Get-Acl -LiteralPath $Path -Audit -ErrorAction Stop
+        return $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+    } finally { $scope.Dispose() }
+}
+function Get-PostgresRecoverySecurityPart([string]$Sddl, [ValidateSet('All', 'Access', 'AccessAudit', 'OwnerGroupAccess', 'OwnerGroup')][string]$Part = 'All') {
+    $sections = switch ($Part) {
+        'All' { [Security.AccessControl.AccessControlSections]::All }
+        'Access' { [Security.AccessControl.AccessControlSections]::Access }
+        'AccessAudit' { [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Audit }
+        'OwnerGroupAccess' { [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group -bor [Security.AccessControl.AccessControlSections]::Access }
+        'OwnerGroup' { [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group }
+    }
+    $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($Sddl)
+    return $descriptor.GetSddlForm($sections)
+}
+function Set-PostgresRecoveryFileSecurity([string]$Path, [string]$Sddl, [switch]$OwnershipOnly) {
+    $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($Sddl)
+    if (-not $descriptor.Owner -or -not $descriptor.Group) { throw 'Recorded PostgreSQL security is missing its owner or primary group.' }
+    # FileSecurity can synthesize an Everyone/FullControl ACE for a null DACL.
+    # Refuse that unsupported descriptor instead of changing its meaning.
+    if (-not $OwnershipOnly -and $null -eq $descriptor.DiscretionaryAcl) { throw 'PostgreSQL recovery cannot preserve a null DACL automatically.' }
+    $part = if ($OwnershipOnly) { 'OwnerGroup' } else { 'All' }
+    $sections = if ($OwnershipOnly) { [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group } else { [Security.AccessControl.AccessControlSections]::All }
+    $restore = $null; $security = $null
+    try {
+        $restore = Enter-PostgresRecoveryPrivilege 'SeRestorePrivilege'
+        $security = Enter-PostgresRecoveryPrivilege 'SeSecurityPrivilege'
+        $acl = Get-Acl -LiteralPath $Path -Audit -ErrorAction Stop
+        $before = $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+        $acl.SetSecurityDescriptorSddlForm($Sddl, $sections)
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        $applied = (Get-Acl -LiteralPath $Path -Audit -ErrorAction Stop).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+        if ((Get-PostgresRecoverySecurityPart $applied $part) -cne (Get-PostgresRecoverySecurityPart $Sddl $part)) { throw "Could not preserve the recorded PostgreSQL file security: $Path" }
+        if ($OwnershipOnly -and (Get-PostgresRecoverySecurityPart $applied 'AccessAudit') -cne (Get-PostgresRecoverySecurityPart $before 'AccessAudit')) { throw "PostgreSQL access/audit rules changed during ownership restoration: $Path" }
+    } finally {
+        try { if ($security) { $security.Dispose() } }
+        finally { if ($restore) { $restore.Dispose() } }
+    }
+}
+function Write-PostgresRecoveryBytes([string]$Path, [byte[]]$Bytes, [string]$ExpectedSecurity = '', [string]$ExpectedHash = '') {
+    $originalSecurity = Get-PostgresRecoveryFileSecurity $Path
+    $originalHash = Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($Path))
+    if (($ExpectedSecurity -and $originalSecurity -cne $ExpectedSecurity) -or ($ExpectedHash -and $originalHash -cne $ExpectedHash)) {
+        throw "PostgreSQL configuration changed before replacement: $Path. No replacement was published."
+    }
     $temporary = "$Path.aurora-$([guid]::NewGuid().ToString('N')).tmp"
     try {
+        # ReplaceFile preserves the DACL, but does not promise owner/group/SACL
+        # preservation. Apply and verify the complete descriptor before publish.
+        $stage = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stage.Dispose()
+        Set-PostgresRecoveryFileSecurity $temporary $originalSecurity
         [IO.File]::WriteAllBytes($temporary, $Bytes)
-        # ReplaceFile preserves the destination's ACL/owner; give the staged file
-        # its access rules too so the PostgreSQL service can read the replacement.
-        $originalAcl = Get-Acl -LiteralPath $Path
-        $stageAcl = Get-Acl -LiteralPath $temporary
-        $stageAcl.SetSecurityDescriptorSddlForm($originalAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access), [Security.AccessControl.AccessControlSections]::Access)
-        Set-Acl -LiteralPath $temporary -AclObject $stageAcl
+        if ((Get-PostgresRecoveryFileSecurity $temporary) -cne $originalSecurity -or
+            (Get-PostgresRecoveryFileSecurity $Path) -cne $originalSecurity -or
+            (Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($Path))) -cne $originalHash) {
+            throw "PostgreSQL configuration or staged permissions changed before replacement: $Path. No replacement was published."
+        }
         [IO.File]::Replace($temporary, $Path, [Management.Automation.Language.NullString]::Value)
+        if ((Get-PostgresRecoveryFileSecurity $Path) -cne $originalSecurity -or
+            (Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($Path))) -cne (Get-PostgresRecoveryHash $Bytes)) {
+            throw "Could not verify the replaced PostgreSQL configuration and permissions: $Path. The recovery journal was retained."
+        }
     } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
 }
 function Restore-PostgresRecoveryJournal($Target, [string]$Directory) {
@@ -1758,23 +1885,68 @@ function Restore-PostgresRecoveryJournal($Target, [string]$Directory) {
     $null = Assert-PostgresRecoveryPath $path
     Assert-PostgresRecoveryJournalAcl $path
     $journal = [IO.File]::ReadAllText($path) | ConvertFrom-Json
-    if ($journal.schema -ne 1 -or $journal.data -ine $Target.data -or $journal.bin -ine $Target.bin -or [int]$journal.port -ne $Target.port -or @($journal.files).Count -ne 2) { throw "The pending password-recovery journal does not match this instance: $path" }
+    if ($journal.schema -notin @(1, 2) -or $journal.data -ine $Target.data -or $journal.bin -ine $Target.bin -or [int]$journal.port -ne $Target.port -or @($journal.files).Count -ne 2) { throw "The pending password-recovery journal does not match this instance: $path" }
     $expected = @($Target.hba, $Target.ident)
+    # Schema 1 recorded Get-Acl without -Audit. Preserve its current SACL while
+    # checking every recorded section; schema 2 also records/verifies auditing.
+    $sections = if ($journal.schema -eq 1) { 'OwnerGroupAccess' } else { 'All' }
+    $snapshots = @(); $repairs = @()
     for ($i = 0; $i -lt 2; $i++) {
         $entry = $journal.files[$i]
         if ($entry.path -ine $expected[$i]) { throw "Unexpected configuration path in recovery journal: $path" }
-        $currentHash = Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))
-        if ($currentHash -cnotin @($entry.originalHash, $entry.temporaryHash)) { throw "Recovery stopped because '$($entry.path)' changed concurrently. Its original bytes are retained in $path; reconcile it before retrying." }
-        if ((Get-Acl -LiteralPath $entry.path).Sddl -cne $entry.acl) { throw "Recovery stopped because the ACL of '$($entry.path)' changed concurrently. Restore its recorded permissions before retrying: $path" }
+        $null = Assert-PostgresRecoveryPath $entry.path
         $original = [Convert]::FromBase64String($entry.original)
         if ((Get-PostgresRecoveryHash $original) -cne $entry.originalHash) { throw "The recovery journal failed its integrity check: $path" }
+        $currentHash = Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))
+        if ($currentHash -cnotin @($entry.originalHash, $entry.temporaryHash)) { throw "Recovery stopped because '$($entry.path)' changed concurrently. Its original bytes are retained in $path; reconcile it before retrying." }
+        $security = Get-PostgresRecoveryFileSecurity $entry.path
+        $recorded = Get-PostgresRecoverySecurityPart $entry.acl $sections
+        if ((Get-PostgresRecoverySecurityPart $security $sections) -cne $recorded) {
+            if ($journal.schema -eq 1 -and
+                (Get-PostgresRecoverySecurityPart $security 'Access') -ceq (Get-PostgresRecoverySecurityPart $entry.acl 'Access')) {
+                # The original writer copied only the DACL to its replacement.
+                # Repair only that legacy owner/group drift, with explicit consent.
+                $repairs += $i
+            } else { throw "Recovery stopped because recorded permissions changed for '$($entry.path)'. No automatic permission repair is allowed. Compare the current security descriptor with the protected journal: $path" }
+        }
+        $snapshots += @{ hash = $currentHash; security = $security; recorded = $recorded }
+    }
+    if ($repairs.Count) {
+        Assert-PostgresRecoveryAdministrator
+        Write-Host 'A previous bootstrap version could change file ownership during atomic replacement. File contents and recorded access permissions still match.'
+        foreach ($i in $repairs) {
+            Write-Host ("Restore recorded owner/group for '{0}': {1} -> {2}" -f $journal.files[$i].path,
+                (Get-PostgresRecoverySecurityPart $snapshots[$i].security 'OwnerGroup'),
+                (Get-PostgresRecoverySecurityPart $journal.files[$i].acl 'OwnerGroup'))
+        }
+        $answer = Read-Host 'Restore the recorded owner/group and original authentication files from this trusted journal? [y/N]'
+        if (([string]$answer).Trim() -notmatch '^(y|yes|d|da)$') { throw "Recovery journal repair was declined. Files and journal were preserved: $path" }
+    }
+    # Recheck both snapshots after any prompt, before making the first change.
+    for ($i = 0; $i -lt 2; $i++) {
+        $entry = $journal.files[$i]
+        if ((Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))) -cne $snapshots[$i].hash -or
+            (Get-PostgresRecoveryFileSecurity $entry.path) -cne $snapshots[$i].security) {
+            throw "PostgreSQL configuration or permissions changed during recovery preflight: $($entry.path). Journal: $path"
+        }
+    }
+    foreach ($i in $repairs) {
+        $entry = $journal.files[$i]
+        if ((Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))) -cne $snapshots[$i].hash -or
+            (Get-PostgresRecoveryFileSecurity $entry.path) -cne $snapshots[$i].security) { throw "Configuration changed before ownership repair: $($entry.path). Journal: $path" }
+        Set-PostgresRecoveryFileSecurity $entry.path $entry.acl -OwnershipOnly
+        $snapshots[$i].security = Get-PostgresRecoveryFileSecurity $entry.path
+        if ((Get-PostgresRecoverySecurityPart $snapshots[$i].security $sections) -cne $snapshots[$i].recorded) { throw "Could not verify repaired ownership: $($entry.path). Journal: $path" }
     }
     # Close the temporary authentication route before removing its identity map.
-    foreach ($entry in $journal.files) {
+    for ($i = 0; $i -lt 2; $i++) {
+        $entry = $journal.files[$i]
         $currentHash = Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))
-        if ($currentHash -ceq $entry.temporaryHash) { Write-PostgresRecoveryBytes $entry.path ([Convert]::FromBase64String($entry.original)) }
-        elseif ($currentHash -cne $entry.originalHash) { throw "Recovery configuration changed during restoration: $($entry.path). Journal: $path" }
-        if ((Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))) -cne $entry.originalHash -or (Get-Acl -LiteralPath $entry.path).Sddl -cne $entry.acl) { throw "Could not verify restored PostgreSQL configuration: $($entry.path). Journal: $path" }
+        if ($currentHash -cne $snapshots[$i].hash -or (Get-PostgresRecoveryFileSecurity $entry.path) -cne $snapshots[$i].security) { throw "Recovery configuration changed during restoration: $($entry.path). Journal: $path" }
+        if ($currentHash -ceq $entry.temporaryHash) { Write-PostgresRecoveryBytes $entry.path ([Convert]::FromBase64String($entry.original)) $snapshots[$i].security $currentHash }
+        if ((Get-PostgresRecoveryHash ([IO.File]::ReadAllBytes($entry.path))) -cne $entry.originalHash -or
+            (Get-PostgresRecoveryFileSecurity $entry.path) -cne $snapshots[$i].security -or
+            (Get-PostgresRecoverySecurityPart $snapshots[$i].security $sections) -cne $snapshots[$i].recorded) { throw "Could not verify restored PostgreSQL configuration: $($entry.path). Journal: $path" }
     }
     [IO.File]::Delete($path)
 }
@@ -1864,12 +2036,12 @@ function Recover-LocalPostgresPassword {
                 [Array]::Copy($prefix, 0, $temporary, $bom, $prefix.Length)
                 [Array]::Copy($bytes, $bom, $temporary, ($bom + $prefix.Length), ($bytes.Length - $bom))
                 $temporaryBytes += ,$temporary
-                $entries += @{ path = $paths[$i]; original = [Convert]::ToBase64String($bytes); originalHash = (Get-PostgresRecoveryHash $bytes); temporaryHash = (Get-PostgresRecoveryHash $temporary); acl = (Get-Acl -LiteralPath $paths[$i]).Sddl }
+                $entries += @{ path = $paths[$i]; original = [Convert]::ToBase64String($bytes); originalHash = (Get-PostgresRecoveryHash $bytes); temporaryHash = (Get-PostgresRecoveryHash $temporary); acl = (Get-PostgresRecoveryFileSecurity $paths[$i]) }
             }
-            Save-PostgresRecoveryJournal (Join-Path $directory 'journal.json') @{ schema = 1; data = $target.data; bin = $target.bin; port = $Port; files = $entries }
+            Save-PostgresRecoveryJournal (Join-Path $directory 'journal.json') @{ schema = 2; data = $target.data; bin = $target.bin; port = $Port; files = $entries }
             try {
-                Write-PostgresRecoveryBytes $target.ident $temporaryBytes[1]
-                Write-PostgresRecoveryBytes $target.hba $temporaryBytes[0]
+                Write-PostgresRecoveryBytes $target.ident $temporaryBytes[1] $entries[1].acl $entries[1].originalHash
+                Write-PostgresRecoveryBytes $target.hba $temporaryBytes[0] $entries[0].acl $entries[0].originalHash
                 $probe = Invoke-PostgresRecoveryClient "SELECT json_build_object('login',current_user,'data',current_setting('data_directory'),'hba',current_setting('hba_file'),'ident',current_setting('ident_file'))::text;" | ConvertFrom-Json
                 if ($probe.login -cne $PgAdminUser -or [IO.Path]::GetFullPath([string]$probe.data) -ine $target.data -or [IO.Path]::GetFullPath([string]$probe.hba) -ine $target.hba -or [IO.Path]::GetFullPath([string]$probe.ident) -ine $target.ident) { throw 'The authenticated recovery connection does not match the verified local PostgreSQL instance.' }
                 $null = Invoke-PostgresRecoveryClient '\password' ($newPassword + "`n" + $newPassword + "`n")

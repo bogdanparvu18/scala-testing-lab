@@ -24,6 +24,8 @@ For local Windows recovery, run PowerShell as Administrator. Setup verifies the 
 # Add -PgServiceName or -PsqlPath when multiple installations need disambiguation.
 ```
 
+If an older bootstrap stops with an ACL-change error during recovery, keep `postgres-password-recovery\journal.json` and rerun the updated script as Administrator with the same `-Root`. The original writer could change a configuration file's owner/group during replacement. The updated script offers a confirmed repair only when the trusted journal, instance, file contents, and recorded access permissions still match. It restores the recorded owner/group and original authentication files before continuing. Changed contents or access permissions require manual review; deleting the journal could leave temporary authentication rules in place. New recovery operations preserve and verify ownership, access permissions, and auditing on replacement files.
+
 For a managed Docker database, the normal `--Docker` flow offers recovery using a verified local administrative socket inside the selected container. It asks for confirmation and the new password twice, then tests the TCP login. If that container's local authentication policy prevents administrative access, setup reports the limitation. For `--Docker -DockerUseHostPostgres`, recover the Windows-hosted account from elevated PowerShell, then rerun Docker setup. Password recovery requires an interactive session; unattended runs report an error instead of resetting credentials.
 
 ## Contents
