@@ -790,11 +790,26 @@ manifest=$(sql "SELECT CASE WHEN to_regclass('rxnorm_lab.release') IS NOT NULL A
 ready=''
 if [ "$manifest" = 1 ]; then ready=$(sql "$QUERY"); fi
 IMPORT_COMMANDS=()
+resume_product_import=0
 if [ "$ready" != 1 ]; then
     has_base=$(sql "SELECT CASE WHEN to_regclass('rxnorm_lab.release') IS NOT NULL THEN 1 ELSE 0 END;")
     if [ "$has_base" = 1 ] && [ "$(sql "SELECT count(*) FROM rxnorm_lab.release WHERE release='2026-10-05';")" != 0 ]; then
-        echo 'The existing 2026-10-05 import is incomplete/incompatible. Complete it explicitly with its original archive; no data was replaced.' >&2
-        exit 1
+        # A terminated sbt run may have committed the base import before the
+        # product command started. Resume only its missing product extension,
+        # and only when the base belongs to our exact managed source archive.
+        base_matches=$(sql "SELECT CASE WHEN state='ready' AND scope='all-active-rxnorm-pg-v4'
+AND sha256_json::jsonb->>'RXNCONSO.RRF'='555730c3ff2a981796dc5d649acc482e4685f7a31f7b0442941393ae50dd5209'
+AND sha256_json::jsonb->>'RXNREL.RRF'='cca47f32a2c32ef60d65c6789851385ff5dcf287750ca01a53f800a5cf5ef694'
+THEN 1 ELSE 0 END FROM rxnorm_lab.release WHERE release='2026-10-05';")
+        product_rows=0
+        if [ "$manifest" = 1 ]; then product_rows=$(sql "SELECT count(*) FROM rxnorm_lab.product_release WHERE release='2026-10-05';"); fi
+        if [ "$base_matches" = 1 ] && [ "$product_rows" = 0 ]; then
+            resume_product_import=1
+            echo 'Verified base RxNorm import reused; completing only the missing product attributes.'
+        else
+            echo 'The existing 2026-10-05 base/product manifest is incompatible or incomplete. Complete it with its original matching RxNorm archive (README section 7). No existing data was replaced and no archive was downloaded.' >&2
+            exit 1
+        fi
     fi
     declare -A rrf_hash=(
         [RXNCONSO.RRF]=555730c3ff2a981796dc5d649acc482e4685f7a31f7b0442941393ae50dd5209
@@ -833,7 +848,11 @@ if [ "$ready" != 1 ]; then
             fi
         done
     fi
-    IMPORT_COMMANDS=("run import-rxnorm \"$DATA/rrf\" 2026-10-05" "run import-product-attributes \"$DATA/rrf\" 2026-10-05")
+    if [ "$resume_product_import" = 1 ]; then
+        IMPORT_COMMANDS=("run import-product-attributes \"$DATA/rrf\" 2026-10-05")
+    else
+        IMPORT_COMMANDS=("run import-rxnorm \"$DATA/rrf\" 2026-10-05" "run import-product-attributes \"$DATA/rrf\" 2026-10-05")
+    fi
 else
     echo 'Verified RxNorm import reused; no extraction or import needed.'
 fi
@@ -852,8 +871,9 @@ done
 cd "$SCALA"
 run_sbt compile test "${IMPORT_COMMANDS[@]}" "run resolve \"$SMOKE/valid.ast.json\" \"$SMOKE/valid.result.json\"" "run resolve \"$SMOKE/invalid.ast.json\" \"$SMOKE/invalid.result.json\""
 if [ "${#IMPORT_COMMANDS[@]}" -gt 0 ]; then
-    sql 'ANALYZE;' >/dev/null
-    [ "$(sql "$QUERY")" = 1 ] || { echo 'RxNorm release/product provenance verification failed.' >&2; exit 1; }
+    [ "$(sql "$QUERY")" = 1 ] || { echo 'RxNorm base/product manifests are missing or incompatible after import. Existing data was preserved; inspect the import command output before retrying.' >&2; exit 1; }
+    # The application owns these tables; system catalogs do not need analyzing.
+    sql 'ANALYZE rxnorm_lab.release, rxnorm_lab.rxnconso, rxnorm_lab.rxnrel, rxnorm_lab.rx_concept, rxnorm_lab.lexical_name, rxnorm_lab.product_release, rxnorm_lab.rxnsat, rxnorm_lab.product_attribute;' >/dev/null
 fi
 node - "$SMOKE" <<'JS'
 const fs = require('node:fs');
