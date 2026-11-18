@@ -138,13 +138,48 @@ test('exports explicit RxCUI identity and release without treating the local ali
   assert.deepEqual(reopened.mentions[0].productBinding, m.productBinding);
 });
 
+test('exports the exact visible product and RxCUI on the configured release, preserving the alias', async () => {
+  const display = 'Synthetic Aspirin "Brand" 81 MG / Oral Tablet [Demo]';
+  const text = boundFixture.replace('rxnormRelease "2026-10-05"', `product ${JSON.stringify(display)}`);
+  const request = await project(text, '2026-11-02');
+  assert.equal(request.schemaVersion, '2');
+  const m = request.mentions[0];
+  assert.equal(m.originalText, 'MyLocalAlias');
+  assert.deepEqual(m.productBinding, { rxcui: '10', release: '2026-11-02', display });
+  assert.equal(m.source.text, text.split('\n')[2]);
+  assert.equal(request.terminologyRelease, '2026-11-02');
+  await assert.rejects(project(text, '2026-02-30'), /invalid.*release/i);
+  await assert.rejects(project(text.replace('rxcui "10", ', ''), '2026-11-02'), /RxCUI/i);
+  await assert.rejects(project(text.replace(JSON.stringify(display), '"   "'), '2026-11-02'), /blank|empty/i);
+});
+
+test('bare search text cannot be exported until the editor inserts the selected product', async () => {
+  const release = '2026-10-05';
+  const binding = 'product "aspirin synthetic product" rxcui "900001"';
+  const completed = boundFixture.replace('rxcui "10", rxnormRelease "2026-10-05"', binding);
+  for (const draft of [
+    completed.replace(binding, 'aspi'),
+    completed.replace('Plan DemoPlan:', 'aspi\nPlan DemoPlan:')
+  ]) {
+    await assert.rejects(project(draft, release), /Lexing\/parsing failed/);
+  }
+
+  const { mentions: [mention] } = await project(completed, release);
+  assert.deepEqual(mention.productBinding, { rxcui: '900001', display: 'aspirin synthetic product', release });
+  assert.equal(mention.originalText, 'MyLocalAlias');
+  assert.equal(mention.orderId, 'DemoPlan');
+  assert.deepEqual(mention.dose, { amount: 1, unit: 'mg' });
+  assert.equal(mention.route, 'PO');
+  assert.equal(mention.frequency, 'PRN');
+});
+
 test('rejects binding/version mismatch before producing a terminology request', async () => {
   await assert.rejects(project(boundFixture, '2026-09-07'), /selected from RxNorm|release/i);
 });
 
 test('rejects partial, invalid and duplicate bindings', async () => {
   await assert.rejects(project(boundFixture.replace('rxcui "10", ', ''), '2026-10-05'), /together|RxCUI|binding/i);
-  await assert.rejects(project(boundFixture.replace('rxnormRelease "2026-10-05", ', ''), '2026-10-05'), /together|release|binding/i);
+  await assert.rejects(project(boundFixture.replace('rxnormRelease "2026-10-05", ', ''), '2026-10-05'), /product name|release|binding/i);
   await assert.rejects(project(boundFixture.replace('rxcui "10"', 'rxcui "0"'), '2026-10-05'), /RxCUI/i);
   await assert.rejects(project(boundFixture.replace('rxcui "10"', 'rxcui "10", rxcui "11"'), '2026-10-05'), /duplicate|once/i);
 });

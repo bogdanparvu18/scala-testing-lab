@@ -65,6 +65,9 @@ object Resolver:
             case Some(c) if !products(c.tty) || m.role == "activeIngredient" =>
               Resolution(m,"invalidRole",None,None,Vector.empty,Vector(Candidate(ref(c),Vector.empty)),"explicit_rxcui",
                 Vector("PRODUCT_RXCUI_TYPE_MISMATCH: explicit product bindings require SCD or SBD and a medication/product role"))
+            case Some(c) if binding.display.exists(_ != c.display) =>
+              Resolution(m,"needsClarification",None,None,Vector.empty,Vector.empty,"explicit_rxcui",
+                Vector("PRODUCT_DISPLAY_MISMATCH: the stored product name differs from the name for this RxCUI in the configured release. Select the product again."))
             case Some(c) =>
               if m.productStrength.nonEmpty || m.doseForm.nonEmpty then
                 // ProductSelector restricts an SCD/SBD starting concept to this ID.
