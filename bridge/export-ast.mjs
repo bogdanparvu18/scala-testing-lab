@@ -23,6 +23,30 @@ function duplicates(nodes, kind, errors) {
   }
 }
 
+function productBindingFor(medication, configuredRelease) {
+  const { name, rxcui, productName, rxnormRelease } = medication;
+  if (rxcui === undefined && productName === undefined && rxnormRelease === undefined) return undefined;
+  if (!/^[1-9][0-9]{0,19}$/.test(rxcui ?? '')) {
+    throw new Error(`Medication ${name} requires a valid product RxCUI.`);
+  }
+  if (productName === undefined && rxnormRelease === undefined) {
+    throw new Error(`Medication ${name} requires a product name alongside its RxCUI.`);
+  }
+  if (productName !== undefined && !productName.trim()) {
+    throw new Error(`Medication ${name} has an empty RxNorm product name.`);
+  }
+  // A pin from an older document still constrains validation.
+  if (rxnormRelease !== undefined && rxnormRelease !== configuredRelease) {
+    throw new Error(`Medication ${name} was selected from RxNorm ${rxnormRelease}, but validation uses ${configuredRelease}. Select a product from the configured release.`);
+  }
+  const date = new Date(`${configuredRelease}T00:00:00.000Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(configuredRelease) || configuredRelease.startsWith('0000-') ||
+      !Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== configuredRelease) {
+    throw new Error(`Medication ${name} has an invalid configured RxNorm release date.`);
+  }
+  return { rxcui, release: configuredRelease, ...(productName !== undefined ? { display: productName } : {}) };
+}
+
 async function langiumImportUrl(resolveFromLanguage, subpath) {
   // Langium 4 is ESM-only. require.resolve('langium') cannot select its `import`
   // export, so locate its package through Node's search paths, then use that export.
@@ -109,21 +133,7 @@ export async function exportDocument({ langiumRoot, input, release }) {
     if (!cst) throw new Error(`Medication ${medication.name} has no source CST.`);
     const amount = Number(medication.amount);
     if (!Number.isFinite(amount)) throw new Error(`Medication ${medication.name} has a nonfinite amount.`);
-    const hasBinding = medication.rxcui !== undefined || medication.rxnormRelease !== undefined;
-    if (hasBinding && (!/^[1-9][0-9]{0,19}$/.test(medication.rxcui ?? '') ||
-        !/^\d{4}-\d{2}-\d{2}$/.test(medication.rxnormRelease ?? ''))) {
-      throw new Error(`Medication ${medication.name} requires a valid RxCUI and RxNorm release together.`);
-    }
-    if (hasBinding) {
-      const date = new Date(`${medication.rxnormRelease}T00:00:00.000Z`);
-      if (medication.rxnormRelease.startsWith('0000-') || !Number.isFinite(date.getTime()) ||
-          date.toISOString().slice(0, 10) !== medication.rxnormRelease) {
-        throw new Error(`Medication ${medication.name} has an invalid RxNorm release date.`);
-      }
-    }
-    if (hasBinding && medication.rxnormRelease !== release.trim()) {
-      throw new Error(`Medication ${medication.name} was selected from RxNorm ${medication.rxnormRelease}, but validation uses ${release.trim()}. Select a product from the configured release.`);
-    }
+    const productBinding = productBindingFor(medication, release.trim());
     const position = value => ({
       line: value.line,
       character: value.character,
@@ -143,7 +153,7 @@ export async function exportDocument({ langiumRoot, input, release }) {
       dose: { amount, unit: medication.unit },
       ...(medication.productStrength !== undefined ? { productStrength: medication.productStrength } : {}),
       ...(medication.doseForm !== undefined ? { doseForm: medication.doseForm } : {}),
-      ...(hasBinding ? { productBinding: { rxcui: medication.rxcui, release: medication.rxnormRelease } } : {}),
+      ...(productBinding ? { productBinding } : {}),
       route: medication.route,
       frequency: medication.frequency,
       patientRef: patient.name,

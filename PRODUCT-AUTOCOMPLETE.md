@@ -45,16 +45,17 @@ The endpoint accepts no document or patient payload, performs no binding writes,
 Choosing a product writes these fields into the Medication colon declaration:
 
 ```text
-rxcui "900001" rxnormRelease "2026-10-05"
+product "aspirin synthetic product" rxcui "900001"
 ```
 
 `900001` is a synthetic fixture identifier in this documentation. Actual IDs must come from the imported product suggestions. A complete declaration also needs its administered dose, route, and frequency. These are never inferred from the product ID.
 
-The bridge exports the pair as:
+The bridge includes the full display name and the configured release in each bound mention. For this example the exported binding is
 
 ```json
 "productBinding": {
   "rxcui": "900001",
+  "display": "aspirin synthetic product",
   "release": "2026-10-05"
 }
 ```
@@ -66,11 +67,12 @@ The bridge exports the pair as:
 
 Mixed requests retain normal name resolution for their unbound mentions. The resolution report remains schema `2` and echoes the original binding. The source declaration and UTF-16 locations are preserved.
 
-For a bound mention, `originalText` is a **local DSL alias**. Resolution fetches the selected RxCUI directly, checks its release and SCD/SBD type, and derives ingredients through the existing permitted relationship paths. Renaming the alias cannot change the selected terminology concept.
+For a bound mention, `originalText` is a **local DSL alias**. Resolution fetches the selected RxCUI directly, checks its release, SCD/SBD type, and exact canonical display name when supplied, and derives ingredients through the existing permitted relationship paths. Renaming the alias cannot change the selected terminology concept.
 
 | Conflict | Behavior |
 | --- | --- |
-| Bound release differs from configured/requested release | The bridge rejects export; a direct resolver request returns a release-clarification result. |
+| An older declaration explicitly pins a different release | The bridge rejects export; a direct resolver request returns a release-clarification result. |
+| Saved product name differs from the canonical name for the selected RxCUI | Resolution asks for clarification. Select the product again to accept the current label. |
 | Selected ID is absent | `productNotFound`, with no lexical fallback. |
 | Selected ID is not an SCD/SBD or is used in an ingredient-only role | `invalidRole`. |
 | Explicit strength/form conflict | Existing product validation checks only the selected ID and returns its failure/clarification result. |

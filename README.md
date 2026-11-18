@@ -758,7 +758,7 @@ The contract includes:
 | `dose` / `route` / `frequency` | Administration information already represented by the grammar. |
 | `patientRef` / `orderId` | Patient and plan context. |
 | `productStrength` / `doseForm` | Optional explicit product qualifiers. |
-| `productBinding` | Optional `{rxcui, release}` selected in the editor and persisted in the DSL; overrides lexical lookup of the local alias. |
+| `productBinding` | Explicit product identity. The editor stores the selected display name and RxCUI. The bridge supplies the configured release at export. Older bindings may omit `display`. |
 
 The JSON is an AST projection. It does not serialize all Langium internals and their object references/cycles.
 

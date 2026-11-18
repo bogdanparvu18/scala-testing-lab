@@ -45,6 +45,25 @@ object ProductBindingSpec extends ZIOSpecDefault:
       val decoded = request.toJson.fromJson[AstRequest].toOption.get
       assertTrue(decoded == request,Resolver.resolve(decoded,snapshot).toJson == Resolver.resolve(request,snapshot).toJson)
     },
+    test("schema2 binds a visible product name independently of the alias and round trips old bindings") {
+      val display = "synthetic product 500 mg"
+      val text = source.replace(s"""rxnormRelease "$release" """, s"""product "$display" """)
+      val m = mention.copy(source=mention.source.copy(text=text,end=Position(0,text.length,text.length)),
+        productBinding=Some(ProductBinding("10",release,Some(display))))
+      val saved = request.copy(document=request.document.copy(text=text),mentions=Vector(m))
+      val reopened = saved.toJson.fromJson[AstRequest].toOption.get
+      val r = Resolver.resolve(reopened,snapshot).resolutions.head
+      assertTrue(reopened == saved, r.status == "resolved", r.selectedProduct.exists(_.display == display),
+        r.mention.originalText == "myMedicine", r.selectedProduct.exists(_.rxcui == "10"),
+        """{"rxcui":"10","release":"2026-10-05"}""".fromJson[ProductBinding] == Right(ProductBinding("10",release)))
+    },
+    test("a stale or edited visible name requires reselection even if the RxCUI and qualifiers match") {
+      val m = mention.copy(productStrength=Some("500 mg"),doseForm=Some("Oral Tablet"),
+        productBinding=Some(ProductBinding("10",release,Some("synthetic PRODUCT 500 mg"))))
+      val r = result(m)
+      assertTrue(r.status == "needsClarification",r.selectedProduct.isEmpty,r.initialConcept.isEmpty,r.ingredients.isEmpty,
+        r.diagnostics.exists(_.startsWith("PRODUCT_DISPLAY_MISMATCH")))
+    },
     test("missing explicit ID never falls back to the alias match") {
       val r = result(mention.copy(productBinding=Some(ProductBinding("999",release))))
       assertTrue(r.status == "productNotFound",r.selectedProduct.isEmpty,r.initialConcept.isEmpty,

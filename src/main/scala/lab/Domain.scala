@@ -15,7 +15,7 @@ final case class DocumentSource(uri: String, text: String) derives JsonCodec
 @jsonNoExtraFields
 final case class Dose(amount: BigDecimal, unit: String) derives JsonCodec
 @jsonNoExtraFields
-final case class ProductBinding(rxcui: String, release: String) derives JsonCodec
+final case class ProductBinding(rxcui: String, release: String, display: Option[String] = None) derives JsonCodec
 @jsonNoExtraFields
 final case class Mention(
   id: String, originalText: String, role: String, source: SourceLocation,
@@ -97,6 +97,7 @@ object InputValidation:
       m.productBinding.foreach { binding =>
         require(a.schemaVersion == "2", "Explicit product bindings require schemaVersion 2")
         require(binding.rxcui.matches("[1-9][0-9]{0,19}"), "Invalid product RxCUI")
+        require(binding.display.forall(_.trim.nonEmpty), "Empty RxNorm product display")
         require(!binding.release.startsWith("0000-") && binding.release.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}") &&
           scala.util.Try(java.time.LocalDate.parse(binding.release)).isSuccess, "Invalid product binding release")
       }
