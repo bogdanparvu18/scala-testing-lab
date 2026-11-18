@@ -42,11 +42,19 @@ The endpoint accepts no document or patient payload, performs no binding writes,
 
 ## Persisted selection
 
-Choosing a product writes these fields into the Medication colon declaration:
+On a new declaration line, type a product prefix such as `aspi` and press **Tab** on a suggestion to create a Medication. To keep an existing alias used by a Plan, type the prefix directly after the colon:
 
 ```text
-product "aspirin synthetic product" rxcui "900001"
+Medication MorningMedication: aspi
 ```
+
+For the synthetic product below, accepting the suggestion produces this line:
+
+```text
+Medication MorningMedication: product "aspirin synthetic product" rxcui "900001"
+```
+
+`Medication aspi` and the previously supported `rxcui "aspi"` search also offer products from the same catalog. In each case Tab writes the selected display name and numeric RxCUI. A bare search prefix on its own is temporary editor input. The bridge exports the completed declaration after the product is chosen and the required fields are filled in.
 
 `900001` is a synthetic fixture identifier in this documentation. Actual IDs must come from the imported product suggestions. A complete declaration also needs its administered dose, route, and frequency. These are never inferred from the product ID.
 

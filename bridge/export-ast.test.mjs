@@ -153,6 +153,26 @@ test('exports the exact visible product and RxCUI on the configured release, pre
   await assert.rejects(project(text.replace(JSON.stringify(display), '"   "'), '2026-11-02'), /blank|empty/i);
 });
 
+test('bare search text cannot be exported until the editor inserts the selected product', async () => {
+  const release = '2026-10-05';
+  const binding = 'product "aspirin synthetic product" rxcui "900001"';
+  const completed = boundFixture.replace('rxcui "10", rxnormRelease "2026-10-05"', binding);
+  for (const draft of [
+    completed.replace(binding, 'aspi'),
+    completed.replace('Plan DemoPlan:', 'aspi\nPlan DemoPlan:')
+  ]) {
+    await assert.rejects(project(draft, release), /Lexing\/parsing failed/);
+  }
+
+  const { mentions: [mention] } = await project(completed, release);
+  assert.deepEqual(mention.productBinding, { rxcui: '900001', display: 'aspirin synthetic product', release });
+  assert.equal(mention.originalText, 'MyLocalAlias');
+  assert.equal(mention.orderId, 'DemoPlan');
+  assert.deepEqual(mention.dose, { amount: 1, unit: 'mg' });
+  assert.equal(mention.route, 'PO');
+  assert.equal(mention.frequency, 'PRN');
+});
+
 test('rejects binding/version mismatch before producing a terminology request', async () => {
   await assert.rejects(project(boundFixture, '2026-09-07'), /selected from RxNorm|release/i);
 });
