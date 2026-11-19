@@ -11,6 +11,8 @@ This is a personal integration laboratory for work that can later be adapted to 
 
 From the repository root, run `.\scripts\bootstrap-windows.ps1` to prepare the native lab in `scripts\AuroraMedicationLab`, or `.\scripts\bootstrap-windows.ps1 --Docker` for the persistent Linux lab. Both modes look for usable installations and configure them before installing missing tools. When an installed version requires replacement, setup describes the change and asks for consent. Run with `-Help` for path overrides and PostgreSQL options.
 
+Both modes install the Health Canada Drug Product Database (DPD) catalog automatically. On a fresh installation, setup downloads `data/allfiles.zip` into the managed Scala checkout and imports it into PostgreSQL. Later runs reuse that file, including when populating a new database. In Docker the checkout and archive live in the persistent workspace volume. See [Health Canada marketed drug catalog](#health-canada-marketed-drug-catalog) for refresh and recovery commands.
+
 Both modes reuse a complete, compatible RxNorm base and product index. If an earlier run stopped after committing the base import, setup can complete only the missing product attributes when the base source hashes match the managed prescribable archive. Verified cached files are reused; the base rows are not imported again. A different source archive or an existing incompatible product manifest requires its original matching files and explicit repair, rather than an automatic replacement.
 
 The bootstrap defaults to the application login `scala_lab` with password `aurora`, including new managed Docker installations. It authenticates on each run. On an existing PostgreSQL server, an administrator verifies the catalog before setup creates a missing role/database. Existing passwords are not reset automatically on an authentication error. `PGPASSWORD` can supply an existing application password; `-PgAdminUser` selects the administrator needed for recovery. Legacy Docker installations retain their original `rxnorm_lab` account and data. The manual CLI instructions below let you choose your own application password. The intention of this bootstrap version is just to deploy a local working version of the PostgreSQL used by RXNORM. After the POC, the future versions of the script may use other auth methods which do not provide directly the password in an insecure way.
@@ -38,7 +40,7 @@ For a managed Docker database, the normal `--Docker` flow offers recovery using 
 4. [RxNorm and the PostgreSQL data model](#4-rxnorm-and-the-postgresql-data-model)
 5. [Windows installation and project setup](#5-windows-installation-and-project-setup)
 6. [Configure local PostgreSQL](#6-configure-local-postgresql)
-7. [Download and import RxNorm](#7-download-and-import-rxnorm)
+7. [Download and import RxNorm](#7-download-and-import-rxnorm) · [Import the Health Canada catalog](#health-canada-marketed-drug-catalog)
 8. [Complete example: paracetamol](#8-complete-example-paracetamol)
 9. [Product strength and dose form](#9-product-strength-and-dose-form)
 10. [VS Code extension workflow](#10-vs-code-extension-workflow)
@@ -646,6 +648,50 @@ The SAT import is additive. It requires the base release and matching CONSO/REL 
 - The product manifest includes SAT and its link to the base import.
 
 The date label alone does not authenticate a downloaded release. Obtain the archive from NLM; the hashes identify and pin the actual files used by this application.
+
+### Health Canada marketed drug catalog
+
+The native Windows and Docker installers run `import-dpd --setup` before reporting the lab ready. They keep the Health Canada marketed extract at `data/allfiles.zip` in the installed Scala checkout. Git ignores the local archive. A standalone `sbt compile` only builds the code. For a manual installation or refresh, run one of these commands from the Scala repository root.
+
+| When to use it | Command | Result |
+| --- | --- | --- |
+| Manual setup or retry | `sbt "run import-dpd --setup"` | Imports the saved ZIP if present. When missing, downloads it and proceeds directly to import. |
+| Refresh from Health Canada | `sbt "run import-dpd"` | Downloads the current extract, verifies the ZIP, replaces `data/allfiles.zip` and imports it. |
+| Replay a specific extract offline | `sbt "run import-dpd path/to/allfiles.zip"` | Imports the supplied file. |
+
+If a download fails, the command reports the source URL, destination and cause, and setup stops before the DPD database import. A failed refresh preserves the previously saved archive. If setup finds a damaged saved ZIP, run `sbt "run import-dpd"` to download a fresh copy. If PostgreSQL fails after a successful download, fix the connection or database error and rerun setup to reuse the saved ZIP.
+
+The importer uses the lab’s PostgreSQL settings (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`). The database login needs permission to create the `health_canada_dpd` schema on first use. The public download requires no Health Canada account or API key. If using the PowerShell launcher configured in section 5, the equivalent setup command is `& $javaExecutable @sbtArgs 'run import-dpd --setup'`.
+
+The command reads `drug.txt`, `ingred.txt`, `form.txt`, `route.txt` and `status.txt` from the official UTF-8 extract. It links them by DPD `drug_code` and preserves the eight-character DIN, including leading zeros. The extract files have no column headers. To inspect the Aspirin example directly, find DIN `02237726` in `drug.txt`, then look for `61080` in the first column of each related file.
+
+| Medication detail | Source for ASPIRIN 81MG |
+| --- | --- |
+| Ingredient strength | `ingred.txt`, columns 5–6 (`STRENGTH`, `STRENGTH_UNIT`): `81`, `MG` per tablet |
+| Dosage form | `form.txt`, column 3 (`PHARMACEUTICAL_FORM`): `TABLET (ENTERIC-COATED)` |
+| Product route | `route.txt`, column 3 (`ROUTE_OF_ADMINISTRATION`): `ORAL` |
+| Administered dose and frequency by indication | Separate [Canadian Aspirin product monograph, section 4, pages 6–7](https://pdf.hres.ca/dpd_pm/00076303.PDF#page=6) |
+
+Section 4 is in the product-specific PDF. The ZIP contains the catalog tables. Its ingredient `DOSAGE_VALUE` and `DOSAGE_UNIT` columns can qualify the strength (for example, the volume in a strength expressed per 5 mL). For this example the two ingredient dosage fields are empty, and `schedule.txt` says `NON-PRESCRIPTION DRUGS`, a regulatory classification. This import covers catalog data only. An application that offers dose and frequency suggestions also needs a separate source for regimens and verified product mappings.
+
+An identical ZIP is a no-op. A changed extract replaces the current Canadian catalog in a single transaction. A failed download or invalid import leaves the previous catalog available. Inspect the source, SHA-256 and row counts with `SELECT * FROM health_canada_dpd.snapshot;`.
+
+To check a known product, run this query in psql. For DIN `02237726`, the marketed extract dated November 2, 2026 contains ASPIRIN 81MG, acetylsalicylic acid, an 81 MG ingredient strength and an oral route.
+
+```sql
+SELECT p.din, p.brand_name, i.ingredient, i.strength, i.strength_unit,
+       ARRAY(SELECT f.form FROM health_canada_dpd.form f
+             WHERE f.drug_code = p.drug_code) AS forms,
+       ARRAY(SELECT r.route FROM health_canada_dpd.route r
+             WHERE r.drug_code = p.drug_code) AS routes
+FROM health_canada_dpd.product p
+JOIN health_canada_dpd.ingredient i USING (drug_code)
+WHERE p.din = '02237726';
+```
+
+To exercise the database import with synthetic data, run `sbt "Test/runMain lab.DpdImportIntegrationCheck"` with a PostgreSQL test role that can create databases. This check creates and removes its own temporary database.
+
+The [official downloads page](https://www.canada.ca/en/health-canada/services/drugs-health-products/drug-products/drug-product-database/what-data-extract-drug-product-database.html) publishes the extract date and links to the terms of use. The [DPD data dictionary](https://www.canada.ca/en/health-canada/services/drugs-health-products/drug-products/drug-product-database/read-file-drug-product-database-data-extract.html) describes the source columns.
 
 ## 8. Complete example: paracetamol
 

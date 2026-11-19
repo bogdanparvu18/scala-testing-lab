@@ -2425,6 +2425,7 @@ if ($Help) {
     Write-Host 'Native mode defaults to scala_lab with password aurora; PGPASSWORD overrides it. A successful login is reused. On failure, the administrator verifies the catalog and creates only a missing role/database. Application passwords are not reset automatically. -PgAdminUser selects the administrator (default postgres). Custom roles require -ProvisionDatabase for creation.'
     Write-Host 'Administrator access first tries password postgres. If rejected, enter the existing password or choose interactive recovery. -RecoverPostgresPassword runs only local Windows recovery, with elevation and confirmation, and asks for a new password. Recovery preserves database contents and restores authentication configuration.'
     Write-Host 'A ready local RxNorm import with compatible manifests is reused. Empty databases receive the verified prescribable archive; incomplete/incompatible existing releases are not replaced.'
+    Write-Host 'Setup imports the Health Canada marketed-product catalog into the selected PostgreSQL database. The archive is kept in data/allfiles.zip in the active Scala checkout (inside the persistent Linux workspace in Docker mode).'
     Write-Host 'A stopped service can be started only when its executable belongs to the selected PostgreSQL installation. Use -PgServiceName to select another service or resolve ambiguity.'
     Write-Host 'Existing tools are discovered and version-checked outside PATH, including Program Files, registry/services and user installs. Only genuinely missing tools may use WinGet --no-upgrade.'
     Write-Host 'Optional -LocateToolsOnFixedDrives lists portable tool paths on fixed drives and exits before executing discovered files. Use -Verbose to see unreadable directories.'
@@ -2708,7 +2709,7 @@ $SmokeName = 'smoke-' + [guid]::NewGuid().ToString('N')
 $Smoke = Join-Path $State $SmokeName
 New-Item -ItemType Directory -Path $Smoke | Out-Null
 $fixture = "Patient P9999: age 30, condition Fever`nMedication aspirin: 100 mg, strength 325 mg, doseForm Oral Tablet, route PO, frequency PRN`nPlan DemoPlan: for P9999, prescribe aspirin`nshow DemoPlan`n"
-$SmokeCommands = @('test') + $ImportCommands
+$SmokeCommands = @('test') + $ImportCommands + @('run import-dpd --setup')
 foreach ($case in @('valid', 'invalid')) {
     $text = $fixture
     if ($case -eq 'invalid') { $text = $text.Replace('strength 325 mg', 'strength 32500 mg') }
@@ -2765,7 +2766,7 @@ if (-not $NoEditor) { Run { code.cmd --new-window --user-data-dir $Profile "--ex
 Save-Json $HealthFile @{
     status = 'ready'; checkedAt = (Get-Date).ToUniversalTime().ToString('o')
     root = $Root; setupDirectory = $Automatic; scalaRoot = $Scala; langiumRoot = $Langium
-    repositories = $RepoHeads; postgres = 'authenticated-query-pass'; rxnorm = 'ready'
+    repositories = $RepoHeads; postgres = 'authenticated-query-pass'; rxnorm = 'ready'; dpd = 'catalog-import-pass'
     databaseMode = $DatabaseMode; pgHost = $PgHost; pgPort = $Port; pgDatabase = $Database; pgUser = $DbUser
     scala = 'incremental-compile-test-pass'; langium = 'incremental-generate-build-pass'
     clinicalValid = 'pass'; clinicalInvalid = 'pass'; languageServer = 'initialize-diagnostics-pass'
@@ -2773,7 +2774,8 @@ Save-Json $HealthFile @{
 }
 & node.exe "$Scala\scripts\finish-smoke.mjs" $Smoke
 Write-Host "RxNorm autocomplete: $autocomplete. See $Scala\PRODUCT-AUTOCOMPLETE.md for the editor service."
-Write-Host "READY: repository updates, builds, PostgreSQL, RxNorm and runtime smoke tests passed."
+Write-Host "READY: repository updates, builds, PostgreSQL, RxNorm, Health Canada DPD and runtime smoke tests passed."
+Write-Host "Health Canada archive: $Scala\data\allfiles.zip"
 Write-Host "Demo: $Demo"
 Write-Host "Health report: $HealthFile"
 Write-Host 'sbt/npm are completed build commands, not background services. The editor owns its Node language server.'
