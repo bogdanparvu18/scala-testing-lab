@@ -103,7 +103,7 @@ Run the usual Scala suite with `sbt test`, and the bridge tests with `LANGIUM_RO
 
 ## Canadian product selection and monographs
 
-With the local service running and the companion extension installed, type `tyl` and accept the 500 mg Tylenol oral tablet suggestion. The editor asks which Canadian presentation you want. Confirm **TYLENOL EXTRA STRENGTH**, DIN `00559407`, to use the tablet presentation. The editor offers the cached English PDF and opens the professional dosage section when it can locate the heading. In the July 3, 2024 Tylenol document this is page 14. The PDF includes several presentations and populations. The clinician selects the applicable instructions and enters the administered dose and frequency. [Canadian prescribing information](https://pdf.hres.ca/dpd_pm/00076531.PDF#page=14).
+With the local service running and the companion extension installed, type `tyl` and accept the 500 mg Tylenol oral tablet suggestion. The editor asks which Canadian presentation you want. Confirm **TYLENOL EXTRA STRENGTH**, DIN `00559407`, to use the tablet presentation. The editor offers the cached English PDF and opens the professional dosage section when it can locate the heading. In the July 3, 2024 Tylenol document this is page 14. The backend compares the confirmed Canadian presentation with explicit dosage instructions in the English PDF. For this DIN it returns a draft dose of 500 mg and an interval of four to six hours as needed. The source includes an age group, a dose range, and per-dose and daily limits. The companion editor writes `dose 500 mg frequency 4-6H PRN` automatically in the selected declaration, where the clinician can edit either value before final validation. [Canadian prescribing information](https://pdf.hres.ca/dpd_pm/00076531.PDF#page=14).
 
 | Action | Lookup |
 | --- | --- |
@@ -113,6 +113,12 @@ With the local service running and the companion extension installed, type `tyl`
 | View the PDF | The editor opens the returned signed `/monograph.pdf` URL, which identifies the confirmed DIN, RxNorm release, product and PDF checksum. This also supports VS Code port forwarding. The cached bytes remain available while Health Canada is unreachable. |
 
 The candidate lookup compares all supported active ingredients and strengths, route and dosage form using the ready RxNorm release and DPD snapshot. Branded products also require brand-name evidence. Supported presentations include oral tablets and capsules, selected delayed-release, chewable, disintegrating and effervescent forms, and oral solutions and suspensions. Complex forms, unsupported release durations and unverified salt conversions can yield no candidates. The editor distinguishes this outcome from a Canadian product with no published electronic monograph. Reopen a document with **Open Health Canada Product Monograph** from the command palette while the cursor is in the bound Medication declaration.
+
+### Dose and frequency in the monograph response
+
+An available monograph includes `regimenSuggestions`. Each item has `dose`, `frequency`, the one-based physical PDF `page`, the applicable `context` and the source `evidence`. The response also includes the source URL, PDF checksum, revision when known, and a signed local preview link. The fields come from the dosage passage of that PDF. The catalog strength helps identify the passage. The extractor keeps as-needed qualifiers and interval ranges. Where the source gives a supported dose range for a matching whole tablet, the lower written dose is the editable starting value.
+
+This version recognizes English dosage sections with an explicit immediate-release heading, a general adult age group, and a strength-labelled row for a single-ingredient oral tablet or capsule. The row must give an amount and an hourly or once-daily schedule. Tables, weight-based dosing, modified-release products, unrecognized layouts and conflicting instructions produce an empty suggestions list. The cached PDF remains available for the clinician to consult. Product resolution verifies the terminology binding. It does not assess the clinical suitability of an edited schedule.
 
 ### Keeping documents on a tester’s computer
 

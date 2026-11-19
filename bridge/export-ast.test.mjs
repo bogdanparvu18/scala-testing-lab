@@ -102,6 +102,15 @@ Medication paracetamol: 15 mg, strength 160 mg/5 ml, doseForm Oral Solution, rou
 Plan DemoPlan: for DemoPatient, prescribe paracetamol
 show DemoPlan
 `;
+test('keeps the entire approved frequency in both the mention and its original source', async () => {
+  for (const [value, expected] of [['6H', 'Q6H'], ['4-6H PRN', 'Q4-6H PRN'], ['"q3h prn"', 'Q3H PRN']]) {
+    const mention = (await project(colonFixture.replace('frequency PRN', 'frequency ' + value))).mentions[0];
+    assert.equal(mention.frequency, expected);
+    assert.ok(mention.source.text.includes('frequency ' + value));
+  }
+  await assert.rejects(project(colonFixture.replace('frequency PRN', 'frequency 6-4H PRN')), /Ranges must increase/);
+});
+
 test('colon syntax exports the same contract and exact source positions', async () => {
   const request = await project(colonFixture);
   const m = request.mentions[0];
