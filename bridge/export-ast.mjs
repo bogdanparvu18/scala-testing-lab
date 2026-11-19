@@ -94,6 +94,9 @@ export async function exportDocument({ langiumRoot, input, release }) {
   }
   // Read once, so text and CST positions describe exactly the same source snapshot.
   const sourceText = await readFile(inputPath, 'utf8');
+  if (!language.readMonographSource && /^[ \t]*\/\/\s*@monograph\b/im.test(sourceText)) {
+    throw new Error('Update the Clinical DSL language to export the selected monograph.');
+  }
   const uri = langium.URI.file(inputPath);
   const document = shared.workspace.LangiumDocumentFactory.fromString(sourceText, uri);
   shared.workspace.LangiumDocuments.addDocument(document);
@@ -134,6 +137,12 @@ export async function exportDocument({ langiumRoot, input, release }) {
     const amount = Number(medication.amount);
     if (!Number.isFinite(amount)) throw new Error(`Medication ${medication.name} has a nonfinite amount.`);
     const productBinding = productBindingFor(medication, release.trim());
+    const selection = language.readMonographSource?.(medication);
+    if (selection?.status === 'invalid') throw new Error(selection.message);
+    const monographSource = selection?.status === 'selected' ? selection.source : undefined;
+    if (monographSource && (monographSource.rxcui !== productBinding?.rxcui || monographSource.release !== release.trim())) {
+      throw new Error(`Medication ${medication.name}: select the Canadian monograph for the current RxNorm product and release again.`);
+    }
     const position = value => ({
       line: value.line,
       character: value.character,
@@ -154,15 +163,18 @@ export async function exportDocument({ langiumRoot, input, release }) {
       ...(medication.productStrength !== undefined ? { productStrength: medication.productStrength } : {}),
       ...(medication.doseForm !== undefined ? { doseForm: medication.doseForm } : {}),
       ...(productBinding ? { productBinding } : {}),
+      ...(monographSource ? { monographSource: { din: monographSource.din, sha256: monographSource.sha256 } } : {}),
       route: medication.route,
       frequency: medication.frequency,
       patientRef: patient.name,
       orderId: plan.name
     };
   });
+  const pinned = mentions.some(m => m.monographSource);
+  const bound = mentions.some(m => m.productBinding);
   return {
-    schemaVersion: mentions.some(m => m.productBinding) ? '2' : '1',
-    policyVersion: mentions.some(m => m.productBinding) ? 'explicit-product-v1' : 'exact-v1',
+    schemaVersion: pinned ? '3' : bound ? '2' : '1',
+    policyVersion: pinned ? 'explicit-monograph-v1' : bound ? 'explicit-product-v1' : 'exact-v1',
     terminologyRelease: release.trim(),
     document: { uri: uri.toString(), text: sourceText },
     mentions

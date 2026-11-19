@@ -17,6 +17,16 @@ final case class ProductSearchResponse(
 final case class ProductSearchError(code: String, message: String) derives JsonCodec
 final case class ProductSearchFailure(status: Int, code: String, detail: String) extends RuntimeException(detail)
 
+@jsonNoExtraFields
+private[lab] final case class RegimenCheckRequest(release: String, rxcui: String, din: String, sha256: String,
+    dose: Option[Dose] = None, frequency: Option[String] = None) derives JsonCodec:
+  def wellFormed: Boolean =
+    ProductSearchQuery.validRelease(release) && rxcui.matches("[1-9][0-9]{0,19}") &&
+      din.matches("[0-9]{8}") && sha256.matches("[a-f0-9]{64}") &&
+      (dose.isDefined || frequency.isDefined) &&
+      dose.forall(d => d.unit.length <= 12 && d.amount.precision <= 128 && math.abs(d.amount.scale.toLong) <= 128) &&
+      frequency.forall(f => f.nonEmpty && f.length <= 120 && !f.exists(_.isControl))
+
 final case class ProductSearchQuery(release: String, query: String, limit: Int):
   require(ProductSearchQuery.validRelease(release),"Invalid RxNorm release date")
   require(query == TextKey.normalize(query) && query.length >= 2 && query.length <= 100 &&
@@ -50,7 +60,7 @@ object ProductSearchQuery:
     }.toEither.left.map(_ => ProductSearchFailure(400,"INVALID_SEARCH_QUERY",
       "Use release=YYYY-MM-DD, q with 2–100 characters, and limit between 1 and 20."))
 
-/** Runs on loopback for the editor session. The editor sends terminology identifiers only. */
+/** Runs on loopback. Checking an order only needs its source identifiers and dosing fields. */
 object ProductSearchService:
   private def respond(exchange: HttpExchange, status: Int, body: String): Unit =
     val bytes=body.getBytes(UTF_8)
@@ -110,10 +120,10 @@ object ProductSearchService:
         val previewRequest=monographs.nonEmpty && path == "/monograph.pdf" && exchange.getRequestMethod == "GET"
         if !localClient && !previewRequest then
           error(exchange,ProductSearchFailure(403,"LOCAL_CLIENT_REQUIRED","Only local editor clients are supported."))
-        else if path != "/products" && !(monographs.nonEmpty && Set("/canadian-products","/monograph","/monograph.pdf").contains(path)) then
+        else if path != "/products" && !(monographs.nonEmpty && Set("/canadian-products","/monograph","/monograph.pdf","/validate-regimen").contains(path)) then
           error(exchange,ProductSearchFailure(404,"NOT_FOUND","Unknown endpoint."))
         else
-          val method = if path == "/monograph" then "POST" else "GET"
+          val method = if path == "/monograph" || path == "/validate-regimen" then "POST" else "GET"
           if exchange.getRequestMethod != method then
             exchange.getResponseHeaders.set("Allow",method)
             error(exchange,ProductSearchFailure(405,"METHOD_NOT_ALLOWED",s"Use $method for this endpoint."))
@@ -122,7 +132,7 @@ object ProductSearchService:
               response => respond(exchange,200,response.toJson)
             }
           else if method == "POST" && exchange.getRequestHeaders.getFirst("X-Aurora-Client") != "vscode" then
-            error(exchange,ProductSearchFailure(403,"LOCAL_CLIENT_REQUIRED","Monograph downloads require an explicit editor request."))
+            error(exchange,ProductSearchFailure(403,"LOCAL_CLIENT_REQUIRED","This endpoint requires an explicit local editor request."))
           else
             try documents.execute(() => handleCanadian(exchange,path,raw,monographs.get,localClient))
             catch case _: RejectedExecutionException =>
@@ -138,6 +148,9 @@ object ProductSearchService:
     }.orDie }.map(_._1.getAddress.getPort)
 
   private def handleCanadian(exchange: HttpExchange, path: String, raw: String, service: CanadianMonographAccess, localClient: Boolean): Unit =
+    if path == "/validate-regimen" then
+      handleRegimenCheck(exchange, raw, service)
+      return
     CanadianSelection.parse(raw,requireDin = path != "/canadian-products",previewRoute = path == "/monograph.pdf") match
       case Left(problem) => error(exchange,problem)
       case Right(query) if path == "/canadian-products" =>
@@ -160,3 +173,26 @@ object ProductSearchService:
             case Some(document) => sendPdf(exchange,document,din)
             case None => error(exchange,ProductSearchFailure(404,"PDF_NOT_CACHED","No downloaded PDF is available for this DIN."))
           }
+
+  private def handleRegimenCheck(exchange: HttpExchange, raw: String, service: CanadianMonographAccess): Unit =
+    val badRequest = ProductSearchFailure(400, "INVALID_REGIMEN_REQUEST",
+      "Supply the RxNorm release, RxCUI, confirmed DIN, PDF checksum, and a dose or frequency in a JSON body.")
+    val mediaType = Option(exchange.getRequestHeaders.getFirst("Content-Type")).map(_.takeWhile(_ != ';').trim)
+    if raw != null || !mediaType.exists(_.equalsIgnoreCase("application/json")) then error(exchange, badRequest)
+    else
+      complete(exchange, canadianUnavailable) {
+        for
+          bytes <- ZIO.attemptBlocking(exchange.getRequestBody.readNBytes(4097))
+          _ <- ZIO.fail(ProductSearchFailure(413, "REQUEST_TOO_LARGE", "Regimen check requests are limited to 4 KiB."))
+            .when(bytes.length > 4096)
+          request <- ZIO.fromEither(String(bytes, UTF_8).fromJson[RegimenCheckRequest].toOption
+            .filter(_.wellFormed).toRight(badRequest))
+          result <- service.orderValidation.check(request.release, request.rxcui, request.din, request.sha256, request.dose, request.frequency)
+        yield result
+      } { result =>
+        val status = result.status match
+          case "withinMonograph"  => "valid"
+          case "outsideMonograph" => "invalid"
+          case _                  => "unverified"
+        respond(exchange, 200, result.copy(status = status).toJson)
+      }

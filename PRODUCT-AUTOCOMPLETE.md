@@ -120,6 +120,20 @@ An available monograph includes `regimenSuggestions`. Each item has `dose`, `fre
 
 This version recognizes English dosage sections with an explicit immediate-release heading, a general adult age group, and a strength-labelled row for a single-ingredient oral tablet or capsule. The row must give an amount and an hourly or once-daily schedule. Tables, weight-based dosing, modified-release products, unrecognized layouts and conflicting instructions produce an empty suggestions list. The cached PDF remains available for the clinician to consult. Product resolution verifies the terminology binding. It does not assess the clinical suitability of an edited schedule.
 
+### Validating manual edits
+
+Langium and the final Scala resolver use the same rule extracted from the same PDF. The rule contains inclusive mass and hourly interval bounds, the as-needed condition and any supported single-dose and daily maximum. Equivalent mass units are converted before comparison. Fixed or narrower intervals qualify when they remain inside the source range and preserve its as-needed condition. A fixed schedule is also checked against the 24-hour limit if the passage supplies one. With PRN the report retains the daily ceiling for review because actual administration times are unknown.
+
+The local editor posts JSON to `/validate-regimen` with `X-Aurora-Client: vscode` and `Content-Type: application/json`. It supplies `release`, `rxcui`, `din`, `sha256` and the fields being checked (`dose` with `amount` and `unit`, and/or `frequency`). The response contains a status (`valid`, `invalid` or `unverified`), field-specific `issues` and a source page when available. Validation uses the locally verified cache and sends no patient information.
+
+For a final check from the command line, run
+
+```sh
+sbt "run resolve order.json result.json --require-monograph"
+```
+
+A pinned mention uses AST schema `3`, policy `explicit-monograph-v1` and `monographSource` containing its DIN and PDF checksum. The ordinary resolver also checks all supplied pins. The strict flag requires verifiable source evidence for every order. A failed monograph check writes the report and exits with an error. The report keeps the RxNorm product match and the monograph verdict as separate fields so an identified product can still have dose or frequency errors.
+
 ### Keeping documents on a tester’s computer
 
 The shared list in `src/main/resources/monographs.tsv` records the DPD drug code, DIN, verified English PDF URL, revision date, SHA-256 and product name. Add a verified entry to distribute a presentation to other installations on their next bootstrap. If the product page is temporarily unreachable on first use during setup, the installer can retrieve the previously verified document from its official PDF URL and requires an exact checksum match. It reports when it uses this fallback. An explicit withdrawal on the DPD page takes precedence. Each tester keeps their additional selections locally. The service and bootstrap use the same Scala checkout as their working directory. Inside the managed Docker runtime the cache is `/workspace/repos/scala-testing-lab/data/monographs/`.

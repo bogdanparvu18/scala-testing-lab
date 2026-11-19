@@ -77,16 +77,27 @@ object Main extends ZIOAppDefault:
           _ <- Console.printLine(s"Index ready: $summary. Identical input can be safely re-imported.")
         yield ()
       }
-      case "resolve" :: input :: output :: Nil => ZIO.scoped {
+      case "resolve" :: input :: output :: options if options.isEmpty || options == List("--require-monograph") => ZIO.scoped {
         for
           ast <- readInput(input)
           store <- PostgresStore.open
           snapshot <- store.snapshotForResolution(ast)
-          report <- ZIO.attempt(Resolver.resolve(ast, snapshot))
+          terminology <- ZIO.attempt(Resolver.resolve(ast, snapshot))
+          validator = new MonographOrderValidation(store.canadianProducts, new MonographCache().cached)
+          report <- validator.validateOrders(terminology, options.nonEmpty)
+          problems = MonographOrderValidation.blockingIssues(report, options.nonEmpty)
           runId = Hashing.sha256(report.inputSha256 + report.snapshotFingerprint + report.policyVersion + Hashing.sha256(report.toJson))
           _ <- store.saveBinding(runId, ast.toJson, report.toJson, snapshot.release)
           _ <- writeJson(output, report.toJsonPretty)
-          _ <- Console.printLine(s"Saved $output; binding run $runId; " + report.resolutions.map(r => s"${r.mention.id}=${r.status}").mkString(", "))
+          _ <- Console.printLine(s"Saved $output; binding run $runId; " + report.resolutions.map { r =>
+            val monograph = r.monographValidation.map(v => s", monograph=${v.status}").getOrElse("")
+            s"${r.mention.id}=${r.status}$monograph"
+          }.mkString("; "))
+          _ <- ZIO.foreachDiscard(report.resolutions.flatMap { r =>
+            r.monographValidation.toVector.flatMap(_.issues.map(issue => s"${r.mention.id} / ${issue.field}: ${issue.message}"))
+          })(Console.printLineError(_))
+          _ <- ZIO.when(problems.nonEmpty)(ZIO.fail(new IllegalArgumentException(
+            "Monograph validation failed. " + problems.mkString(" "))))
         yield ()
       }
       case "lookup" :: release :: terms if terms.nonEmpty => ZIO.scoped {
@@ -111,6 +122,6 @@ object Main extends ZIOAppDefault:
           s"Release $release; scope ${Rrf.scope}; ${p.concepts.size} concepts; $descriptions names; $relationships relationship rows; source SHA-256 ${p.sha256.toJson}"
         }.flatMap(Console.printLine(_))
       case _ => ZIO.fail(new IllegalArgumentException(
-        "Usage: import-dpd [--setup | allfiles.zip] | sync-monographs | import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> | " +
+        "Usage: import-dpd [--setup | allfiles.zip] | sync-monographs | import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> [--require-monograph] | " +
         "lookup <release> <name> | serve-products <port> | inspect-rxnorm <rrf-dir> <release> | import-product-attributes <rrf-dir> <release>. No seed or alias argument is accepted."))
   }
