@@ -29,10 +29,16 @@ object Main extends ZIOAppDefault:
     args.toList match
       case "import-dpd" :: paths if paths.size <= 1 => ZIO.scoped {
         for
-          config <- PGConfig.fromEnvironment
-          local <- ZIO.attempt(paths.headOption.map(path => Paths.get(path)))
-          source <- DpdSource.prepare(local)
-          summary <- DpdStore.importArchive(config, source.archive, source.origin)
+          source <- paths.headOption match
+            case Some("--setup") => DpdSource.setup()
+            case Some(path) => ZIO.attempt(Paths.get(path)).flatMap(file => DpdSource.prepare(Some(file)))
+            case None => DpdSource.prepare(None)
+          _ <- Console.printLine(s"Importing Health Canada DPD from ${source.origin} into PostgreSQL.")
+          _ <- ZIO.when(paths.isEmpty || paths.contains("--setup"))(
+            Console.printLine(s"Repository archive: ${source.archive}"))
+          summary <- PGConfig.fromEnvironment.flatMap(config =>
+            DpdStore.importArchive(config, source.archive, source.origin)).mapError(error =>
+              new java.io.IOException(s"Health Canada DPD PostgreSQL import failed: ${error.getMessage}", error))
           _ <- Console.printLine(
             s"Health Canada DPD: ${summary.products} marketed human products, ${summary.ingredients} ingredient rows, " +
             s"${summary.forms} forms, ${summary.routes} routes, ${summary.statuses} status rows. SHA-256 ${summary.sha256}")
@@ -102,6 +108,6 @@ object Main extends ZIOAppDefault:
           s"Release $release; scope ${Rrf.scope}; ${p.concepts.size} concepts; $descriptions names; $relationships relationship rows; source SHA-256 ${p.sha256.toJson}"
         }.flatMap(Console.printLine(_))
       case _ => ZIO.fail(new IllegalArgumentException(
-        "Usage: import-dpd [allfiles.zip] | import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> | " +
+        "Usage: import-dpd [--setup | allfiles.zip] | import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> | " +
         "lookup <release> <name> | serve-products <port> | inspect-rxnorm <rrf-dir> <release> | import-product-attributes <rrf-dir> <release>. No seed or alias argument is accepted."))
   }
