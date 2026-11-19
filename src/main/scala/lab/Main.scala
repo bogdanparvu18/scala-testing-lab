@@ -44,6 +44,7 @@ object Main extends ZIOAppDefault:
             s"${summary.forms} forms, ${summary.routes} routes, ${summary.statuses} status rows. SHA-256 ${summary.sha256}")
         yield ()
       }
+      case "sync-monographs" :: Nil => MonographSync.run
       case "serve-products" :: portText :: Nil => ZIO.scoped {
         for
           port <- ZIO.attempt {
@@ -52,7 +53,9 @@ object Main extends ZIOAppDefault:
             value
           }
           store <- PostgresStore.open
-          boundPort <- ProductSearchService.start(port,store.searchProducts)
+          cache = new MonographCache()
+          monographs = new CanadianMonographAccess(store.canadianProducts,(code,din) => cache.resolve(code,din),cache.cached)
+          boundPort <- ProductSearchService.start(port,store.searchProducts,Some(monographs))
           _ <- Console.printLine(s"Product search ready at http://127.0.0.1:$boundPort/products; leave this process running for editor autocomplete.")
           _ <- ZIO.never
         yield ()
@@ -108,6 +111,6 @@ object Main extends ZIOAppDefault:
           s"Release $release; scope ${Rrf.scope}; ${p.concepts.size} concepts; $descriptions names; $relationships relationship rows; source SHA-256 ${p.sha256.toJson}"
         }.flatMap(Console.printLine(_))
       case _ => ZIO.fail(new IllegalArgumentException(
-        "Usage: import-dpd [--setup | allfiles.zip] | import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> | " +
+        "Usage: import-dpd [--setup | allfiles.zip] | sync-monographs | import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> | " +
         "lookup <release> <name> | serve-products <port> | inspect-rxnorm <rrf-dir> <release> | import-product-attributes <rrf-dir> <release>. No seed or alias argument is accepted."))
   }

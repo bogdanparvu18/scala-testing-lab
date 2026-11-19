@@ -100,3 +100,22 @@ The existing strength/form policy remains limited to supported single-component 
 | `bridge/export-ast.mjs` | Validated Langium export and persisted selection contract. |
 
 Run the usual Scala suite with `sbt test`, and the bridge tests with `LANGIUM_ROOT=/path/to/clinical-dsl-demo node --test bridge/export-ast.test.mjs` after building the companion language package. HTTP tests use synthetic fixtures; database integration requires a separate fixture database. No public terminology API or real patient data is needed for these tests.
+
+## Canadian product selection and monographs
+
+With the local service running and the companion extension installed, type `tyl` and accept the 500 mg Tylenol oral tablet suggestion. The editor asks which Canadian presentation you want. Confirm **TYLENOL EXTRA STRENGTH**, DIN `00559407`, to use the tablet presentation. The editor offers the cached English PDF and opens the professional dosage section when it can locate the heading. In the July 3, 2024 Tylenol document this is page 14. The PDF includes several presentations and populations. The clinician selects the applicable instructions and enters the administered dose and frequency. [Canadian prescribing information](https://pdf.hres.ca/dpd_pm/00076531.PDF#page=14).
+
+| Action | Lookup |
+| --- | --- |
+| Type a prefix | The existing local `/products` endpoint searches RxNorm. |
+| Accept a suggestion | `GET /canadian-products?release=…&rxcui=…` checks the selected RxNorm product and returns compatible marketed Canadian presentations from PostgreSQL. |
+| Confirm a DIN | `POST /monograph?release=…&rxcui=…&din=…`, with `X-Aurora-Client: vscode`, validates the selection. On first access it looks up the DPD page by drug code, checks the DIN and follows the official document link. |
+| View the PDF | The editor opens the returned signed `/monograph.pdf` URL, which identifies the confirmed DIN, RxNorm release, product and PDF checksum. This also supports VS Code port forwarding. The cached bytes remain available while Health Canada is unreachable. |
+
+The candidate lookup compares all supported active ingredients and strengths, route and dosage form using the ready RxNorm release and DPD snapshot. Branded products also require brand-name evidence. Supported presentations include oral tablets and capsules, selected delayed-release, chewable, disintegrating and effervescent forms, and oral solutions and suspensions. Complex forms, unsupported release durations and unverified salt conversions can yield no candidates. The editor distinguishes this outcome from a Canadian product with no published electronic monograph. Reopen a document with **Open Health Canada Product Monograph** from the command palette while the cursor is in the bound Medication declaration.
+
+### Keeping documents on a tester’s computer
+
+The shared list in `src/main/resources/monographs.tsv` records the DPD drug code, DIN, verified English PDF URL, revision date, SHA-256 and product name. Add a verified entry to distribute a presentation to other installations on their next bootstrap. If the product page is temporarily unreachable on first use during setup, the installer can retrieve the previously verified document from its official PDF URL and requires an exact checksum match. It reports when it uses this fallback. An explicit withdrawal on the DPD page takes precedence. Each tester keeps their additional selections locally. The service and bootstrap use the same Scala checkout as their working directory. Inside the managed Docker runtime the cache is `/workspace/repos/scala-testing-lab/data/monographs/`.
+
+The `documents/` directory contains one PDF per SHA-256 checksum. The `products/` directory records the DIN-to-document association, including source URL and revision when available. Bootstrap checks the shared list and this machine’s previous selections for updated DPD links. A change creates a new active association and keeps earlier PDFs on disk. A network failure with a previously verified local PDF emits a warning and retains that copy. A failed first download reports the DIN and a retry command. If Health Canada explicitly lists no electronic monograph, the product is marked accordingly. Git tracks the shared index and ignores the machine’s downloaded files.
