@@ -87,9 +87,7 @@ final class PostgresStore private (config: PGConfig) extends TerminologyReposito
   private[lab] def ensureSchema: Task[Unit] = use { c => transaction(c) {
     // Serialize the short, idempotent schema initialization across CLI processes.
     query(c,"SELECT pg_advisory_xact_lock(hashtextextended('rxnorm_lab/schema/v3',0))")(_ => ())
-    val source = Option(getClass.getResourceAsStream("/db/schema.sql")).getOrElse(throw IllegalStateException("Missing db/schema.sql"))
-    val sql = Using.resource(source)(s => new String(s.readAllBytes(),UTF_8))
-    Using.resource(c.createStatement()) { statement => sql.split(";").map(_.trim).filter(_.nonEmpty).foreach(statement.execute) }
+    PostgresStore.installSchema(c, "/db/schema.sql")
   }}
 
   /** COPY keeps at most about 64 KiB plus one source row in its output buffer. */
@@ -357,15 +355,26 @@ final class PostgresStore private (config: PGConfig) extends TerminologyReposito
 
 object PostgresStore:
   def open: ZIO[Scope,Throwable,PostgresStore] = PGConfig.fromEnvironment.flatMap(open)
-  def open(config: PGConfig): ZIO[Scope,Throwable,PostgresStore] = for
-    _ <- ZIO.attempt {
+  def open(config: PGConfig): ZIO[Scope,Throwable,PostgresStore] =
+    configured(config).tap(_.ensureSchema)
+
+  /** Run an import with the same scoped loopback connection and rollback rules as RxNorm,
+    * without initializing the RxNorm tables. */
+  private[lab] def inTransaction[A](config: PGConfig)(f: Connection => A): Task[A] =
+    configured(config).flatMap(store => store.use(c => store.transaction(c)(f(c))))
+
+  private[lab] def installSchema(c: Connection, resource: String): Unit =
+    val source = Option(getClass.getResourceAsStream(resource)).getOrElse(throw IllegalStateException(s"Missing $resource"))
+    val sql = Using.resource(source)(s => new String(s.readAllBytes(), UTF_8))
+    Using.resource(c.createStatement()) { statement => sql.split(";").map(_.trim).filter(_.nonEmpty).foreach(statement.execute) }
+
+  private def configured(config: PGConfig): Task[PostgresStore] =
+    ZIO.attempt {
       require(Set("localhost","127.0.0.1","::1","[::1]").contains(config.host),"The lab only connects to PostgreSQL on loopback")
       require(config.port > 0 && config.port <= 65535,"Invalid PGPORT")
       require(config.database.matches("[A-Za-z_][A-Za-z0-9_]*"),"PGDATABASE must be a simple database identifier")
       require(config.user.nonEmpty && config.password.nonEmpty,"PostgreSQL credentials must be nonempty")
       // sbt may load each run in a new class loader after JDBC has discovered providers.
       Class.forName("org.postgresql.Driver")
+      new PostgresStore(config)
     }
-    store = new PostgresStore(config)
-    _ <- store.ensureSchema
-  yield store

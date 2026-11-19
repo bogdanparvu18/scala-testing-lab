@@ -4,7 +4,7 @@ import zio.*
 import zio.json.*
 import java.nio.file.{Files, Paths, StandardCopyOption}
 
-/** Runtime I/O uses local files and loopback PostgreSQL/product-search connections. */
+/** DPD import can also download Health Canada's public marketed-products archive. */
 object Main extends ZIOAppDefault:
   private def readInput(path: String): Task[AstRequest] = ZIO.attemptBlocking {
     val raw = Files.readString(Paths.get(path))
@@ -27,6 +27,17 @@ object Main extends ZIOAppDefault:
 
   def run = getArgs.flatMap { args =>
     args.toList match
+      case "import-dpd" :: paths if paths.size <= 1 => ZIO.scoped {
+        for
+          config <- PGConfig.fromEnvironment
+          local <- ZIO.attempt(paths.headOption.map(path => Paths.get(path)))
+          source <- DpdSource.prepare(local)
+          summary <- DpdStore.importArchive(config, source.archive, source.origin)
+          _ <- Console.printLine(
+            s"Health Canada DPD: ${summary.products} marketed human products, ${summary.ingredients} ingredient rows, " +
+            s"${summary.forms} forms, ${summary.routes} routes, ${summary.statuses} status rows. SHA-256 ${summary.sha256}")
+        yield ()
+      }
       case "serve-products" :: portText :: Nil => ZIO.scoped {
         for
           port <- ZIO.attempt {
@@ -91,6 +102,6 @@ object Main extends ZIOAppDefault:
           s"Release $release; scope ${Rrf.scope}; ${p.concepts.size} concepts; $descriptions names; $relationships relationship rows; source SHA-256 ${p.sha256.toJson}"
         }.flatMap(Console.printLine(_))
       case _ => ZIO.fail(new IllegalArgumentException(
-        "Usage: import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> | " +
+        "Usage: import-dpd [allfiles.zip] | import-rxnorm <rrf-dir> <YYYY-MM-DD> | resolve <ast.json> <result.json> | " +
         "lookup <release> <name> | serve-products <port> | inspect-rxnorm <rrf-dir> <release> | import-product-attributes <rrf-dir> <release>. No seed or alias argument is accepted."))
   }

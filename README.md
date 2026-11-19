@@ -38,7 +38,7 @@ For a managed Docker database, the normal `--Docker` flow offers recovery using 
 4. [RxNorm and the PostgreSQL data model](#4-rxnorm-and-the-postgresql-data-model)
 5. [Windows installation and project setup](#5-windows-installation-and-project-setup)
 6. [Configure local PostgreSQL](#6-configure-local-postgresql)
-7. [Download and import RxNorm](#7-download-and-import-rxnorm)
+7. [Download and import RxNorm](#7-download-and-import-rxnorm) · [Import the Health Canada catalog](#health-canada-marketed-drug-catalog)
 8. [Complete example: paracetamol](#8-complete-example-paracetamol)
 9. [Product strength and dose form](#9-product-strength-and-dose-form)
 10. [VS Code extension workflow](#10-vs-code-extension-workflow)
@@ -646,6 +646,50 @@ The SAT import is additive. It requires the base release and matching CONSO/REL 
 - The product manifest includes SAT and its link to the base import.
 
 The date label alone does not authenticate a downloaded release. Obtain the archive from NLM; the hashes identify and pin the actual files used by this application.
+
+### Health Canada marketed drug catalog
+
+From the repository root, run the following command to download Health Canada’s public Drug Product Database (DPD) marketed extract and load its human products into local PostgreSQL. Use the same PostgreSQL settings as the other lab commands (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`). The database login needs permission to create the `health_canada_dpd` schema on first use. Health Canada access requires no account or API key.
+
+```sh
+sbt "run import-dpd"
+```
+
+With the Windows PowerShell launcher configured in section 5, run `& $javaExecutable @sbtArgs 'run import-dpd'`. To replay a saved copy, pass the path to the original ZIP:
+
+```sh
+sbt "run import-dpd data/allfiles.zip"
+```
+
+The command reads `drug.txt`, `ingred.txt`, `form.txt`, `route.txt` and `status.txt` from the official UTF-8 extract. It links them by DPD `drug_code` and preserves the eight-character DIN, including leading zeros. The extract files have no column headers. To inspect the Aspirin example directly, find DIN `02237726` in `drug.txt`, then look for `61080` in the first column of each related file.
+
+| Medication detail | Source for ASPIRIN 81MG |
+| --- | --- |
+| Ingredient strength | `ingred.txt`, columns 5–6 (`STRENGTH`, `STRENGTH_UNIT`): `81`, `MG` per tablet |
+| Dosage form | `form.txt`, column 3 (`PHARMACEUTICAL_FORM`): `TABLET (ENTERIC-COATED)` |
+| Product route | `route.txt`, column 3 (`ROUTE_OF_ADMINISTRATION`): `ORAL` |
+| Administered dose and frequency by indication | Separate [Canadian Aspirin product monograph, section 4, pages 6–7](https://pdf.hres.ca/dpd_pm/00076303.PDF#page=6) |
+
+Section 4 is in the product-specific PDF. The ZIP contains the catalog tables. Its ingredient `DOSAGE_VALUE` and `DOSAGE_UNIT` columns can qualify the strength (for example, the volume in a strength expressed per 5 mL). For this example the two ingredient dosage fields are empty, and `schedule.txt` says `NON-PRESCRIPTION DRUGS`, a regulatory classification. This import covers catalog data only. An application that offers dose and frequency suggestions also needs a separate source for regimens and verified product mappings.
+
+An identical ZIP is a no-op. A changed extract replaces the current Canadian catalog in a single transaction. A failed download or invalid import leaves the previous catalog available. Inspect the source, SHA-256 and row counts with `SELECT * FROM health_canada_dpd.snapshot;`.
+
+To check a known product, run this query in psql. For DIN `02237726`, the marketed extract dated November 2, 2026 contains ASPIRIN 81MG, acetylsalicylic acid, an 81 MG ingredient strength and an oral route.
+
+```sql
+SELECT p.din, p.brand_name, i.ingredient, i.strength, i.strength_unit,
+       ARRAY(SELECT f.form FROM health_canada_dpd.form f
+             WHERE f.drug_code = p.drug_code) AS forms,
+       ARRAY(SELECT r.route FROM health_canada_dpd.route r
+             WHERE r.drug_code = p.drug_code) AS routes
+FROM health_canada_dpd.product p
+JOIN health_canada_dpd.ingredient i USING (drug_code)
+WHERE p.din = '02237726';
+```
+
+To exercise the database import with synthetic data, run `sbt "Test/runMain lab.DpdImportIntegrationCheck"` with a PostgreSQL test role that can create databases. This check creates and removes its own temporary database.
+
+The [official downloads page](https://www.canada.ca/en/health-canada/services/drugs-health-products/drug-products/drug-product-database/what-data-extract-drug-product-database.html) publishes the extract date and links to the terms of use. The [DPD data dictionary](https://www.canada.ca/en/health-canada/services/drugs-health-products/drug-products/drug-product-database/read-file-drug-product-database-data-extract.html) describes the source columns.
 
 ## 8. Complete example: paracetamol
 
