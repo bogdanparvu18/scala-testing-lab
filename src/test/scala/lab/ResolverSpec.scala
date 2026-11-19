@@ -18,6 +18,13 @@ object ResolverSpec extends ZIOSpecDefault:
       assertTrue(r.status == "resolved",r.initialConcept.exists(_.rxcui == "161"),r.selectedProduct.isEmpty,
         r.ingredients.map(_.concept.rxcui) == Vector("161"),r.matchMethod == "exact_imported_name")
     },
+    test("retains canonical hour ranges and PRN without inferring a schedule") {
+      def resolveFrequency(value: String) =
+        Resolver.resolve(request.copy(mentions = Vector(mention.copy(frequency = value))), snapshot).resolutions.head.mention.frequency
+      assertTrue(resolveFrequency("Q4-6H PRN") == "Q4-6H PRN", resolveFrequency("Q3H") == "Q3H",
+        Vector("Q0H", "Q8-4H", "Q4-4H", "QD PRN", "Q4H or Q6H").forall(value =>
+          scala.util.Try(resolveFrequency(value)).isFailure))
+    },
     test("unknown spelling remains unresolved") {
       val m = mention.copy(originalText="paracetamo")
       assertTrue(Resolver.resolve(request.copy(mentions=Vector(m)),snapshot).resolutions.head.status == "unresolved")

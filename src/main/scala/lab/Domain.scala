@@ -70,7 +70,14 @@ object Hashing:
 object InputValidation:
   private val units = Set("mg", "mcg", "g", "ml", "puff", "unit")
   private val routes = Set("PO", "IV", "IM", "SC", "PR", "SL", "BUCC")
-  private val frequencies = Set("QD", "BID", "TID", "QID", "PRN", "Q4H", "Q6H", "Q8H", "Q12H", "Q24H")
+  private val frequencyCodes = Set("QD", "BID", "TID", "QID", "PRN")
+  private val hourInterval = """Q([1-9][0-9]*)(?:-([1-9][0-9]*))?H(?: PRN)?""".r
+
+  private def supportedFrequency(value: String): Boolean = value match
+    case hourInterval(start, end) =>
+      end == null || end.length > start.length || (end.length == start.length && end > start)
+    case code => frequencyCodes(code)
+
   def validate(a: AstRequest): Unit =
     require(Set("1", "2")(a.schemaVersion), "Unsupported schemaVersion")
     require((a.schemaVersion, a.policyVersion) == ("1", "exact-v1") ||
@@ -91,7 +98,7 @@ object InputValidation:
       require(m.originalText.trim.nonEmpty, "Empty medication name")
       require(Set("medication", "activeIngredient", "medicationProduct")(m.role), "Unknown semantic role")
       require(m.dose.amount > 0 && units(m.dose.unit), "Invalid administered dose representation")
-      require(routes(m.route) && frequencies(m.frequency), "Unsupported route or frequency")
+      require(routes(m.route) && supportedFrequency(m.frequency), "Unsupported route or frequency")
       require(m.productStrength.forall(value => ProductStrength.parse(value).nonEmpty), "Unsupported product strength: use mass or mass/ml")
       require(m.doseForm.forall(value => value.trim.nonEmpty && value.length <= 200), "Invalid dose form")
       m.productBinding.foreach { binding =>

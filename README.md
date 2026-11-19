@@ -667,7 +667,7 @@ The importer uses the lab’s PostgreSQL settings (`PGHOST`, `PGPORT`, `PGDATABA
 
 The command reads `drug.txt`, `ingred.txt`, `form.txt`, `route.txt` and `status.txt` from the official UTF-8 extract. It links them by DPD `drug_code` and preserves the eight-character DIN, including leading zeros. The extract files have no column headers. To inspect the Aspirin example directly, find DIN `02237726` in `drug.txt`, then look for `61080` in the first column of each related file.
 
-The PDF collection has a separate manual command, `sbt "run sync-monographs"`. Both bootstrap modes run it after the DPD catalog import. You can replay it without rebuilding the RxNorm or DPD indexes. The initial shared products are Tylenol Extra Strength tablets (DIN `00559407`) and Aspirin 81 mg enteric-coated tablets (DIN `02237726`). Each entry points to a DPD presentation so that setup follows the document linked by Health Canada. Additional selections are downloaded on demand.
+The PDF collection has a separate manual command, `sbt "run sync-monographs"`. Both bootstrap modes run it after the DPD catalog import. You can replay it without rebuilding the RxNorm or DPD indexes. The initial shared products are Tylenol Extra Strength tablets (DIN `00559407`) and Aspirin 81 mg enteric-coated tablets (DIN `02237726`). Each entry points to a DPD presentation so that setup follows the document linked by Health Canada. Additional selections are downloaded on demand. When a dosage passage can be matched to the selected presentation, the service returns an editable dose and frequency to the extension. See [the monograph response and example](PRODUCT-AUTOCOMPLETE.md#dose-and-frequency-in-the-monograph-response).
 
 | Medication detail | Source for ASPIRIN 81MG |
 | --- | --- |
@@ -676,7 +676,7 @@ The PDF collection has a separate manual command, `sbt "run sync-monographs"`. B
 | Product route | `route.txt`, column 3 (`ROUTE_OF_ADMINISTRATION`): `ORAL` |
 | Administered dose and frequency by indication | Separate [Canadian Aspirin product monograph, section 4, pages 6–7](https://pdf.hres.ca/dpd_pm/00076303.PDF#page=6) |
 
-Section 4 is in the product-specific PDF. The ZIP contains the catalog tables. Its ingredient `DOSAGE_VALUE` and `DOSAGE_UNIT` columns can qualify the strength (for example, the volume in a strength expressed per 5 mL). For this example the two ingredient dosage fields are empty, and `schedule.txt` says `NON-PRESCRIPTION DRUGS`, a regulatory classification. This import covers catalog data only. An application that offers dose and frequency suggestions also needs a separate source for regimens and verified product mappings.
+Section 4 is in the product-specific PDF. The ZIP contains the catalog tables. Its ingredient `DOSAGE_VALUE` and `DOSAGE_UNIT` columns can qualify the strength (for example, the volume in a strength expressed per 5 mL). For this example the two ingredient dosage fields are empty, and `schedule.txt` says `NON-PRESCRIPTION DRUGS`, a regulatory classification. The service uses the matching product monograph as its separate source for draft dose and frequency suggestions.
 
 An identical ZIP is a no-op. A changed extract replaces the current Canadian catalog in a single transaction. A failed download or invalid import leaves the previous catalog available. Inspect the source, SHA-256 and row counts with `SELECT * FROM health_canada_dpd.snapshot;`.
 

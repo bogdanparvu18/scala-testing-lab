@@ -5,7 +5,8 @@ import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
-import org.apache.pdfbox.pdmodel.{PDDocument, PDPage}
+import org.apache.pdfbox.pdmodel.{PDDocument, PDPage, PDPageContentStream}
+import org.apache.pdfbox.pdmodel.font.{PDType1Font, Standard14Fonts}
 import scala.util.Using
 import zio.*
 import zio.json.*
@@ -45,6 +46,48 @@ object CanadianMonographHttpSpec extends ZIOSpecDefault:
     ProductSearchService.start(0,q => ZIO.succeed(ProductSearchResponse("1",q.release,q.query,Vector.empty,false)),Some(service))
 
   def spec = suite("Canadian monograph endpoints")(
+    test("confirmation extracts from the selected DIN's presentation and keeps the signed PDF when no passage matches") {
+      ZIO.scoped {
+        val otherDin = "00000043"
+        val selected = CanadianProduct(din, 17, "Test Tablet", Vector("TEST INGREDIENT 40 MG"), Vector("TABLET"), Vector("ORAL"))
+        val other = selected.copy(din = otherDin, drugCode = 18, ingredients = Vector("TEST INGREDIENT 60 MG"))
+        val presentations = items.copy(items = Vector(selected, other))
+        for
+          file <- ZIO.acquireRelease(ZIO.attemptBlocking(Files.createTempFile("monograph-regimens-", ".pdf")))(p =>
+            ZIO.attemptBlocking(Files.deleteIfExists(p)).orDie)
+          _ <- ZIO.attemptBlocking(Using.resource(new PDDocument()) { pdf =>
+            val page = new PDPage()
+            pdf.addPage(page)
+            Using.resource(new PDPageContentStream(pdf, page)) { stream =>
+              stream.beginText()
+              stream.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 11)
+              stream.setLeading(14)
+              stream.newLineAtOffset(40, 700)
+              Vector("Dosage and Administration:", "Immediate Release:", "Adults and children 12 years of age and older",
+                "40 mg tablet: 40 mg to 80 mg every 4 to 6 hours, as required,",
+                "not to exceed 240 mg per day.").foreach { line =>
+                stream.showText(line)
+                stream.newLine()
+              }
+              stream.endText()
+            }
+            pdf.save(file.toFile)
+          })
+          document = CachedMonograph(file, "https://pdf.hres.ca/dpd_pm/00012345.PDF", "c"*64, Some("2025-11-01"))
+          service = new CanadianMonographAccess((_,_) => ZIO.succeed(presentations),
+            (_,_) => ZIO.some(document), (_,_) => ZIO.some(document))
+          port <- start(service)
+          response <- request(port, s"/monograph?$confirmed", post = true)
+          result <- ZIO.fromEither(body(response).fromJson[MonographResult]).orDieWith(new RuntimeException(_))
+          different <- request(port, s"/monograph?$query&din=$otherDin", post = true)
+          unmatched <- ZIO.fromEither(body(different).fromJson[MonographResult]).orDieWith(new RuntimeException(_))
+        yield assertTrue(response.statusCode == 200, result.dosagePage.contains(1),
+          result.regimenSuggestions.exists(s => s.page == 1 && s.dose.contains("40") && s.frequency.nonEmpty &&
+            s.context.contains("Adults") && s.evidence.contains("240 mg per day")),
+          unmatched.dosagePage.contains(1), unmatched.regimenSuggestions.isEmpty,
+          unmatched.pdfPath.exists(_.contains(otherDin)), unmatched.sha256.contains(document.sha256))
+      }
+    },
     test("candidate list, explicit confirmation, offline PDF preview and release validation") {
       ZIO.scoped {
         val fetches = new AtomicInteger()
@@ -68,7 +111,8 @@ object CanadianMonographHttpSpec extends ZIOSpecDefault:
           shown <- request(port,result.pdfPath.getOrElse("/missing"))
         yield assertTrue(body(listed).fromJson[CanadianProductCandidates] == Right(items),
           invalidRelease.statusCode == 404, result.status == "available", result.sha256.contains(document.sha256),
-          result.revision == document.revision, result.sourceUrl.contains(document.url), !body(downloaded).contains(file.toString),
+          result.revision == document.revision, result.sourceUrl.contains(document.url), result.regimenSuggestions.isEmpty,
+          !body(downloaded).contains(file.toString),
           shown.statusCode == 200, shown.headers.firstValue("Content-Type").orElse("") == "application/pdf",
           shown.body.sameElements(bytes), fetches.get == 1, views.get == 1)
       }

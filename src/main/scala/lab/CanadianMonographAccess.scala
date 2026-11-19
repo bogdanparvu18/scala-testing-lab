@@ -31,9 +31,12 @@ private[lab] object CanadianSelection:
       CanadianSelection(release,rxcui,din,preview)
     }.toEither.left.map(_ => ProductSearchFailure(400,"INVALID_CANADIAN_SELECTION","Supply a valid release and RxCUI, plus an eight-digit DIN for document access."))
 
+private[lab] final case class RegimenSuggestion(dose: String, frequency: String, page: Int,
+    context: String, evidence: String) derives JsonCodec
+
 private[lab] final case class MonographResult(status: String, pdfPath: Option[String] = None,
     sourceUrl: Option[String] = None, sha256: Option[String] = None, revision: Option[String] = None,
-    dosagePage: Option[Int] = None) derives JsonCodec
+    dosagePage: Option[Int] = None, regimenSuggestions: Vector[RegimenSuggestion] = Vector.empty) derives JsonCodec
 
 final class CanadianMonographAccess(
     val candidates: (String,String) => Task[CanadianProductCandidates],
@@ -52,23 +55,30 @@ final class CanadianMonographAccess(
     MessageDigest.isEqual(signature(release,rxcui,din,proof.sha256),HexFormat.of().parseHex(proof.token))
 
   /** Both fetch and view must use a DIN still associated with this selected product. */
-  def document(release: String, rxcui: String, din: String, cacheOnly: Boolean): Task[Option[CachedMonograph]] =
+  private def selectedDocument(release: String, rxcui: String, din: String,
+      cacheOnly: Boolean): Task[Option[(CanadianProduct, CachedMonograph)]] =
     candidates(release,rxcui).flatMap { response =>
       response.items.find(_.din == din) match
         case None => ZIO.fail(ProductSearchFailure(409,"DIN_NOT_ELIGIBLE","This DIN is not a candidate for the selected RxNorm product. Select it again."))
         case Some(product) =>
           val obtain = if cacheOnly then cached else download
-          obtain(product.drugCode,product.din).mapError(_ =>
+          obtain(product.drugCode,product.din).map(_.map(pdf => product -> pdf)).mapError(_ =>
             ProductSearchFailure(502,"MONOGRAPH_UNAVAILABLE","The official monograph could not be retrieved or verified. Please retry."))
     }
 
+  def document(release: String, rxcui: String, din: String, cacheOnly: Boolean): Task[Option[CachedMonograph]] =
+    selectedDocument(release, rxcui, din, cacheOnly).map(_.map(_._2))
+
   def confirm(release: String, rxcui: String, din: String): Task[MonographResult] =
-    document(release,rxcui,din,cacheOnly = false).flatMap {
+    selectedDocument(release,rxcui,din,cacheOnly = false).flatMap {
       case None => ZIO.succeed(MonographResult("unavailable"))
-      case Some(pdf) =>
+      case Some((product, pdf)) =>
         val token = HexFormat.of().formatHex(signature(release,rxcui,din,pdf.sha256))
         val localPath=s"/monograph.pdf?release=$release&rxcui=$rxcui&din=$din&sha256=${pdf.sha256}&token=$token"
-        ZIO.attemptBlocking(MonographDosage.page(pdf.path)).orElseSucceed(None).map { page =>
-          MonographResult("available",Some(localPath),Some(pdf.url),Some(pdf.sha256),pdf.revision,page)
-        }
+        ZIO.attemptBlocking(MonographRegimen.inspect(pdf.path, product))
+          .orElse(ZIO.attemptBlocking(MonographDosage.page(pdf.path)).orElseSucceed(None)
+            .map(page => page -> Vector.empty[RegimenSuggestion]))
+          .map { (page, suggestions) =>
+            MonographResult("available", Some(localPath), Some(pdf.url), Some(pdf.sha256), pdf.revision, page, suggestions)
+          }
     }
