@@ -246,6 +246,52 @@ final class PostgresStore private (config: PGConfig) extends TerminologyReposito
     ProductSearchResponse("1",request.release,request.query,rows.take(request.limit),rows.size > request.limit)
   }}
 
+  /** Resolve a selected product by RxCUI against its release, then compare the full
+    * formulation against a consistent read of the current Canadian catalog.
+    */
+  def canadianProducts(release: String, rxcui: String): Task[CanadianProductCandidates] =
+    readSnapshot(release, Vector.empty, true, Vector(rxcui)).flatMap { snapshot =>
+      snapshot.concepts.find(c => c.rxcui == rxcui && Set("SCD","SBD")(c.tty)) match
+        case None => ZIO.fail(ProductSearchFailure(404, "RXNORM_PRODUCT_UNKNOWN", "No active clinical product with this RxCUI in the selected release."))
+        case Some(product) =>
+          use { c => transaction(c, true) {
+            if query(c, "SELECT to_regclass('health_canada_dpd.snapshot') IS NOT NULL", strings())(_.getBoolean(1)) != Vector(true) ||
+                query(c, "SELECT singleton FROM health_canada_dpd.snapshot", strings())(_.getBoolean(1)) != Vector(true) then
+              throw ProductSearchFailure(503, "DPD_UNAVAILABLE", "Run setup to import the Canadian product catalog.")
+            val items = CanadianProducts.profile(product, snapshot).toVector.flatMap(profile => canadianCandidates(c, release, profile))
+            CanadianProductCandidates(release, rxcui, product.display, items)
+          }}
+    }
+
+  private def canadianCandidates(c: Connection, release: String, profile: CanadianProducts.Profile): Vector[CanadianProduct] =
+    import CanadianProducts.{Ingredient, Presentation}
+    val ingredients = profile.components.map(_.ingredient)
+    val synonyms = array(c, ingredients.map(_.rxcui)) { ids =>
+      query(c, """SELECT DISTINCT rxcui, normalized FROM rxnorm_lab.lexical_name WHERE release=? AND rxcui=ANY(?)
+        AND ((sab='RXNORM' AND tty IN ('IN','SY')) OR (sab='MTHSPL' AND tty='SU'))""",
+        p => { p.setString(1, release); p.setArray(2, ids) })(r => r.getString(1) -> r.getString(2))
+    }
+    val names = (synonyms ++ ingredients.map(i => i.rxcui -> TextKey.normalize(i.display))).groupMap(_._1)(_._2).view.mapValues(_.toSet).toMap
+    val rows = array(c, names.valuesIterator.flatten.toVector.distinct) { labels =>
+      query(c, """SELECT p.din,p.drug_code,p.brand_name,
+          ARRAY(SELECT DISTINCT f.form FROM health_canada_dpd.form f WHERE f.drug_code=p.drug_code ORDER BY f.form),
+          ARRAY(SELECT DISTINCT r.route FROM health_canada_dpd.route r WHERE r.drug_code=p.drug_code ORDER BY r.route),
+          i.ingredient,i.strength,i.strength_unit,i.dosage_value,i.dosage_unit,i.ingredient_supplied_ind,i.strength_type,i.base
+        FROM health_canada_dpd.product p JOIN health_canada_dpd.ingredient i USING(drug_code)
+        WHERE p.number_of_ais=? AND p.drug_code IN (SELECT drug_code FROM health_canada_dpd.ingredient
+          WHERE lower(trim(ingredient))=ANY(?)) ORDER BY p.brand_name,p.din""", p => {
+          p.setString(1, ingredients.size.toString); p.setArray(2, labels); p.setQueryTimeout(5)
+        }) { r =>
+          def texts(index: Int): Vector[String] = r.getArray(index).getArray.asInstanceOf[Array[String]].toVector
+          Presentation(r.getString(1), r.getInt(2), r.getString(3), texts(4), texts(5)) ->
+            Ingredient(r.getString(6), r.getString(7), r.getString(8), r.getString(9), r.getString(10),
+              r.getString(11), r.getString(12), r.getString(13))
+        }
+    }
+    rows.groupMap(_._1)(_._2).toVector.flatMap { (presentation, composition) =>
+      CanadianProducts.candidate(profile, names, presentation, composition)
+    }.sortBy(item => (item.brandName, item.din))
+
   def snapshotForResolution(ast: AstRequest): Task[RxSnapshot] =
     val productRequested = ast.mentions.exists(m => m.productStrength.nonEmpty || m.doseForm.nonEmpty)
     val terms=ast.mentions.flatMap(m => (if m.productBinding.isEmpty then Vector(m.originalText) else Vector.empty) ++ m.doseForm.toVector)
@@ -259,13 +305,14 @@ final class PostgresStore private (config: PGConfig) extends TerminologyReposito
       "Resolve expects 1–100 distinct terminology terms/product identifiers")
     val metadata = query(c,"SELECT scope,sha256_json FROM rxnorm_lab.release WHERE release=? AND state='ready'",strings(release))(
       r => (r.getString(1),r.getString(2)))
-    require(metadata.size == 1,s"No ready local release '$release'; finish import-rxnorm first")
+    if metadata.isEmpty then throw ProductSearchFailure(404, "RXNORM_RELEASE_UNAVAILABLE", s"No ready local release '$release'; finish import-rxnorm first")
     require(metadata.head._1 == Rrf.scope,"Unsupported index scope")
     val baseHashes = metadata.head._2.fromJson[Map[String,String]].fold(e => throw IllegalStateException(e),identity)
     val hashes = if !productRequested then baseHashes else
       val productMetadata = query(c,"SELECT sha256_json FROM rxnorm_lab.product_release WHERE release=? AND state='ready' AND policy=?",
         strings(release,ProductAttributes.policy))(_.getString(1))
-      require(productMetadata.size == 1,"Product index unavailable: run import-product-attributes with the matching RXNSAT.RRF first")
+      if productMetadata.isEmpty then throw ProductSearchFailure(503, "PRODUCT_INDEX_UNAVAILABLE",
+        "Product index unavailable: run import-product-attributes with the matching RXNSAT.RRF first")
       productMetadata.head.fromJson[Map[String,String]].fold(e => throw IllegalStateException(e),identity)
     val concepts = mutable.HashMap.empty[String,RxConcept]
     val names = array(c,normalized) { termsArray =>

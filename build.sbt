@@ -10,6 +10,8 @@ lazy val root = project.in(file("."))
       "dev.zio" %% "zio-json" % "0.7.3",
       "org.apache.commons" % "commons-csv" % "1.14.1",
       "commons-io" % "commons-io" % "2.20.0",
+      "org.jsoup" % "jsoup" % "1.22.1",
+      "org.apache.pdfbox" % "pdfbox" % "3.0.7",
       "org.postgresql" % "postgresql" % "42.7.14",
       "dev.zio" %% "zio-test" % "2.1.9" % Test,
       "dev.zio" %% "zio-test-sbt" % "2.1.9" % Test

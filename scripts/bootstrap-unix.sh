@@ -869,7 +869,7 @@ for case_name in valid invalid; do
     node "$SCALA/bridge/export-ast.mjs" --langium-root "$LANGIUM" --input "$SMOKE/$case_name.clinical" --release 2026-10-05 --output "$SMOKE/$case_name.ast.json"
 done
 cd "$SCALA"
-run_sbt compile test "${IMPORT_COMMANDS[@]}" "run import-dpd --setup" \
+run_sbt compile test "${IMPORT_COMMANDS[@]}" "run import-dpd --setup" "run sync-monographs" \
     "run resolve \"$SMOKE/valid.ast.json\" \"$SMOKE/valid.result.json\"" "run resolve \"$SMOKE/invalid.ast.json\" \"$SMOKE/invalid.result.json\""
 if [ "${#IMPORT_COMMANDS[@]}" -gt 0 ]; then
     [ "$(sql "$QUERY")" = 1 ] || { echo 'RxNorm base/product manifests are missing or incompatible after import. Existing data was preserved; inspect the import command output before retrying.' >&2; exit 1; }
@@ -924,8 +924,9 @@ console.log('RxNorm autocomplete: ' + autocomplete + '. See ' + scala + '/PRODUC
 const head = cwd => execFileSync('git', ['rev-parse', 'HEAD'], {cwd,encoding:'utf8'}).trim();
 fs.writeFileSync(health, JSON.stringify({status:'runtime-checks-passed', checkedAt:new Date().toISOString(),
     databaseMode:'docker-linux-runtime', scalaHead:head(scala), langiumHead:head(langium),
+    monographCache:scala + '/data/monographs',
     autocomplete, postgres:'authenticated-query-pass', rxnorm:'provenance-pass', dpd:'catalog-import-pass', scala:'incremental-compile-test-pass',
     langium:'generate-build-pass', clinicalValid:'pass', clinicalInvalid:'pass', languageServer:'initialize-diagnostics-pass'}, null, 2));
 JS
 node "$SCALA/scripts/finish-smoke.mjs" "$SMOKE"
-printf 'Linux runtime checks passed. Health Canada DPD archive: %s\nDemo: %s\nHealth: %s\n' "$SCALA/data/allfiles.zip" "$DEMO" "$HEALTH"
+printf 'Linux runtime checks passed. Health Canada DPD archive: %s\nHealth Canada monograph cache: %s\nDemo: %s\nHealth: %s\n' "$SCALA/data/allfiles.zip" "$SCALA/data/monographs" "$DEMO" "$HEALTH"
