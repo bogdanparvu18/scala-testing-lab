@@ -131,6 +131,15 @@ Medication MyLocalAlias: rxcui "10", rxnormRelease "2026-10-05", dose 1mg, route
 Plan DemoPlan: prescribe mylocalalias, for DemoPatient
 show DemoPlan
 `;
+test('rejects an edited bound dose that would silently round at a monograph boundary', async () => {
+  const order = amount => boundFixture.replace('dose 1mg', `dose ${amount}mg`);
+  await assert.rejects(project(order('1000.00000000000001'), '2026-10-05'), /dose would be rounded/i);
+  for (const spelling of ['1000.0000', '0.00000001', '0.1']) {
+    const { mentions: [mention] } = await project(order(spelling), '2026-10-05');
+    assert.equal(mention.dose.amount, Number(spelling));
+  }
+});
+
 test('exports explicit RxCUI identity and release without treating the local alias as a product name', async () => {
   const request = await project(boundFixture, '2026-10-05');
   assert.equal(request.schemaVersion, '2');
@@ -203,4 +212,19 @@ show OtherPlan
   assert.equal(request.mentions.length, 2);
   assert.deepEqual(request.mentions[0].productBinding, { rxcui: '10', release: '2026-10-05' });
   assert.equal('productBinding' in request.mentions[1], false);
+});
+
+test('pins the confirmed DIN and PDF revision from the saved declaration across edits and repeated export', async () => {
+  const hash = 'bf'.repeat(32);
+  const pin = `// @monograph MyLocalAlias 10 2026-10-05 00000001 ${hash}`;
+  const text = boundFixture.replace('Medication MyLocalAlias:', `${pin}\nMedication MyLocalAlias:`);
+  const result = await project(text, '2026-10-05');
+  assert.equal(result.schemaVersion, '3');
+  assert.equal(result.policyVersion, 'explicit-monograph-v1');
+  const edited = await project(text.replace('1mg', '2mg').replace('frequency PRN', 'frequency 6H PRN'), '2026-10-05');
+  assert.deepEqual(edited.mentions[0].monographSource, { din: '00000001', sha256: hash });
+  assert.deepEqual(result.mentions[0].monographSource, edited.mentions[0].monographSource);
+  assert.deepEqual(edited.mentions[0].dose, { amount: 2, unit: 'mg' });
+  assert.equal(edited.mentions[0].frequency, 'Q6H PRN');
+  await assert.rejects(project(text.replace('MyLocalAlias 10 2026-', 'MyLocalAlias 11 2026-'), '2026-10-05'), /monograph|RxCUI/i);
 });

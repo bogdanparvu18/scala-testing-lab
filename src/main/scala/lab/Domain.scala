@@ -17,11 +17,13 @@ final case class Dose(amount: BigDecimal, unit: String) derives JsonCodec
 @jsonNoExtraFields
 final case class ProductBinding(rxcui: String, release: String, display: Option[String] = None) derives JsonCodec
 @jsonNoExtraFields
+final case class MonographSource(din: String, sha256: String) derives JsonCodec
+@jsonNoExtraFields
 final case class Mention(
   id: String, originalText: String, role: String, source: SourceLocation,
   dose: Dose, route: String, frequency: String, patientRef: String, orderId: String,
   productStrength: Option[String] = None, doseForm: Option[String] = None,
-  productBinding: Option[ProductBinding] = None
+  productBinding: Option[ProductBinding] = None, monographSource: Option[MonographSource] = None
 ) derives JsonCodec
 @jsonNoExtraFields
 final case class AstRequest(
@@ -47,7 +49,7 @@ final case class Resolution(
   mention: Mention, status: String, initialConcept: Option[ConceptRef], selectedProduct: Option[ConceptRef],
   ingredients: Vector[IngredientEvidence], candidates: Vector[Candidate], matchMethod: String,
   diagnostics: Vector[String], clinicianConfirmed: Boolean = false,
-  productEvidence: Option[ProductMatchEvidence] = None
+  productEvidence: Option[ProductMatchEvidence] = None, monographValidation: Option[MonographValidation] = None
 ) derives JsonCodec
 final case class SharedIngredient(patientRef: String, orderIds: Vector[String], ingredient: ConceptRef, message: String) derives JsonCodec
 final case class ResolutionReport(
@@ -79,11 +81,14 @@ object InputValidation:
     case code => frequencyCodes(code)
 
   def validate(a: AstRequest): Unit =
-    require(Set("1", "2")(a.schemaVersion), "Unsupported schemaVersion")
+    require(Set("1", "2", "3")(a.schemaVersion), "Unsupported schemaVersion")
     require((a.schemaVersion, a.policyVersion) == ("1", "exact-v1") ||
-      (a.schemaVersion, a.policyVersion) == ("2", "explicit-product-v1"), "Unsupported schema/policy combination")
+      (a.schemaVersion, a.policyVersion) == ("2", "explicit-product-v1") ||
+      (a.schemaVersion, a.policyVersion) == ("3", "explicit-monograph-v1"), "Unsupported schema/policy combination")
     require(a.terminologyRelease.matches("[A-Za-z0-9][A-Za-z0-9._-]{0,79}"), "Invalid terminologyRelease")
     require(a.mentions.nonEmpty, "No medication mentions")
+    require((a.schemaVersion == "3") == a.mentions.exists(_.monographSource.nonEmpty),
+      "A monograph source requires schemaVersion 3 and at least one pinned medication")
     require(a.mentions.map(_.id).distinct.size == a.mentions.size, "Duplicate mention IDs")
     require(a.mentions.map(_.orderId).distinct.size == a.mentions.size, "Duplicate order IDs")
     def positionValid(p: Position): Boolean =
@@ -101,8 +106,13 @@ object InputValidation:
       require(routes(m.route) && supportedFrequency(m.frequency), "Unsupported route or frequency")
       require(m.productStrength.forall(value => ProductStrength.parse(value).nonEmpty), "Unsupported product strength: use mass or mass/ml")
       require(m.doseForm.forall(value => value.trim.nonEmpty && value.length <= 200), "Invalid dose form")
+      m.monographSource.foreach { source =>
+        require(m.productBinding.nonEmpty, "A monograph source requires an explicit RxNorm product")
+        require(source.din.matches("[0-9]{8}"), "Invalid Canadian monograph DIN")
+        require(source.sha256.matches("[0-9a-f]{64}"), "Invalid monograph PDF SHA-256")
+      }
       m.productBinding.foreach { binding =>
-        require(a.schemaVersion == "2", "Explicit product bindings require schemaVersion 2")
+        require(a.schemaVersion != "1", "Explicit product bindings require schemaVersion 2 or 3")
         require(binding.rxcui.matches("[1-9][0-9]{0,19}"), "Invalid product RxCUI")
         require(binding.display.forall(_.trim.nonEmpty), "Empty RxNorm product display")
         require(!binding.release.startsWith("0000-") && binding.release.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}") &&

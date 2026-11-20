@@ -24,8 +24,7 @@ private[lab] object MonographRegimen:
   private val ceiling = """(?:not to exceed|do not exceed|not greater than|taken in divided doses, not greater than)"""
   private val period = """(?:per (?:single dose|dose|day)|(?:in|per) (?:any )?24 hours?)"""
   private def limitsFor(ingredientName: String): Regex =
-    val limit = s"$ceiling\\s+$number\\s*$unit(?:\\s+${Pattern.quote(ingredientName)})?\\s+$period\\."
-    (s"(?i)^[,.]?\\s*(?:$limit\\s*){1,3}$$").r
+    (s"(?i)^$ceiling\\s+($number)\\s*($unit)(?:\\s+${Pattern.quote(ingredientName)})?\\s+($period)\\.").r
   private val beginsLimit = (s"(?i)^(?:$ceiling|maximum)\\b").r
   private val nextGroup = """(?i)^(?:(?:sustained|extended|delayed)[ -]release\s*:?|children under \d{1,2} years(?: of age)?\s*:.*)$""".r
   private val food = """(?i)^doses may be (?:administered|taken) with or without food\.$""".r
@@ -106,8 +105,8 @@ private[lab] object MonographRegimen:
               case Some(line) => presentation.matches(line) || nextGroup.matches(line)
               case None => following.forall(nextGroup.matches)
             val parsed = Option.when(finished && labels.exists(accepted) && labels.forall(plainFormWords) && body.length <= 650)(body)
-              .flatMap(readInstruction(_, strength, limits)).map { (dose, frequency) =>
-                RegimenSuggestion(dose, frequency, page, context, s"$label: $body")
+              .flatMap(readInstruction(_, strength, limits)).map { (dose, frequency, rule) =>
+                RegimenSuggestion(dose, frequency, page, context, s"$label: $body", rule)
               }
             matches += parsed
         case line if nextGroup.matches(line) => inGroup = false
@@ -117,27 +116,53 @@ private[lab] object MonographRegimen:
       case Vector(candidate) => candidate
       case _ => None
 
-  private def readInstruction(text: String, strength: ProductStrength, limits: Regex): Option[(String, String)] =
+  private def readInstruction(text: String, strength: ProductStrength, limits: Regex): Option[(String, String, RegimenRule)] =
     for
       dose <- administration.findPrefixMatchOf(text)
       amount = dose.group(1)
       u = dose.group(2).toLowerCase(Locale.ROOT)
-      physicalDose <- ProductStrength.parse(s"$amount $u")
-      if physicalDose.massMg % strength.massMg == 0
-      if Option(dose.group(3)).forall(high =>
-        dose.group(4).equalsIgnoreCase(u) && BigDecimal(high) >= BigDecimal(amount))
+      lower <- ProductStrength.parse(s"$amount $u")
+      if lower.massMg % strength.massMg == 0
+      upper <- Option(dose.group(3)) match
+        case None => Some(lower)
+        case Some(high) => ProductStrength.parse(s"$high ${dose.group(4)}")
+      if upper.massMg >= lower.massMg
       schedule <- schedulePrefix(text.substring(dose.end))
-      (frequency, tail) = schedule
+      (frequency, minHours, maxHours, tail) = schedule
       prn = asNeeded.findPrefixMatchOf(tail)
       remainder = tail.substring(prn.fold(0)(_.end)).trim
-      if remainder == "." || limits.matches(remainder)
-    yield (s"$amount $u", if prn.isEmpty then frequency else (if frequency == "QD" then "q24h" else frequency) + " PRN")
+      caps <- ceilings(remainder, limits)
+      (single, daily) = caps
+      rule = RegimenRule(1, lower.massMg, upper.massMg, minHours, maxHours, prn.nonEmpty, single, daily)
+      draftFrequency = if prn.isEmpty then frequency else (if frequency == "QD" then "q24h" else frequency) + " PRN"
+      if rule.violations(Some(Dose(BigDecimal(amount), u)), Some(draftFrequency)).isEmpty
+    yield (s"$amount $u", draftFrequency, rule)
 
-  private def schedulePrefix(text: String): Option[(String, String)] =
+  private def ceilings(text: String, clause: Regex): Option[(Option[BigDecimal], Option[BigDecimal])] =
+    if text == "." then return Some((None, None))
+    var tail = text.stripPrefix(",").stripPrefix(".").trim
+    var single = Option.empty[BigDecimal]
+    var daily = Option.empty[BigDecimal]
+    var count = 0
+    while tail.nonEmpty && count < 3 do
+      clause.findPrefixMatchOf(tail) match
+        case Some(m) =>
+          ProductStrength.parse(s"${m.group(1)} ${m.group(2)}") match
+            case Some(mass) =>
+              val limitType = m.group(3).toLowerCase(Locale.ROOT)
+              if limitType.endsWith("dose") then single = Some(single.fold(mass.massMg)(_.min(mass.massMg)))
+              else daily = Some(daily.fold(mass.massMg)(_.min(mass.massMg)))
+            case None => return None
+          tail = tail.substring(m.end).trim
+          count += 1
+        case None => return None
+    Option.when(count > 0 && tail.isEmpty)((single, daily))
+
+  private def schedulePrefix(text: String): Option[(String, Int, Int, String)] =
     interval.findPrefixMatchOf(text).flatMap { m =>
-      val start = m.group(1)
-      val end = Option(m.group(2))
-      Option.when(end.forall(_.toInt > start.toInt)) {
-        ("q" + start + end.fold("")("-" + _) + "h", text.substring(m.end))
+      val start = m.group(1).toInt
+      val end = Option(m.group(2)).map(_.toInt)
+      Option.when(end.forall(_ > start)) {
+        ("q" + start + end.fold("")(n => s"-$n") + "h", start, end.getOrElse(start), text.substring(m.end))
       }
-    }.orElse(daily.findPrefixMatchOf(text).map(m => ("QD", text.substring(m.end))))
+    }.orElse(daily.findPrefixMatchOf(text).map(m => ("QD", 24, 24, text.substring(m.end))))

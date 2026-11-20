@@ -42,6 +42,13 @@ object CanadianMonographHttpSpec extends ZIOSpecDefault:
     }
   }
   private def body(response: HttpResponse[Array[Byte]]): String = String(response.body,UTF_8)
+  private def postCheck(port: Int, json: String, path: String = "/validate-regimen"): Task[HttpResponse[Array[Byte]]] =
+    ZIO.attemptBlocking {
+      val request = HttpRequest.newBuilder(URI.create(s"http://127.0.0.1:$port$path"))
+        .timeout(java.time.Duration.ofSeconds(5)).header("X-Aurora-Client", "vscode")
+        .header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(json)).build()
+      client.send(request, HttpResponse.BodyHandlers.ofByteArray())
+    }
   private def start(service: CanadianMonographAccess) =
     ProductSearchService.start(0,q => ZIO.succeed(ProductSearchResponse("1",q.release,q.query,Vector.empty,false)),Some(service))
 
@@ -73,7 +80,7 @@ object CanadianMonographHttpSpec extends ZIOSpecDefault:
             }
             pdf.save(file.toFile)
           })
-          document = CachedMonograph(file, "https://pdf.hres.ca/dpd_pm/00012345.PDF", "c"*64, Some("2025-11-01"))
+          document = CachedMonograph(file, "https://pdf.hres.ca/dpd_pm/00012345.PDF", Rrf.hash(file), Some("2025-11-01"))
           service = new CanadianMonographAccess((_,_) => ZIO.succeed(presentations),
             (_,_) => ZIO.some(document), (_,_) => ZIO.some(document))
           port <- start(service)
@@ -81,11 +88,20 @@ object CanadianMonographHttpSpec extends ZIOSpecDefault:
           result <- ZIO.fromEither(body(response).fromJson[MonographResult]).orDieWith(new RuntimeException(_))
           different <- request(port, s"/monograph?$query&din=$otherDin", post = true)
           unmatched <- ZIO.fromEither(body(different).fromJson[MonographResult]).orDieWith(new RuntimeException(_))
+          payload = RegimenCheckRequest(release, rxcui, din, document.sha256, Some(Dose(60,"mg")), Some("Q6H PRN"))
+          accepted <- postCheck(port, payload.toJson)
+          rejected <- postCheck(port, payload.copy(dose = Some(Dose(81,"mg")), frequency = Some("Q6H")).toJson)
+          missing <- postCheck(port, payload.copy(sha256 = "9" * 64).toJson)
+          partial <- postCheck(port, payload.copy(dose = None).toJson)
+          checks <- ZIO.foreach(Vector(accepted, rejected, missing, partial))(r =>
+            ZIO.fromEither(body(r).fromJson[MonographValidation]).orDieWith(new RuntimeException(_)))
         yield assertTrue(response.statusCode == 200, result.dosagePage.contains(1),
           result.regimenSuggestions.exists(s => s.page == 1 && s.dose.contains("40") && s.frequency.nonEmpty &&
             s.context.contains("Adults") && s.evidence.contains("240 mg per day")),
           unmatched.dosagePage.contains(1), unmatched.regimenSuggestions.isEmpty,
-          unmatched.pdfPath.exists(_.contains(otherDin)), unmatched.sha256.contains(document.sha256))
+          unmatched.pdfPath.exists(_.contains(otherDin)), unmatched.sha256.contains(document.sha256),
+          checks.map(_.status) == Vector("valid","invalid","unverified","valid"), checks.head.page.contains(1),
+          checks(1).issues.map(_.field).toSet == Set("dose","frequency"), checks(2).issues.exists(_.field == "source"))
       }
     },
     test("candidate list, explicit confirmation, offline PDF preview and release validation") {
@@ -133,9 +149,17 @@ object CanadianMonographHttpSpec extends ZIOSpecDefault:
           get <- request(port,s"/monograph?$confirmed")
           path <- request(port,s"/monograph.pdf/other?$confirmed")
           traversal <- request(port,s"/monograph.pdf?$query&din=..%2F..%2Fetc")
+          unexpectedField <- postCheck(port, RegimenCheckRequest(release,rxcui,din,"a" * 64,
+            frequency = Some("Q6H")).toJson.dropRight(1) + ""","patient":"unused"}""")
+          oversized <- postCheck(port, " " * 4097)
+          noMarker <- request(port, "/validate-regimen", post = true, editor = false)
+          wrongMethod <- request(port, "/validate-regimen")
+          queryOnly <- postCheck(port, "{}", "/validate-regimen?" + confirmed)
         yield assertTrue(wrongDin.statusCode == 409,invalid.statusCode == 400,old.statusCode == 404,
           browser.statusCode == 403,simple.statusCode == 403,get.statusCode == 405,path.statusCode == 404,
-          traversal.statusCode == 400,calls.get == 2,fetches.get == 0)
+          traversal.statusCode == 400, unexpectedField.statusCode == 400, oversized.statusCode == 413,
+          noMarker.statusCode == 403, wrongMethod.statusCode == 405, queryOnly.statusCode == 400,
+          calls.get == 2,fetches.get == 0)
       }
     },
     test("forwarded hosts can preview only the signed document and revision") {

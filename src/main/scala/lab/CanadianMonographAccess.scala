@@ -32,7 +32,7 @@ private[lab] object CanadianSelection:
     }.toEither.left.map(_ => ProductSearchFailure(400,"INVALID_CANADIAN_SELECTION","Supply a valid release and RxCUI, plus an eight-digit DIN for document access."))
 
 private[lab] final case class RegimenSuggestion(dose: String, frequency: String, page: Int,
-    context: String, evidence: String) derives JsonCodec
+    context: String, evidence: String, rule: RegimenRule) derives JsonCodec
 
 private[lab] final case class MonographResult(status: String, pdfPath: Option[String] = None,
     sourceUrl: Option[String] = None, sha256: Option[String] = None, revision: Option[String] = None,
@@ -42,6 +42,7 @@ final class CanadianMonographAccess(
     val candidates: (String,String) => Task[CanadianProductCandidates],
     download: (Int,String) => Task[Option[CachedMonograph]],
     cached: (Int,String) => Task[Option[CachedMonograph]]):
+  private[lab] val orderValidation = new MonographOrderValidation(candidates, cached)
   private val previewKey = new SecretKeySpec(new SecureRandom().generateSeed(32),"HmacSHA256")
   private def signature(release: String, rx: String, din: String, hash: String): Array[Byte] =
     val mac = Mac.getInstance("HmacSHA256")
